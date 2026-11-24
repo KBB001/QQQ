@@ -1,0 +1,20 @@
+<resources>
+    <string name="app_name">Sonora</string>
+    <string name="nav_home">Главная</string>
+    <string name="nav_search">Поиск</string>
+    <string name="nav_library">Медиатека</string>
+    <string name="nav_settings">Настройки</string>
+    <string name="search_hint">Треки, артисты или ссылка YouTube</string>
+    <string name="import_playlist">Импорт из YouTube</string>
+    <string name="create_playlist">Создать</string>
+    <string name="favorites_title">Избранное</string>
+    <string name="history_title">Недавно прослушано</string>
+    <string name="playlists_title">Ваши плейлисты</string>
+    <string name="now_playing">Сейчас играет</string>
+    <string name="empty_search_title">Найдите любимую музыку</string>
+    <string name="empty_search_subtitle">Ищите треки, исполнителей, плейлисты или вставьте ссылку на YouTube</string>
+    <string name="empty_library_title">В медиатеке пока пусто</string>
+    <string name="empty_library_subtitle">Добавляйте треки в избранное, скачивайте для офлайн-доступа или импортируйте плейлист</string>
+    <string name="notification_permission_rationale">Разрешите уведомления для управления воспроизведением на экране блокировки.</string>
+    <string name="widget_description">Мини-плеер Sonora с текущим треком и кнопками управления.</string>
+</resources>
