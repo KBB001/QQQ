@@ -140,6 +140,7 @@ jobs:
           mkdir -p release-assets
           OUT_APK="release-assets/sonora-${{ steps.version.outputs.tag }}.apk"
           cp "$APK_SRC" "$OUT_APK"
+          sha256sum "$OUT_APK" | awk '{print $1}' > "${OUT_APK}.sha256"
           APKSIGNER=$(find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -name apksigner 2>/dev/null | head -n 1 || true)
           if [ -n "$APKSIGNER" ] && [ -x "$APKSIGNER" ]; then
             "$APKSIGNER" verify --print-certs "$OUT_APK" || true
@@ -155,5 +156,6 @@ jobs:
           prerelease: false
           files: |
             release-assets/*.apk
+            release-assets/*.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

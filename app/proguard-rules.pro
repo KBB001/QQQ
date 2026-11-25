@@ -64,3 +64,7 @@
 -dontwarn okio.**
 -dontwarn javax.annotation.**
 -keepnames class okhttp3.internal.publicsuffix.PublicSuffixDatabase
+
+# --- SQLCipher ---
+-keep class net.zetetic.** { *; }
+-dontwarn net.zetetic.**
