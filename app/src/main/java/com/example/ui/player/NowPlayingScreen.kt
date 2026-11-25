@@ -4,12 +4,28 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Build
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.gestures.rememberDraggableState
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -26,6 +42,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.itemsIndexed
@@ -65,6 +82,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -72,10 +90,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
@@ -102,6 +126,7 @@ import com.example.ui.components.SonoraIcons
 import com.example.ui.components.TrackRowItem
 import com.example.ui.settings.EqualizerSheetContent
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -436,6 +461,10 @@ fun NowPlayingScreen(
         )
     }
 
+    val density = LocalDensity.current
+    val collapseThresholdPx = with(density) { 128.dp.toPx() }
+    val swipeOffsetY = remember { Animatable(0f) }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -456,9 +485,53 @@ fun NowPlayingScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .widthIn(max = 560.dp)
-                .padding(horizontal = 24.dp, vertical = 12.dp),
+                .graphicsLayer {
+                    translationY = swipeOffsetY.value
+                    val fadeProgress = (swipeOffsetY.value / 720f).coerceIn(0f, 0.42f)
+                    alpha = 1f - fadeProgress
+                }
+                .draggable(
+                    orientation = Orientation.Vertical,
+                    enabled = !showQueueSheet && !showLyricsSheet && !showEqualizerSheet,
+                    state = rememberDraggableState { delta ->
+                        scope.launch {
+                            swipeOffsetY.snapTo((swipeOffsetY.value + delta).coerceAtLeast(0f))
+                        }
+                    },
+                    onDragStopped = { velocity ->
+                        scope.launch {
+                            if (swipeOffsetY.value >= collapseThresholdPx || velocity >= 1000f) {
+                                swipeOffsetY.animateTo(
+                                    targetValue = collapseThresholdPx * 2.2f,
+                                    animationSpec = tween(durationMillis = 140)
+                                )
+                                onBack()
+                            } else {
+                                swipeOffsetY.animateTo(
+                                    targetValue = 0f,
+                                    animationSpec = spring(stiffness = Spring.StiffnessMediumLow)
+                                )
+                            }
+                        }
+                    }
+                )
+                .padding(horizontal = 24.dp)
+                .padding(top = 6.dp, bottom = 12.dp),
             verticalArrangement = Arrangement.SpaceBetween
         ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 2.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Box(
+                    modifier = Modifier
+                        .size(width = 36.dp, height = 4.dp)
+                        .clip(CircleShape)
+                        .background(MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f))
+                )
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -624,6 +697,18 @@ fun NowPlayingScreen(
                     )
                 }
             } else {
+                var seekFeedbackSide by remember(track.id) { mutableStateOf<Int?>(null) }
+                var seekFeedbackDeltaSeconds by remember(track.id) { mutableIntStateOf(0) }
+                var seekFeedbackNonce by remember(track.id) { mutableIntStateOf(0) }
+
+                LaunchedEffect(seekFeedbackNonce) {
+                    if (seekFeedbackNonce > 0) {
+                        delay(750L)
+                        seekFeedbackSide = null
+                        seekFeedbackDeltaSeconds = 0
+                    }
+                }
+
                 BoxWithConstraints(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -632,12 +717,7 @@ fun NowPlayingScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     val artSize = min(maxWidth, maxHeight).coerceAtMost(320.dp)
-                    AsyncImage(
-                        model = track.thumbnailUrl,
-                        contentDescription = "Обложка ${track.title}",
-                        placeholder = painterResource(R.drawable.img_default_cover),
-                        error = painterResource(R.drawable.img_default_cover),
-                        contentScale = ContentScale.Crop,
+                    Box(
                         modifier = Modifier
                             .size(artSize)
                             .aspectRatio(1f)
@@ -648,7 +728,102 @@ fun NowPlayingScreen(
                                 shape = RoundedCornerShape(22.dp)
                             )
                             .background(MaterialTheme.colorScheme.surfaceContainerHigh)
-                    )
+                            .pointerInput(track.id, playback.durationMs) {
+                                detectTapGestures(
+                                    onDoubleTap = { tapOffset ->
+                                        val isRightHalf = tapOffset.x >= size.width / 2f
+                                        val deltaMs = if (isRightHalf) 10_000L else -10_000L
+                                        val currentProgress = viewModel.playbackProgress.value
+                                        val effectiveDuration = currentProgress.durationMs
+                                            .takeIf { it > 0L }
+                                            ?: playback.durationMs
+                                        val rawTarget = currentProgress.positionMs + deltaMs
+                                        val clampedTarget = if (effectiveDuration > 0L) {
+                                            rawTarget.coerceIn(0L, effectiveDuration)
+                                        } else {
+                                            rawTarget.coerceAtLeast(0L)
+                                        }
+                                        viewModel.seekTo(clampedTarget)
+                                        val nextSide = if (isRightHalf) 1 else -1
+                                        seekFeedbackDeltaSeconds = if (seekFeedbackSide == nextSide) {
+                                            seekFeedbackDeltaSeconds + if (isRightHalf) 10 else -10
+                                        } else {
+                                            if (isRightHalf) 10 else -10
+                                        }
+                                        seekFeedbackSide = nextSide
+                                        seekFeedbackNonce++
+                                    }
+                                )
+                            }
+                            .testTag("player_artwork_double_tap_area")
+                    ) {
+                        AsyncImage(
+                            model = track.thumbnailUrl,
+                            contentDescription = "Обложка ${track.title}",
+                            placeholder = painterResource(R.drawable.img_default_cover),
+                            error = painterResource(R.drawable.img_default_cover),
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+
+                        androidx.compose.animation.AnimatedVisibility(
+                            visible = seekFeedbackSide != null,
+                            enter = fadeIn(tween(150)) + scaleIn(initialScale = 0.85f),
+                            exit = fadeOut(tween(220)) + scaleOut(targetScale = 0.9f),
+                            modifier = Modifier
+                                .align(
+                                    if (seekFeedbackSide == 1) Alignment.CenterEnd else Alignment.CenterStart
+                                )
+                                .padding(horizontal = 24.dp)
+                                .testTag("player_seek_feedback_badge")
+                        ) {
+                            val isForward = seekFeedbackSide == 1
+                            val label = if (isForward) {
+                                "+${abs(seekFeedbackDeltaSeconds)} с"
+                            } else {
+                                "-${abs(seekFeedbackDeltaSeconds)} с"
+                            }
+                            Surface(
+                                shape = CircleShape,
+                                color = Color.Black.copy(alpha = 0.72f),
+                                border = BorderStroke(
+                                    1.dp,
+                                    MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+                                )
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    if (!isForward) {
+                                        Icon(
+                                            imageVector = SonoraIcons.FastRewind,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                    Text(
+                                        text = label,
+                                        style = MaterialTheme.typography.titleSmall.copy(
+                                            fontWeight = FontWeight.Bold,
+                                            fontFeatureSettings = "tnum"
+                                        ),
+                                        color = Color.White
+                                    )
+                                    if (isForward) {
+                                        Icon(
+                                            imageVector = SonoraIcons.FastForward,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(20.dp)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
                 Column(
@@ -986,6 +1161,7 @@ fun NowPlayingScreen(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun NowPlayingSeekBar(
     progressFlow: StateFlow<PlaybackProgress>,
@@ -1000,7 +1176,18 @@ private fun NowPlayingSeekBar(
     val playbackFraction = (progress.positionMs.toFloat() / totalMs.toFloat()).coerceIn(0f, 1f)
     val sliderValue = if (isDragging) dragValue else playbackFraction
 
-    Column {
+    val interactionSource = remember { MutableInteractionSource() }
+    val isThumbDragged by interactionSource.collectIsDraggedAsState()
+    val thumbSize by animateDpAsState(
+        targetValue = if (isDragging || isThumbDragged) 18.dp else 13.dp,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "seekbar_thumb_size"
+    )
+    val activeTrackColor = MaterialTheme.colorScheme.primary
+    val inactiveTrackColor = MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.85f)
+    val thumbFillColor = MaterialTheme.colorScheme.onBackground
+
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Slider(
             value = sliderValue,
             onValueChange = {
@@ -1011,18 +1198,76 @@ private fun NowPlayingSeekBar(
                 onSeekTo((dragValue * totalMs).toLong())
                 isDragging = false
             },
+            interactionSource = interactionSource,
             colors = SliderDefaults.colors(
-                thumbColor = MaterialTheme.colorScheme.onBackground,
-                activeTrackColor = MaterialTheme.colorScheme.primary,
-                inactiveTrackColor = MaterialTheme.colorScheme.surfaceContainerHighest
+                thumbColor = thumbFillColor,
+                activeTrackColor = activeTrackColor,
+                inactiveTrackColor = inactiveTrackColor
             ),
+            thumb = {
+                Box(
+                    modifier = Modifier.size(22.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(thumbSize)
+                            .shadow(
+                                elevation = if (isDragging) 6.dp else 2.dp,
+                                shape = CircleShape,
+                                ambientColor = activeTrackColor,
+                                spotColor = activeTrackColor
+                            )
+                            .background(color = thumbFillColor, shape = CircleShape)
+                            .border(
+                                width = 2.dp,
+                                color = activeTrackColor,
+                                shape = CircleShape
+                            )
+                    )
+                }
+            },
+            track = { sliderState ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(22.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Canvas(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(4.dp)
+                            .clip(CircleShape)
+                    ) {
+                        val range = (sliderState.valueRange.endInclusive - sliderState.valueRange.start)
+                            .coerceAtLeast(0.0001f)
+                        val fraction = ((sliderState.value - sliderState.valueRange.start) / range)
+                            .coerceIn(0f, 1f)
+                        val corner = CornerRadius(size.height / 2f, size.height / 2f)
+                        drawRoundRect(
+                            color = inactiveTrackColor,
+                            cornerRadius = corner
+                        )
+                        if (fraction > 0f) {
+                            drawRoundRect(
+                                color = activeTrackColor,
+                                size = Size(width = size.width * fraction, height = size.height),
+                                cornerRadius = corner
+                            )
+                        }
+                    }
+                }
+            },
             modifier = Modifier
                 .fillMaxWidth()
                 .testTag("player_seek_slider")
         )
 
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
             val displayedPosMs = if (isDragging) {
@@ -1036,14 +1281,15 @@ private fun NowPlayingSeekBar(
             } else {
                 "0:00"
             }
+            val timeStyle = MaterialTheme.typography.labelSmall.copy(fontFeatureSettings = "tnum")
             Text(
                 text = DurationFormatter.formatMillis(displayedPosMs),
-                style = MaterialTheme.typography.labelSmall,
+                style = timeStyle,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
                 text = remainingText,
-                style = MaterialTheme.typography.labelSmall,
+                style = timeStyle,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }

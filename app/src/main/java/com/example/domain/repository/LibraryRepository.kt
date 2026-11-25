@@ -16,9 +16,11 @@ interface LibraryRepository {
 
     fun observeDownloadedTracks(): Flow<List<Track>>
     fun observeDownloadedIds(): Flow<Set<String>>
+    fun observeDownloadedBytes(): Flow<Long>
     suspend fun getDownloadedFilePath(trackId: String): String?
     suspend fun saveDownloadedTrack(track: Track, filePath: String, fileSizeBytes: Long)
     suspend fun deleteDownloadedTrack(trackId: String)
+    suspend fun clearAllDownloadedTracks(): Int
 
     fun observeSearchHistory(): Flow<List<String>>
     suspend fun recordSearchQuery(query: String)

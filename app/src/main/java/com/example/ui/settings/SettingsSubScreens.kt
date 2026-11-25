@@ -87,6 +87,7 @@ import com.example.BuildConfig
 import com.example.R
 import com.example.core.common.ApkInstallCompatibility
 import com.example.core.common.ApkInstaller
+import com.example.core.common.DurationFormatter
 import com.example.domain.model.AccountSyncState
 import com.example.domain.model.AppUpdateUiState
 import com.example.domain.model.AudioQuality
@@ -809,17 +810,54 @@ fun CacheQualityScreen(
     viewModel: SettingsViewModel = hiltViewModel()
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
+    var showClearDownloadsDialog by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         viewModel.refreshCacheSize()
     }
 
-    val qualityShortLabel = when (uiState.settings.audioQuality) {
-        AudioQuality.HIGH -> "320 kbps"
-        AudioQuality.BALANCED -> "128 kbps"
-        AudioQuality.DATA_SAVER -> "64 kbps"
+    val totalBytes = uiState.totalStorageBytes
+    val streamCacheLabel = DurationFormatter.formatBytes(uiState.cacheSizeBytes)
+    val offlineBytesLabel = DurationFormatter.formatBytes(uiState.offlineDownloadsBytes)
+    val totalStorageLabel = DurationFormatter.formatBytes(totalBytes)
+
+    if (showClearDownloadsDialog) {
+        AlertDialog(
+            onDismissRequest = { showClearDownloadsDialog = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+            title = { Text("Удалить все офлайн-треки?") },
+            text = {
+                Text(
+                    text = "Будет удалено ${DurationFormatter.formatTrackCount(uiState.offlineTracksCount)} ($offlineBytesLabel) с памяти устройства. Избранное и плейлисты сохранятся.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        showClearDownloadsDialog = false
+                        viewModel.clearOfflineDownloads { removed ->
+                            onShowMessage("Удалено офлайн-треков: $removed")
+                        }
+                    },
+                    shape = CircleShape,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = Color.White
+                    ),
+                    modifier = Modifier.testTag("confirm_clear_offline_downloads_button")
+                ) {
+                    Text("Удалить", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearDownloadsDialog = false }) {
+                    Text("Отмена")
+                }
+            }
+        )
     }
-    val cacheMbLabel = String.format(Locale.US, "%.1f МБ", uiState.cacheSizeBytes / (1024f * 1024f))
 
     Column(
         modifier = Modifier
@@ -829,7 +867,7 @@ fun CacheQualityScreen(
             .navigationBarsPadding()
     ) {
         SonoraSubScreenTopBar(
-            title = "Качество кэша",
+            title = "Качество кэша и память",
             onBack = onBack,
             backTestTag = "cache_quality_back_button"
         )
@@ -837,10 +875,143 @@ fun CacheQualityScreen(
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(18.dp)
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             item {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    SonoraSectionTitle(title = "ИСПОЛЬЗОВАНИЕ ПАМЯТИ")
+                    SonoraCard(modifier = Modifier.fillMaxWidth()) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(36.dp)
+                                            .clip(RoundedCornerShape(10.dp))
+                                            .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.14f)),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Icon(
+                                            imageVector = SonoraIcons.Storage,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.size(19.dp)
+                                        )
+                                    }
+                                    Column {
+                                        Text(
+                                            text = "Занято Sonora",
+                                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Text(
+                                            text = if (uiState.offlineTracksCount > 0) {
+                                                "${DurationFormatter.formatTrackCount(uiState.offlineTracksCount)} в офлайн-доступе"
+                                            } else {
+                                                "Офлайн-загрузок пока нет"
+                                            },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                                Text(
+                                    text = totalStorageLabel,
+                                    style = MaterialTheme.typography.titleMedium.copy(
+                                        fontWeight = FontWeight.ExtraBold,
+                                        fontFeatureSettings = "tnum"
+                                    ),
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+
+                            val denom = totalBytes.coerceAtLeast(1L).toFloat()
+                            val offlineRatio = (uiState.offlineDownloadsBytes / denom).coerceIn(0f, 1f)
+                            val streamRatio = (uiState.cacheSizeBytes / denom).coerceIn(0f, 1f)
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(8.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+                            ) {
+                                if (offlineRatio > 0f) {
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(offlineRatio.coerceAtLeast(0.02f))
+                                            .height(8.dp)
+                                            .background(MaterialTheme.colorScheme.primary)
+                                    )
+                                }
+                                if (streamRatio > 0f) {
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(streamRatio.coerceAtLeast(0.02f))
+                                            .height(8.dp)
+                                            .background(MaterialTheme.colorScheme.secondary)
+                                    )
+                                }
+                                val remainingRatio = (1f - offlineRatio - streamRatio).coerceAtLeast(0f)
+                                if (totalBytes == 0L || remainingRatio > 0.01f) {
+                                    Spacer(modifier = Modifier.weight(remainingRatio.coerceAtLeast(1f)))
+                                }
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(8.dp)
+                                            .clip(CircleShape)
+                                            .background(MaterialTheme.colorScheme.primary)
+                                    )
+                                    Text(
+                                        text = "Офлайн: $offlineBytesLabel",
+                                        style = MaterialTheme.typography.labelMedium.copy(fontFeatureSettings = "tnum"),
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(8.dp)
+                                            .clip(CircleShape)
+                                            .background(MaterialTheme.colorScheme.secondary)
+                                    )
+                                    Text(
+                                        text = "Потоковый кэш: $streamCacheLabel",
+                                        style = MaterialTheme.typography.labelMedium.copy(fontFeatureSettings = "tnum"),
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            item {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     SonoraSectionTitle(title = "КАЧЕСТВО АУДИОПОТОКА И ОФЛАЙН-ФАЙЛОВ")
                     SonoraCard(modifier = Modifier.fillMaxWidth()) {
                         AudioQuality.entries.forEachIndexed { index, quality ->
@@ -858,14 +1029,20 @@ fun CacheQualityScreen(
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .clickable { viewModel.setAudioQuality(quality) }
+                                    .clickable {
+                                        viewModel.setAudioQuality(quality)
+                                        onShowMessage("Качество: $title")
+                                    }
                                     .padding(horizontal = 14.dp, vertical = 12.dp)
                                     .testTag("quality_option_${quality.name}"),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 RadioButton(
                                     selected = selected,
-                                    onClick = { viewModel.setAudioQuality(quality) },
+                                    onClick = {
+                                        viewModel.setAudioQuality(quality)
+                                        onShowMessage("Качество: $title")
+                                    },
                                     colors = RadioButtonDefaults.colors(
                                         selectedColor = MaterialTheme.colorScheme.primary,
                                         unselectedColor = MaterialTheme.colorScheme.onSurfaceVariant
@@ -902,22 +1079,9 @@ fun CacheQualityScreen(
             }
 
             item {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    SonoraSectionTitle(title = "КЭШ И АВТОЗАГРУЗКА")
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    SonoraSectionTitle(title = "УПРАВЛЕНИЕ КЭШЕМ И ЗАГРУЗКАМИ")
                     SonoraCard(modifier = Modifier.fillMaxWidth()) {
-                        SonoraSettingsActionRow(
-                            title = "Качество кэша",
-                            subtitle = "Выбранный битрейт для офлайн-режима",
-                            valueText = qualityShortLabel,
-                            icon = SonoraIcons.HighQuality,
-                            iconTint = MaterialTheme.colorScheme.primary,
-                            onClick = {
-                                val entries = AudioQuality.entries
-                                val next = entries[(entries.indexOf(uiState.settings.audioQuality) + 1) % entries.size]
-                                viewModel.setAudioQuality(next)
-                            }
-                        )
-                        SonoraSettingsDivider()
                         SonoraSettingsSwitchRow(
                             title = "Автоматическая загрузка избранного",
                             subtitle = "Скачивать треки из Избранного по Wi-Fi",
@@ -934,14 +1098,38 @@ fun CacheQualityScreen(
                         )
                         SonoraSettingsDivider()
                         SonoraSettingsActionRow(
-                            title = "Очистить кэш аудио",
-                            subtitle = "Освободить место на устройстве",
-                            valueText = cacheMbLabel,
+                            title = "Очистить потоковый кэш",
+                            subtitle = "Удалить временный буфер стриминга (до 256 МБ LRU)",
+                            valueText = streamCacheLabel,
                             icon = SonoraIcons.CleaningServices,
                             onClick = {
-                                viewModel.clearCache { onShowMessage("Кэш аудио очищен") }
+                                viewModel.clearCache { onShowMessage("Потоковый кэш очищен") }
                             },
                             modifier = Modifier.testTag("cache_quality_clear_button")
+                        )
+                        SonoraSettingsDivider()
+                        SonoraSettingsActionRow(
+                            title = "Удалить все офлайн-треки",
+                            subtitle = if (uiState.offlineTracksCount > 0) {
+                                "Освободить память от ${DurationFormatter.formatTrackCount(uiState.offlineTracksCount)}"
+                            } else {
+                                "Нет сохранённых офлайн-треков"
+                            },
+                            valueText = offlineBytesLabel,
+                            icon = SonoraIcons.DeleteOutline,
+                            iconTint = if (uiState.offlineTracksCount > 0) {
+                                MaterialTheme.colorScheme.error
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                            onClick = {
+                                if (uiState.offlineTracksCount > 0) {
+                                    showClearDownloadsDialog = true
+                                } else {
+                                    onShowMessage("Нет скачанных треков для удаления")
+                                }
+                            },
+                            modifier = Modifier.testTag("cache_quality_clear_downloads_button")
                         )
                     }
                 }
@@ -1034,7 +1222,7 @@ fun YouTubeAccountScreen(
         LazyColumn(
             modifier = Modifier.fillMaxSize(),
             contentPadding = PaddingValues(horizontal = 16.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(18.dp)
+            verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             if (active == null) {
                 item {
@@ -1067,7 +1255,7 @@ fun YouTubeAccountScreen(
                                 textAlign = TextAlign.Center
                             )
                             Text(
-                                text = "Импортируйте любимые треки, плейлисты и историю прослушиваний с автоматической синхронизацией.",
+                                text = "Импортируйте любимые треки, плейлисты и историю прослушиваний с автоматической двусторонней синхронизацией.",
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 textAlign = TextAlign.Center
@@ -1082,6 +1270,7 @@ fun YouTubeAccountScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .height(50.dp)
+                                    .testTag("yt_account_signin_button")
                             ) {
                                 Text("Войти в аккаунт YouTube", fontWeight = FontWeight.Bold)
                             }
@@ -1092,6 +1281,7 @@ fun YouTubeAccountScreen(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .height(48.dp)
+                                    .testTag("yt_account_cookie_signin_button")
                             ) {
                                 Text("Войти через Cookie браузера")
                             }
@@ -1103,7 +1293,7 @@ fun YouTubeAccountScreen(
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(vertical = 8.dp),
+                            .padding(vertical = 6.dp),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
@@ -1164,18 +1354,24 @@ fun YouTubeAccountScreen(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
                             }
-                            val syncText = remember(active.lastSyncTimestamp) {
-                                if (active.lastSyncTimestamp > 0L) {
-                                    val fmt = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, Locale.getDefault())
-                                    "Синхронизировано • ${fmt.format(Date(active.lastSyncTimestamp))}"
-                                } else {
-                                    "Синхронизировано"
+                            val syncText = remember(active.lastSyncTimestamp, uiState.isOnline) {
+                                when {
+                                    !uiState.isOnline -> "Офлайн • Ожидание сети"
+                                    active.lastSyncTimestamp > 0L -> {
+                                        val fmt = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, Locale.getDefault())
+                                        "Синхронизировано • ${fmt.format(Date(active.lastSyncTimestamp))}"
+                                    }
+                                    else -> "Готов к синхронизации"
                                 }
                             }
                             Text(
                                 text = syncText,
                                 style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
-                                color = MaterialTheme.colorScheme.primary
+                                color = if (uiState.isOnline) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
                             )
                         }
 
@@ -1201,38 +1397,124 @@ fun YouTubeAccountScreen(
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text("Синхронизация...", fontWeight = FontWeight.Bold)
                             } else {
+                                Icon(
+                                    imageVector = SonoraIcons.Sync,
+                                    contentDescription = null,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
                                 Text("Синхронизировать", fontWeight = FontWeight.Bold)
                             }
                         }
 
                         when (val s = uiState.syncState) {
                             is AccountSyncState.Syncing -> {
-                                Column(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                SonoraCard(modifier = Modifier.fillMaxWidth()) {
+                                    Column(
+                                        modifier = Modifier.padding(14.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        LinearProgressIndicator(
+                                            progress = { s.progress.coerceIn(0.05f, 1f) },
+                                            modifier = Modifier.fillMaxWidth(),
+                                            color = MaterialTheme.colorScheme.primary,
+                                            trackColor = MaterialTheme.colorScheme.surfaceContainerHighest
+                                        )
+                                        Text(
+                                            text = s.stage,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                }
+                            }
+                            is AccountSyncState.Completed -> {
+                                SonoraCard(
+                                    borderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.45f),
+                                    modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    LinearProgressIndicator(
-                                        progress = { s.progress.coerceIn(0.05f, 1f) },
-                                        modifier = Modifier.fillMaxWidth(),
-                                        color = MaterialTheme.colorScheme.primary,
-                                        trackColor = MaterialTheme.colorScheme.surfaceContainerHighest
-                                    )
-                                    Text(
-                                        text = s.stage,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.primary
-                                    )
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.SpaceBetween
+                                    ) {
+                                        Text(
+                                            text = "Импортировано: +${s.summary.importedLiked} избр., +${s.summary.importedPlaylists} пл., +${s.summary.importedHistory} ист.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        IconButton(
+                                            onClick = accountViewModel::clearSyncState,
+                                            modifier = Modifier.size(28.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Rounded.Close,
+                                                contentDescription = "Скрыть",
+                                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                        }
+                                    }
                                 }
                             }
                             is AccountSyncState.Error -> {
-                                Text(
-                                    text = s.message,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.error,
-                                    textAlign = TextAlign.Center
-                                )
+                                SonoraCard(
+                                    borderColor = MaterialTheme.colorScheme.error.copy(alpha = 0.5f),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        Text(
+                                            text = s.message,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.error,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        TextButton(
+                                            onClick = { accountViewModel.syncAndMergeActiveAccount(onShowMessage) }
+                                        ) {
+                                            Text("Повторить")
+                                        }
+                                    }
+                                }
                             }
                             else -> Unit
+                        }
+                    }
+                }
+
+                item {
+                    SonoraCard(modifier = Modifier.fillMaxWidth()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 14.dp),
+                            horizontalArrangement = Arrangement.SpaceEvenly,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            AccountStatColumn(
+                                value = uiState.favoriteCount.toString(),
+                                label = "Избранное",
+                                modifier = Modifier.weight(1f)
+                            )
+                            AccountStatColumn(
+                                value = uiState.playlistCount.toString(),
+                                label = "Плейлисты",
+                                modifier = Modifier.weight(1f)
+                            )
+                            AccountStatColumn(
+                                value = uiState.historyCount.toString(),
+                                label = "История",
+                                modifier = Modifier.weight(1f)
+                            )
                         }
                     }
                 }
@@ -1299,45 +1581,83 @@ fun YouTubeAccountScreen(
                 }
 
                 item {
-                    SonoraCard(modifier = Modifier.fillMaxWidth()) {
-                        SonoraSettingsSwitchRow(
-                            title = "Автосинхронизация плейлистов",
-                            subtitle = "Обновлять треки и лайки при каждом запуске",
-                            icon = SonoraIcons.Sync,
-                            checked = uiState.autoSyncEnabled,
-                            onCheckedChange = accountViewModel::setAutoSyncEnabled,
-                            testTag = "yt_account_autosync_switch"
-                        )
-                        SonoraSettingsDivider()
-                        SonoraSettingsActionRow(
-                            title = "Импорт из YouTube Music",
-                            subtitle = "Перенести историю и сохранённые плейлисты",
-                            valueText = "Обновить",
-                            icon = SonoraIcons.CloudDownload,
-                            onClick = {
-                                if (!isSyncing) accountViewModel.syncAndMergeActiveAccount(onShowMessage)
-                            }
-                        )
-                        SonoraSettingsDivider()
-                        SonoraSettingsActionRow(
-                            title = "Добавить ещё аккаунт",
-                            subtitle = "Подключить второй профиль Google",
-                            icon = Icons.Rounded.Add,
-                            onClick = { if (!isSyncing) onOpenLogin(true) }
-                        )
-                        SonoraSettingsDivider()
-                        SonoraSettingsActionRow(
-                            title = "Отвязать аккаунт",
-                            subtitle = "Выйти из учётной записи и очистить кэш",
-                            icon = SonoraIcons.Logout,
-                            iconTint = MaterialTheme.colorScheme.error,
-                            onClick = onOpenSignOutConfirm,
-                            modifier = Modifier.testTag("yt_account_unlink_button")
-                        )
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        SonoraSectionTitle(title = "НАСТРОЙКИ СИНХРОНИЗАЦИИ")
+                        SonoraCard(modifier = Modifier.fillMaxWidth()) {
+                            SonoraSettingsSwitchRow(
+                                title = "Автосинхронизация плейлистов",
+                                subtitle = "Обновлять треки и лайки при каждом запуске",
+                                icon = SonoraIcons.Sync,
+                                checked = uiState.autoSyncEnabled,
+                                onCheckedChange = accountViewModel::setAutoSyncEnabled,
+                                testTag = "yt_account_autosync_switch"
+                            )
+                            SonoraSettingsDivider()
+                            SonoraSettingsActionRow(
+                                title = "Импорт из YouTube Music",
+                                subtitle = "Перенести историю и сохранённые плейлисты",
+                                valueText = if (isSyncing) "Идёт..." else "Обновить",
+                                icon = SonoraIcons.CloudDownload,
+                                onClick = {
+                                    if (!isSyncing) accountViewModel.syncAndMergeActiveAccount(onShowMessage)
+                                }
+                            )
+                            SonoraSettingsDivider()
+                            SonoraSettingsActionRow(
+                                title = "Добавить ещё аккаунт",
+                                subtitle = "Войти во второй профиль через браузер",
+                                icon = Icons.Rounded.Add,
+                                onClick = { if (!isSyncing) onOpenLogin(true) }
+                            )
+                            SonoraSettingsDivider()
+                            SonoraSettingsActionRow(
+                                title = "Обновить сессию по Cookie",
+                                subtitle = "Импортировать SAPISID/SID вручную",
+                                icon = SonoraIcons.Key,
+                                onClick = { if (!isSyncing) showCookieDialog = true }
+                            )
+                            SonoraSettingsDivider()
+                            SonoraSettingsActionRow(
+                                title = "Отвязать аккаунт",
+                                subtitle = "Выйти из учётной записи и очистить кэш",
+                                icon = SonoraIcons.Logout,
+                                iconTint = MaterialTheme.colorScheme.error,
+                                onClick = onOpenSignOutConfirm,
+                                modifier = Modifier.testTag("yt_account_unlink_button")
+                            )
+                        }
                     }
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun AccountStatColumn(
+    value: String,
+    label: String,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Text(
+            text = value,
+            style = MaterialTheme.typography.titleLarge.copy(
+                fontWeight = FontWeight.ExtraBold,
+                fontFeatureSettings = "tnum"
+            ),
+            color = MaterialTheme.colorScheme.onBackground
+        )
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1
+        )
     }
 }
 

@@ -4,15 +4,18 @@ import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.core.common.FriendlyErrorMapper
+import com.example.core.common.NetworkMonitor
 import com.example.domain.model.AccountSyncState
 import com.example.domain.model.AccountSyncSummary
 import com.example.domain.model.YouTubeAccount
+import com.example.domain.repository.LibraryRepository
 import com.example.domain.repository.YouTubeAccountRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -23,29 +26,61 @@ data class YouTubeAccountUiState(
     val activeAccount: YouTubeAccount? = null,
     val autoSyncEnabled: Boolean = true,
     val syncState: AccountSyncState = AccountSyncState.Idle,
-    val isSigningIn: Boolean = false
+    val isSigningIn: Boolean = false,
+    val favoriteCount: Int = 0,
+    val playlistCount: Int = 0,
+    val historyCount: Int = 0,
+    val isOnline: Boolean = true
 )
 
 @HiltViewModel
 class YouTubeAccountViewModel @Inject constructor(
-    private val accountRepository: YouTubeAccountRepository
+    private val accountRepository: YouTubeAccountRepository,
+    private val libraryRepository: LibraryRepository,
+    private val networkMonitor: NetworkMonitor
 ) : ViewModel() {
 
     private val isSigningInFlow = MutableStateFlow(false)
 
-    val uiState: StateFlow<YouTubeAccountUiState> = combine(
+    private val accountDataFlow = combine(
         accountRepository.accounts,
         accountRepository.activeAccount,
         accountRepository.autoSyncEnabled,
         accountRepository.syncState,
         isSigningInFlow
     ) { accounts, active, autoSync, syncState, isSigningIn ->
-        YouTubeAccountUiState(
+        AccountBaseState(
             accounts = accounts,
             activeAccount = active,
             autoSyncEnabled = autoSync,
             syncState = syncState,
             isSigningIn = isSigningIn
+        )
+    }
+
+    private val libraryCountsFlow = combine(
+        libraryRepository.observeFavoriteIds().map { it.size },
+        libraryRepository.observePlaylists().map { it.size },
+        libraryRepository.observeHistory().map { it.size },
+        networkMonitor.isOnline
+    ) { favorites, playlists, history, isOnline ->
+        LibraryStats(favorites, playlists, history, isOnline)
+    }
+
+    val uiState: StateFlow<YouTubeAccountUiState> = combine(
+        accountDataFlow,
+        libraryCountsFlow
+    ) { base, stats ->
+        YouTubeAccountUiState(
+            accounts = base.accounts,
+            activeAccount = base.activeAccount,
+            autoSyncEnabled = base.autoSyncEnabled,
+            syncState = base.syncState,
+            isSigningIn = base.isSigningIn,
+            favoriteCount = stats.favorites,
+            playlistCount = stats.playlists,
+            historyCount = stats.history,
+            isOnline = stats.isOnline
         )
     }.stateIn(
         scope = viewModelScope,
@@ -160,4 +195,19 @@ class YouTubeAccountViewModel @Inject constructor(
             "Готово: ${parts.joinToString(", ")}"
         }
     }
+
+    private data class AccountBaseState(
+        val accounts: List<YouTubeAccount>,
+        val activeAccount: YouTubeAccount?,
+        val autoSyncEnabled: Boolean,
+        val syncState: AccountSyncState,
+        val isSigningIn: Boolean
+    )
+
+    private data class LibraryStats(
+        val favorites: Int,
+        val playlists: Int,
+        val history: Int,
+        val isOnline: Boolean
+    )
 }

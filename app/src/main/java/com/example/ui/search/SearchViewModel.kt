@@ -4,6 +4,7 @@ import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.core.common.FriendlyErrorMapper
+import com.example.core.common.NetworkMonitor
 import com.example.data.local.TrackDownloadManager
 import com.example.domain.model.PlaybackState
 import com.example.domain.model.Playlist
@@ -37,10 +38,19 @@ import javax.inject.Inject
 sealed interface SearchResultsState {
     data object Idle : SearchResultsState
     data object Loading : SearchResultsState
-    data class Tracks(val items: List<Track>, val playlistTitle: String? = null) : SearchResultsState
+    data class Tracks(
+        val items: List<Track>,
+        val playlistTitle: String? = null,
+        val headerSubtitle: String? = null,
+        val isArtistCollection: Boolean = false
+    ) : SearchResultsState
+
     data class Playlists(val items: List<YouTubePlaylistSummary>) : SearchResultsState
     data class Artists(val items: List<YouTubeArtistSummary>) : SearchResultsState
-    data class Error(val message: String) : SearchResultsState
+    data class Error(
+        val message: String,
+        val isNetworkError: Boolean = false
+    ) : SearchResultsState
 }
 
 @Immutable
@@ -49,6 +59,7 @@ data class SearchUiState(
     val selectedFilter: SearchFilter = SearchFilter.TRACKS,
     val suggestions: List<String> = emptyList(),
     val localMatches: List<Track> = emptyList(),
+    val localPlaylistMatches: List<Playlist> = emptyList(),
     val searchHistory: List<String> = emptyList(),
     val resultsState: SearchResultsState = SearchResultsState.Idle,
     val canNavigateBackInResults: Boolean = false,
@@ -56,7 +67,8 @@ data class SearchUiState(
     val downloadedIds: Set<String> = emptySet(),
     val downloadingIds: Set<String> = emptySet(),
     val playlists: List<Playlist> = emptyList(),
-    val playbackState: PlaybackState = PlaybackState()
+    val playbackState: PlaybackState = PlaybackState(),
+    val isOnline: Boolean = true
 )
 
 @OptIn(FlowPreview::class, ExperimentalCoroutinesApi::class)
@@ -65,7 +77,8 @@ class SearchViewModel @Inject constructor(
     private val youTubeRepository: YouTubeRepository,
     private val libraryRepository: LibraryRepository,
     private val playbackManager: PlaybackManager,
-    private val trackDownloadManager: TrackDownloadManager
+    private val trackDownloadManager: TrackDownloadManager,
+    private val networkMonitor: NetworkMonitor
 ) : ViewModel() {
 
     private val queryFlow = MutableStateFlow("")
@@ -77,9 +90,10 @@ class SearchViewModel @Inject constructor(
 
     private val suggestionsFlow = combine(
         queryFlow.map { it.trim() },
-        suppressSuggestionsFlow
-    ) { trimmed, suppressed ->
-        if (suppressed || trimmed.length < 2 || isYouTubePlaylistUrl(trimmed)) "" else trimmed
+        suppressSuggestionsFlow,
+        networkMonitor.isOnline
+    ) { trimmed, suppressed, isOnline ->
+        if (!isOnline || suppressed || trimmed.length < 2 || isYouTubeUrl(trimmed)) "" else trimmed
     }
         .debounce(220L)
         .distinctUntilChanged()
@@ -93,21 +107,46 @@ class SearchViewModel @Inject constructor(
             }
         }
 
-    // Instant local matches across Favorites, Downloads, and History (0ms, works offline)
+    // Instant local matches across Downloads, Favorites, History, and Playlists (0ms, works offline)
     private val localMatchesFlow = combine(
         queryFlow.map { it.trim().lowercase() }.distinctUntilChanged(),
         libraryRepository.observeDownloadedTracks(),
         libraryRepository.observeFavorites(),
         libraryRepository.observeHistory()
     ) { normalizedQuery, downloads, favorites, history ->
-        if (normalizedQuery.length < 2) {
+        if (normalizedQuery.isEmpty() || isYouTubeUrl(normalizedQuery)) {
             emptyList()
         } else {
             val combined = (downloads + favorites + history).distinctBy { it.id }
-            combined.filter { track ->
-                track.title.contains(normalizedQuery, ignoreCase = true) ||
-                    track.artist.contains(normalizedQuery, ignoreCase = true)
-            }.take(8)
+            val prefixMatches = combined.filter { track ->
+                track.title.startsWith(normalizedQuery, ignoreCase = true) ||
+                    track.artist.startsWith(normalizedQuery, ignoreCase = true)
+            }
+            val containsMatches = combined.filter { track ->
+                track !in prefixMatches && (
+                    track.title.contains(normalizedQuery, ignoreCase = true) ||
+                        track.artist.contains(normalizedQuery, ignoreCase = true)
+                    )
+            }
+            (prefixMatches + containsMatches).take(10)
+        }
+    }.flowOn(Dispatchers.Default)
+
+    private val localPlaylistMatchesFlow = combine(
+        queryFlow.map { it.trim().lowercase() }.distinctUntilChanged(),
+        libraryRepository.observePlaylists()
+    ) { normalizedQuery, playlists ->
+        if (normalizedQuery.isEmpty() || isYouTubeUrl(normalizedQuery)) {
+            emptyList()
+        } else {
+            val prefix = playlists.filter { it.name.startsWith(normalizedQuery, ignoreCase = true) }
+            val contains = playlists.filter {
+                it !in prefix && (
+                    it.name.contains(normalizedQuery, ignoreCase = true) ||
+                        it.description.contains(normalizedQuery, ignoreCase = true)
+                    )
+            }
+            (prefix + contains).take(6)
         }
     }.flowOn(Dispatchers.Default)
 
@@ -160,15 +199,17 @@ class SearchViewModel @Inject constructor(
 
     val uiState: StateFlow<SearchUiState> = combine(
         searchInputsFlow,
+        localPlaylistMatchesFlow,
         resultsFlow,
         previousResultsStackFlow,
-        librarySignalsFlow
-    ) { inputs, resultsState, backStack, signals ->
+        combine(librarySignalsFlow, networkMonitor.isOnline) { signals, online -> signals to online }
+    ) { inputs, localPlaylists, resultsState, backStack, (signals, isOnline) ->
         SearchUiState(
             query = inputs.query,
             selectedFilter = inputs.filter,
             suggestions = inputs.suggestions,
             localMatches = inputs.localMatches,
+            localPlaylistMatches = localPlaylists,
             searchHistory = inputs.searchHistory,
             resultsState = resultsState,
             canNavigateBackInResults = backStack.isNotEmpty(),
@@ -176,7 +217,8 @@ class SearchViewModel @Inject constructor(
             downloadedIds = signals.downloadedIds,
             downloadingIds = signals.downloadingIds,
             playlists = signals.playlists,
-            playbackState = signals.playbackState
+            playbackState = signals.playbackState,
+            isOnline = isOnline
         )
     }.stateIn(
         scope = viewModelScope,
@@ -207,7 +249,7 @@ class SearchViewModel @Inject constructor(
     fun selectFilter(filter: SearchFilter) {
         if (filterFlow.value == filter) return
         filterFlow.value = filter
-        if (queryFlow.value.isNotBlank()) {
+        if (queryFlow.value.isNotBlank() && resultsFlow.value !is SearchResultsState.Idle) {
             submitSearch()
         }
     }
@@ -222,21 +264,32 @@ class SearchViewModel @Inject constructor(
 
         searchJob?.cancel()
         previousResultsStackFlow.value = emptyList()
+
+        if (!networkMonitor.isOnline.value) {
+            resultsFlow.value = SearchResultsState.Error(
+                message = "Нет подключения к интернету. Проверьте Wi-Fi или мобильную сеть и попробуйте снова.",
+                isNetworkError = true
+            )
+            return
+        }
+
         searchJob = viewModelScope.launch {
             resultsFlow.value = SearchResultsState.Loading
-            if (!isYouTubePlaylistUrl(target)) {
+            if (!isYouTubeUrl(target)) {
                 libraryRepository.recordSearchQuery(target)
             }
 
             if (isYouTubePlaylistUrl(target)) {
                 youTubeRepository.getPlaylistWithTitle(target).fold(
                     onSuccess = { (title, tracks) ->
-                        resultsFlow.value = SearchResultsState.Tracks(tracks, playlistTitle = title)
+                        resultsFlow.value = SearchResultsState.Tracks(
+                            items = tracks,
+                            playlistTitle = title,
+                            headerSubtitle = "Плейлист YouTube"
+                        )
                     },
                     onFailure = { error ->
-                        resultsFlow.value = SearchResultsState.Error(
-                            FriendlyErrorMapper.map(error, "Не удалось загрузить плейлист YouTube")
-                        )
+                        resultsFlow.value = toErrorState(error, "Не удалось загрузить плейлист YouTube")
                     }
                 )
             } else {
@@ -245,9 +298,7 @@ class SearchViewModel @Inject constructor(
                         youTubeRepository.searchTracks(target).fold(
                             onSuccess = { resultsFlow.value = SearchResultsState.Tracks(it) },
                             onFailure = { err ->
-                                resultsFlow.value = SearchResultsState.Error(
-                                    FriendlyErrorMapper.map(err, "Ошибка поиска треков.")
-                                )
+                                resultsFlow.value = toErrorState(err, "Ошибка поиска треков.")
                             }
                         )
                     }
@@ -255,9 +306,7 @@ class SearchViewModel @Inject constructor(
                         youTubeRepository.searchPlaylists(target).fold(
                             onSuccess = { resultsFlow.value = SearchResultsState.Playlists(it) },
                             onFailure = { err ->
-                                resultsFlow.value = SearchResultsState.Error(
-                                    FriendlyErrorMapper.map(err, "Ошибка поиска плейлистов.")
-                                )
+                                resultsFlow.value = toErrorState(err, "Ошибка поиска плейлистов.")
                             }
                         )
                     }
@@ -265,9 +314,7 @@ class SearchViewModel @Inject constructor(
                         youTubeRepository.searchArtists(target).fold(
                             onSuccess = { resultsFlow.value = SearchResultsState.Artists(it) },
                             onFailure = { err ->
-                                resultsFlow.value = SearchResultsState.Error(
-                                    FriendlyErrorMapper.map(err, "Ошибка поиска исполнителей.")
-                                )
+                                resultsFlow.value = toErrorState(err, "Ошибка поиска исполнителей.")
                             }
                         )
                     }
@@ -281,17 +328,26 @@ class SearchViewModel @Inject constructor(
         if (current is SearchResultsState.Playlists || current is SearchResultsState.Artists) {
             previousResultsStackFlow.value = previousResultsStackFlow.value + current
         }
+        if (!networkMonitor.isOnline.value) {
+            resultsFlow.value = SearchResultsState.Error(
+                message = "Нет подключения к интернету. Проверьте сеть и попробуйте открыть плейлист снова.",
+                isNetworkError = true
+            )
+            return
+        }
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
             resultsFlow.value = SearchResultsState.Loading
             youTubeRepository.getPlaylistWithTitle(summary.url).fold(
                 onSuccess = { (title, tracks) ->
-                    resultsFlow.value = SearchResultsState.Tracks(tracks, playlistTitle = title)
+                    resultsFlow.value = SearchResultsState.Tracks(
+                        items = tracks,
+                        playlistTitle = title,
+                        headerSubtitle = summary.uploaderName.takeIf { it.isNotBlank() } ?: "Плейлист YouTube"
+                    )
                 },
                 onFailure = { err ->
-                    resultsFlow.value = SearchResultsState.Error(
-                        FriendlyErrorMapper.map(err, "Не удалось открыть плейлист")
-                    )
+                    resultsFlow.value = toErrorState(err, "Не удалось открыть плейлист")
                 }
             )
         }
@@ -302,17 +358,27 @@ class SearchViewModel @Inject constructor(
         if (current is SearchResultsState.Artists || current is SearchResultsState.Playlists) {
             previousResultsStackFlow.value = previousResultsStackFlow.value + current
         }
+        if (!networkMonitor.isOnline.value) {
+            resultsFlow.value = SearchResultsState.Error(
+                message = "Нет подключения к интернету. Проверьте сеть и повторите попытку.",
+                isNetworkError = true
+            )
+            return
+        }
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
             resultsFlow.value = SearchResultsState.Loading
             youTubeRepository.getArtistTracks(artist.url).fold(
                 onSuccess = { tracks ->
-                    resultsFlow.value = SearchResultsState.Tracks(tracks, playlistTitle = artist.name)
+                    resultsFlow.value = SearchResultsState.Tracks(
+                        items = tracks,
+                        playlistTitle = artist.name,
+                        headerSubtitle = "Популярные треки исполнителя",
+                        isArtistCollection = true
+                    )
                 },
                 onFailure = { err ->
-                    resultsFlow.value = SearchResultsState.Error(
-                        FriendlyErrorMapper.map(err, "Не удалось загрузить треки артиста")
-                    )
+                    resultsFlow.value = toErrorState(err, "Не удалось загрузить треки артиста")
                 }
             )
         }
@@ -402,9 +468,28 @@ class SearchViewModel @Inject constructor(
         }
     }
 
-    private fun isYouTubePlaylistUrl(input: String): Boolean {
-        return input.contains("youtube.com", ignoreCase = true) &&
-            input.contains("list=", ignoreCase = true)
+    private fun toErrorState(error: Throwable, fallback: String): SearchResultsState.Error {
+        val friendly = FriendlyErrorMapper.map(error, fallback)
+        val isNet = !networkMonitor.isOnline.value ||
+            friendly.contains("интернет", ignoreCase = true) ||
+            friendly.contains("подключ", ignoreCase = true) ||
+            friendly.contains("долго не отвечает", ignoreCase = true)
+        return SearchResultsState.Error(message = friendly, isNetworkError = isNet)
+    }
+
+    companion object {
+        fun isYouTubeUrl(input: String): Boolean {
+            val lower = input.trim().lowercase()
+            return lower.contains("youtube.com/") ||
+                lower.contains("music.youtube.com/") ||
+                lower.contains("youtu.be/")
+        }
+
+        fun isYouTubePlaylistUrl(input: String): Boolean {
+            val lower = input.trim().lowercase()
+            return (lower.contains("youtube.com") || lower.contains("music.youtube.com")) &&
+                lower.contains("list=")
+        }
     }
 
     private data class SearchInputs(

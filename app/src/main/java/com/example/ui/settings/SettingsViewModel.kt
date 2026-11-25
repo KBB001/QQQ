@@ -15,6 +15,7 @@ import com.example.domain.model.AppUpdateInfo
 import com.example.domain.model.AppUpdateUiState
 import com.example.domain.model.AudioQuality
 import com.example.domain.model.PlaybackState
+import com.example.domain.repository.LibraryRepository
 import com.example.domain.repository.SettingsRepository
 import com.example.domain.repository.YouTubeAccountRepository
 import com.example.playback.AudioCacheProvider
@@ -28,6 +29,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.io.File
@@ -38,13 +40,21 @@ data class SettingsUiState(
     val playbackState: PlaybackState = PlaybackState(),
     val equalizerState: EqualizerState = EqualizerState(),
     val cacheSizeBytes: Long = 0L,
+    val offlineDownloadsBytes: Long = 0L,
+    val offlineTracksCount: Int = 0,
+    val favoritesCount: Int = 0,
+    val playlistsCount: Int = 0,
     val updateState: AppUpdateUiState = AppUpdateUiState.Idle,
     val lastAutoBackupLocation: String? = null
-)
+) {
+    val totalStorageBytes: Long
+        get() = cacheSizeBytes + offlineDownloadsBytes
+}
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
+    private val libraryRepository: LibraryRepository,
     private val backupCoordinator: BackupCoordinator,
     private val audioCacheProvider: AudioCacheProvider,
     private val playbackManager: PlaybackManager,
@@ -59,22 +69,40 @@ class SettingsViewModel @Inject constructor(
     private val autoBackupLocationFlow = MutableStateFlow<String?>(null)
     private var updateDownloadJob: Job? = null
 
+    private val libraryStatsFlow = combine(
+        libraryRepository.observeDownloadedBytes(),
+        libraryRepository.observeDownloadedIds().map { it.size },
+        libraryRepository.observeFavoriteIds().map { it.size },
+        libraryRepository.observePlaylists().map { it.size }
+    ) { downloadedBytes, downloadedCount, favCount, playlistCount ->
+        LibraryStorageStats(
+            offlineDownloadsBytes = downloadedBytes,
+            offlineTracksCount = downloadedCount,
+            favoritesCount = favCount,
+            playlistsCount = playlistCount
+        )
+    }
+
     val uiState: StateFlow<SettingsUiState> = combine(
         settingsRepository.settings,
         playbackManager.playbackState,
         equalizerManager.state,
         cacheSizeFlow,
-        updateStateFlow,
-        autoBackupLocationFlow
-    ) { values ->
-        @Suppress("UNCHECKED_CAST")
+        combine(updateStateFlow, autoBackupLocationFlow, libraryStatsFlow) { update, backupLoc, stats ->
+            Triple(update, backupLoc, stats)
+        }
+    ) { settings, playback, eq, streamCacheBytes, (update, backupLoc, stats) ->
         SettingsUiState(
-            settings = values[0] as AppSettings,
-            playbackState = values[1] as PlaybackState,
-            equalizerState = values[2] as EqualizerState,
-            cacheSizeBytes = values[3] as Long,
-            updateState = values[4] as AppUpdateUiState,
-            lastAutoBackupLocation = values[5] as String?
+            settings = settings,
+            playbackState = playback,
+            equalizerState = eq,
+            cacheSizeBytes = streamCacheBytes,
+            offlineDownloadsBytes = stats.offlineDownloadsBytes,
+            offlineTracksCount = stats.offlineTracksCount,
+            favoritesCount = stats.favoritesCount,
+            playlistsCount = stats.playlistsCount,
+            updateState = update,
+            lastAutoBackupLocation = backupLoc
         )
     }.stateIn(
         scope = viewModelScope,
@@ -147,6 +175,13 @@ class SettingsViewModel @Inject constructor(
             audioCacheProvider.clearCache()
             cacheSizeFlow.value = audioCacheProvider.getCacheSizeBytes()
             onCleared()
+        }
+    }
+
+    fun clearOfflineDownloads(onCleared: (Int) -> Unit) {
+        viewModelScope.launch {
+            val removed = libraryRepository.clearAllDownloadedTracks()
+            onCleared(removed)
         }
     }
 
@@ -244,7 +279,6 @@ class SettingsViewModel @Inject constructor(
                 downloadedBytes = 0L,
                 totalBytes = info.assetSizeBytes
             )
-            // Proactively create a full pre-update snapshot in Downloads/Sonora
             savePreUpdateBackupSnapshot()
             try {
                 appUpdateRepository.downloadApk(info).collect { event ->
@@ -281,4 +315,11 @@ class SettingsViewModel @Inject constructor(
         appUpdateRepository.clearCachedUpdates()
         updateStateFlow.value = AppUpdateUiState.Idle
     }
+
+    private data class LibraryStorageStats(
+        val offlineDownloadsBytes: Long,
+        val offlineTracksCount: Int,
+        val favoritesCount: Int,
+        val playlistsCount: Int
+    )
 }

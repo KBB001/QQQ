@@ -25,6 +25,7 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
@@ -78,6 +79,14 @@ class LibraryRepositoryImpl @Inject constructor(
 
     override fun observeDownloadedIds(): Flow<Set<String>> =
         downloadedTrackDao.observeDownloadedIds().map { it.toSet() }
+
+    override fun observeDownloadedBytes(): Flow<Long> =
+        downloadedTrackDao.observeDownloads().map { list ->
+            list.sumOf { entity ->
+                val resolved = resolveOfflineFile(entity.id, entity.localFilePath)
+                resolved?.length() ?: 0L
+            }
+        }.flowOn(Dispatchers.IO)
 
     override suspend fun getDownloadedFilePath(trackId: String): String? {
         val storedPath = downloadedTrackDao.getFilePath(trackId) ?: return null
@@ -148,6 +157,28 @@ class LibraryRepositoryImpl @Inject constructor(
             runCatching { File(path).delete() }
         }
         downloadedTrackDao.deleteDownload(trackId)
+    }
+
+    override suspend fun clearAllDownloadedTracks(): Int = withContext(Dispatchers.IO) {
+        val current = downloadedTrackDao.observeDownloads().first()
+        current.forEach { entity ->
+            if (entity.localFilePath.isNotBlank()) {
+                runCatching { File(entity.localFilePath).delete() }
+            }
+            resolveOfflineFile(entity.id, entity.localFilePath)?.let { file ->
+                runCatching { file.delete() }
+            }
+        }
+        context?.let { ctx ->
+            val offlineDir = File(ctx.filesDir, "offline_tracks")
+            if (offlineDir.exists()) {
+                offlineDir.listFiles()?.forEach { file ->
+                    if (file.isFile) runCatching { file.delete() }
+                }
+            }
+        }
+        downloadedTrackDao.clearAllDownloads()
+        current.size
     }
 
     override fun observeSearchHistory(): Flow<List<String>> =

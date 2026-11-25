@@ -328,4 +328,32 @@ object SonoraIcons {
             "M12,3c-4.97,0 -9,4.03 -9,9v7c0,1.1 0.9,2 2,2h4v-8H5v-1c0,-3.87 3.13,-7 7,-7s7,3.13 7,7v1h-4v8h4c1.1,0 2,-0.9 2,-2v-7c0,-4.97 -4.03,-9 -9,-9z"
         )
     }
+
+    val FastRewind: ImageVector by lazy {
+        vector(
+            "FastRewind",
+            "M11,18V6l-8.5,6 8.5,6zM11.5,12l8.5,6V6l-8.5,6z"
+        )
+    }
+
+    val FastForward: ImageVector by lazy {
+        vector(
+            "FastForward",
+            "M4,18l8.5,-6L4,6v12zM13,6v12l8.5,-6L13,6z"
+        )
+    }
+
+    val ContentPaste: ImageVector by lazy {
+        vector(
+            "ContentPaste",
+            "M19,2h-4.18C14.4,0.84 13.3,0 12,0c-1.3,0 -2.4,0.84 -2.82,2L5,2c-1.1,0 -2,0.9 -2,2v16c0,1.1 0.9,2 2,2h14c1.1,0 2,-0.9 2,-2L21,4c0,-1.1 -0.9,-2 -2,-2zM12,2c0.55,0 1,0.45 1,1s-0.45,1 -1,1 -1,-0.45 -1,-1 0.45,-1 1,-1zM19,20L5,20L5,4h2v3h10L17,4h2v16z"
+        )
+    }
+
+    val Storage: ImageVector by lazy {
+        vector(
+            "Storage",
+            "M2,20h20v-4L2,16v4zM4,17h2v2L4,19v-2zM2,4v4h20L22,4L2,4zM6,7L4,7L4,5h2v2zM2,14h20v-4L2,10v4zM4,11h2v2L4,13v-2z"
+        )
+    }
 }

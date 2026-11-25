@@ -340,6 +340,15 @@ fun SonoraNavHost(
                                         pendingLibraryTab = 1
                                         navigateTopLevel(SonoraRoute.Library)
                                     },
+                                    onOpenNowPlaying = { navController.navigate(SonoraRoute.NowPlaying) },
+                                    onOpenLibraryPlaylists = {
+                                        pendingLibraryTab = 0
+                                        navigateTopLevel(SonoraRoute.Library)
+                                    },
+                                    onOpenHistory = {
+                                        pendingLibraryTab = 3
+                                        navigateTopLevel(SonoraRoute.Library)
+                                    },
                                     bottomContentPadding = contentPadding,
                                     onShowMessage = ::showMessage
                                 )
@@ -349,6 +358,9 @@ fun SonoraNavHost(
                                 SearchScreen(
                                     bottomContentPadding = contentPadding,
                                     onShowMessage = ::showMessage,
+                                    onOpenPlaylist = { playlistId ->
+                                        navController.navigate(SonoraRoute.PlaylistDetail(playlistId))
+                                    },
                                     pendingQuery = pendingSearchQuery,
                                     onConsumePendingQuery = onConsumePendingSearchQuery
                                 )

@@ -252,4 +252,71 @@ class ExampleUnitTest {
         val defaults = com.example.domain.model.AppSettings()
         assertTrue(defaults.gaplessPlaybackEnabled)
     }
+
+    @Test
+    fun durationFormatter_formatsTrackCountWithRussianPlurals() {
+        assertEquals("0 треков", DurationFormatter.formatTrackCount(0))
+        assertEquals("1 трек", DurationFormatter.formatTrackCount(1))
+        assertEquals("2 трека", DurationFormatter.formatTrackCount(2))
+        assertEquals("4 трека", DurationFormatter.formatTrackCount(4))
+        assertEquals("5 треков", DurationFormatter.formatTrackCount(5))
+        assertEquals("11 треков", DurationFormatter.formatTrackCount(11))
+        assertEquals("14 треков", DurationFormatter.formatTrackCount(14))
+        assertEquals("21 трек", DurationFormatter.formatTrackCount(21))
+        assertEquals("22 трека", DurationFormatter.formatTrackCount(22))
+        assertEquals("105 треков", DurationFormatter.formatTrackCount(105))
+    }
+
+    @Test
+    fun homeUiState_startsWithPersonalizedForYouMood() {
+        assertEquals(
+            com.example.ui.home.HomeUiState.MOOD_FOR_YOU,
+            com.example.ui.home.HomeUiState.MOOD_CHIPS.first()
+        )
+        assertTrue(
+            com.example.ui.home.HomeUiState.toSearchQuery("Lo-Fi биты").isNotBlank()
+        )
+    }
+
+    @Test
+    fun durationFormatter_formatsBytesAccurately() {
+        assertEquals("0 МБ", DurationFormatter.formatBytes(0L))
+        assertEquals("0 МБ", DurationFormatter.formatBytes(-512L))
+        assertEquals("2.5 МБ", DurationFormatter.formatBytes((2.5 * 1024 * 1024).toLong()))
+        assertEquals("42 МБ", DurationFormatter.formatBytes(42L * 1024L * 1024L))
+        assertEquals("1.50 ГБ", DurationFormatter.formatBytes((1.5 * 1024 * 1024 * 1024).toLong()))
+    }
+
+    @Test
+    fun searchViewModel_detectsYouTubeUrlsAndMaintainsThreeFilters() {
+        assertTrue(com.example.ui.search.SearchViewModel.isYouTubeUrl("https://music.youtube.com/watch?v=abc123"))
+        assertTrue(com.example.ui.search.SearchViewModel.isYouTubeUrl("https://youtu.be/xyz789"))
+        assertFalse(com.example.ui.search.SearchViewModel.isYouTubeUrl("Каспийский Груз"))
+
+        assertTrue(com.example.ui.search.SearchViewModel.isYouTubePlaylistUrl("https://music.youtube.com/playlist?list=PL123"))
+        assertFalse(com.example.ui.search.SearchViewModel.isYouTubePlaylistUrl("https://music.youtube.com/watch?v=abc123"))
+
+        assertEquals(
+            listOf(
+                com.example.domain.model.SearchFilter.TRACKS,
+                com.example.domain.model.SearchFilter.PLAYLISTS,
+                com.example.domain.model.SearchFilter.ARTISTS
+            ),
+            com.example.domain.model.SearchFilter.entries
+        )
+
+        val defaultErr = com.example.ui.search.SearchResultsState.Error("Ошибка")
+        assertFalse(defaultErr.isNetworkError)
+        val netErr = com.example.ui.search.SearchResultsState.Error("Нет сети", isNetworkError = true)
+        assertTrue(netErr.isNetworkError)
+    }
+
+    @Test
+    fun settingsUiState_computesTotalStorageBytes() {
+        val state = com.example.ui.settings.SettingsUiState(
+            cacheSizeBytes = 120_000_000L,
+            offlineDownloadsBytes = 380_000_000L
+        )
+        assertEquals(500_000_000L, state.totalStorageBytes)
+    }
 }
