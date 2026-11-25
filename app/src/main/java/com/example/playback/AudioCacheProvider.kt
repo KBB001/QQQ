@@ -12,6 +12,7 @@ import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.datasource.cache.CacheWriter
 import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
+import com.example.core.security.SecurityStatusTracker
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -24,7 +25,8 @@ import javax.inject.Singleton
 @OptIn(UnstableApi::class)
 @Singleton
 class AudioCacheProvider @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val securityStatusTracker: SecurityStatusTracker? = null
 ) {
     private val cacheDir = File(context.cacheDir, "sonora_audio_cache").apply { mkdirs() }
     private val databaseProvider by lazy { StandaloneDatabaseProvider(context) }
@@ -42,7 +44,7 @@ class AudioCacheProvider @Inject constructor(
     private fun buildHttpUpstreamFactory(): DataSource.Factory {
         val httpFactory = DefaultHttpDataSource.Factory()
             .setUserAgent("Mozilla/5.0 (Android 14; Mobile) Sonora/1.0")
-            .setAllowCrossProtocolRedirects(true)
+            .setAllowCrossProtocolRedirects(false)
             .setConnectTimeoutMs(15_000)
             .setReadTimeoutMs(15_000)
 
@@ -66,6 +68,10 @@ class AudioCacheProvider @Inject constructor(
         maxBytes: Long = DEFAULT_PREFETCH_BYTES
     ) = withContext(Dispatchers.IO) {
         if (trackId.isBlank() || streamUrl.isBlank()) return@withContext
+        if (!streamUrl.startsWith("https://", ignoreCase = true)) {
+            securityStatusTracker?.recordBlockedInsecureConnection(streamUrl)
+            return@withContext
+        }
         if (prefetchedTrackUrls[trackId] == streamUrl) return@withContext
         if (!activePrefetchIds.add(trackId)) return@withContext
 

@@ -319,4 +319,94 @@ class ExampleUnitTest {
         )
         assertEquals(500_000_000L, state.totalStorageBytes)
     }
+
+    @Test
+    fun backupCipher_encryptsDecryptsAndDetectsTampering() {
+        val plain = """{"version":2,"favorites":[{"id":"trk1","title":"Song"}]}"""
+        val encrypted = com.example.core.security.BackupCipher.encrypt(plain, "StrongPass123")
+        assertTrue(com.example.core.security.BackupCipher.isEncryptedBackup(encrypted))
+        assertFalse(encrypted.contains("Song"))
+        assertFalse(com.example.core.security.BackupCipher.isEncryptedBackup(plain))
+
+        val decrypted = com.example.core.security.BackupCipher.decrypt(encrypted, "StrongPass123")
+        assertTrue(decrypted.isSuccess)
+        assertEquals(plain, decrypted.getOrThrow())
+
+        val wrongPwd = com.example.core.security.BackupCipher.decrypt(encrypted, "WrongPass999")
+        assertTrue(wrongPwd.isFailure)
+
+        val match = Regex("\"ciphertext\"\\s*:\\s*\"([A-Za-z0-9+/=]+)\"").find(encrypted)!!
+        val origCt = match.groupValues[1]
+        val flippedChar = if (origCt.first() == 'A') 'B' else 'A'
+        val tamperedCt = flippedChar + origCt.substring(1)
+        val tampered = encrypted.replaceFirst(origCt, tamperedCt)
+        val tamperedRes = com.example.core.security.BackupCipher.decrypt(tampered, "StrongPass123")
+        assertTrue(tamperedRes.isFailure)
+    }
+
+    @Test
+    fun httpsOnlyInterceptor_blocksCleartextHttpAndTracksHost() {
+        val tracker = com.example.core.security.SecurityStatusTracker()
+        val interceptor = com.example.core.security.HttpsOnlyInterceptor(tracker)
+
+        val httpRequest = okhttp3.Request.Builder()
+            .url("http://insecure.example.org/audio.mp3")
+            .build()
+
+        var thrown: Throwable? = null
+        try {
+            interceptor.intercept(FakeChain(httpRequest))
+        } catch (t: Throwable) {
+            thrown = t
+        }
+        assertTrue(thrown is javax.net.ssl.SSLPeerUnverifiedException)
+        assertEquals(1, tracker.blockedInsecureCount.value)
+        assertEquals("insecure.example.org", tracker.lastBlockedHost.value)
+
+        val httpsRequest = okhttp3.Request.Builder()
+            .url("https://music.youtube.com/browse")
+            .build()
+        val resp = interceptor.intercept(FakeChain(httpsRequest))
+        assertEquals(200, resp.code)
+        assertEquals(1, tracker.blockedInsecureCount.value)
+    }
+
+    @Test
+    fun appSettings_defaultsAndSha256ComputationAreSecure() {
+        val defaults = com.example.domain.model.AppSettings()
+        assertTrue(defaults.encryptBackupsEnabled)
+        assertTrue(defaults.autoCheckUpdatesEnabled)
+        assertFalse(defaults.screenSecurityEnabled)
+        assertEquals(0L, defaults.lastUpdateCheckAtMs)
+
+        val temp = kotlin.io.path.createTempFile("sonora_hash_test", ".bin").toFile()
+        try {
+            temp.writeText("sonora-security-test", Charsets.UTF_8)
+            val hash = com.example.core.common.ApkInstaller.computeFileSha256(temp)
+            assertEquals(64, hash?.length)
+            assertEquals(hash, com.example.core.common.ApkInstaller.computeFileSha256(temp))
+        } finally {
+            temp.delete()
+        }
+    }
+
+    private class FakeChain(private val req: okhttp3.Request) : okhttp3.Interceptor.Chain {
+        override fun request(): okhttp3.Request = req
+        override fun proceed(request: okhttp3.Request): okhttp3.Response {
+            return okhttp3.Response.Builder()
+                .request(request)
+                .protocol(okhttp3.Protocol.HTTP_1_1)
+                .code(200)
+                .message("OK")
+                .build()
+        }
+        override fun connection(): okhttp3.Connection? = null
+        override fun call(): okhttp3.Call = throw UnsupportedOperationException()
+        override fun connectTimeoutMillis(): Int = 10_000
+        override fun withConnectTimeout(timeout: Int, unit: java.util.concurrent.TimeUnit): okhttp3.Interceptor.Chain = this
+        override fun readTimeoutMillis(): Int = 10_000
+        override fun withReadTimeout(timeout: Int, unit: java.util.concurrent.TimeUnit): okhttp3.Interceptor.Chain = this
+        override fun writeTimeoutMillis(): Int = 10_000
+        override fun withWriteTimeout(timeout: Int, unit: java.util.concurrent.TimeUnit): okhttp3.Interceptor.Chain = this
+    }
 }

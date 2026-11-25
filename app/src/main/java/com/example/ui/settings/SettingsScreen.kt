@@ -18,10 +18,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.background
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -36,6 +39,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -72,6 +76,7 @@ fun SettingsScreen(
     onOpenCacheQuality: () -> Unit = {},
     onOpenYouTubeAccount: () -> Unit = {},
     onOpenSignOutConfirm: () -> Unit = {},
+    onOpenSecuritySettings: () -> Unit = {},
     viewModel: SettingsViewModel = hiltViewModel(),
     accountViewModel: YouTubeAccountViewModel = hiltViewModel()
 ) {
@@ -83,6 +88,29 @@ fun SettingsScreen(
     var showSleepTimerSheet by remember { mutableStateOf(false) }
     var showBackupSheet by remember { mutableStateOf(false) }
     var showThemeSheet by remember { mutableStateOf(false) }
+    var showExportPasswordDialog by remember { mutableStateOf(false) }
+    var pendingExportPassword by remember { mutableStateOf<String?>(null) }
+    var pendingEncryptedImportPayload by remember { mutableStateOf<String?>(null) }
+    var passwordInput by remember { mutableStateOf("") }
+    var passwordConfirmInput by remember { mutableStateOf("") }
+    var passwordError by remember { mutableStateOf<String?>(null) }
+
+    fun notifyRestoreSuccess(summary: com.example.data.repository.BackupRestoreSummary) {
+        val parts = buildList {
+            if (summary.tracksRestored > 0) add("треков: ${summary.tracksRestored}")
+            if (summary.playlistsRestored > 0) add("плейлистов: ${summary.playlistsRestored}")
+            if (summary.searchQueriesRestored > 0) add("запросов: ${summary.searchQueriesRestored}")
+            if (summary.settingsRestored) add("настройки")
+            if (summary.playbackRestored) add("очередь")
+            if (summary.equalizerRestored) add("эквалайзер")
+        }
+        val msg = if (parts.isEmpty()) {
+            "Резервная копия применена"
+        } else {
+            "Восстановлено (${parts.joinToString(", ")})"
+        }
+        onShowMessage(msg)
+    }
 
     LaunchedEffect(Unit) {
         viewModel.refreshCacheSize()
@@ -91,20 +119,32 @@ fun SettingsScreen(
     val exportLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.CreateDocument("application/json")
     ) { uri ->
+        val exportPwd = pendingExportPassword
+        pendingExportPassword = null
         if (uri != null) {
             scope.launch {
                 runCatching {
-                    val json = viewModel.generateBackupJson()
+                    val payload = if (!exportPwd.isNullOrBlank()) {
+                        viewModel.generateProtectedBackupJson(exportPwd)
+                    } else {
+                        viewModel.generateBackupJson()
+                    }
                     withContext(Dispatchers.IO) {
                         val stream = context.contentResolver.openOutputStream(uri)
                             ?: error("Не удалось открыть файл для записи")
                         stream.use { out ->
-                            out.write(json.toByteArray(Charsets.UTF_8))
+                            out.write(payload.toByteArray(Charsets.UTF_8))
                             out.flush()
                         }
                     }
                 }.onSuccess {
-                    onShowMessage("Резервная копия экспортирована")
+                    onShowMessage(
+                        if (!exportPwd.isNullOrBlank()) {
+                            "Зашифрованная резервная копия экспортирована"
+                        } else {
+                            "Резервная копия экспортирована"
+                        }
+                    )
                 }.onFailure {
                     onShowMessage("Ошибка экспорта: ${it.localizedMessage}")
                 }
@@ -117,7 +157,7 @@ fun SettingsScreen(
     ) { uri ->
         if (uri != null) {
             scope.launch {
-                val json = withContext(Dispatchers.IO) {
+                val payload = withContext(Dispatchers.IO) {
                     runCatching {
                         context.contentResolver.openInputStream(uri)?.use { stream ->
                             val maxBytes = 10 * 1024 * 1024
@@ -135,27 +175,16 @@ fun SettingsScreen(
                         }
                     }.getOrNull()
                 }
-                if (json.isNullOrBlank()) {
+                if (payload.isNullOrBlank()) {
                     onShowMessage("Не удалось прочитать файл или он слишком большой")
+                } else if (viewModel.isEncryptedBackup(payload)) {
+                    passwordInput = ""
+                    passwordError = null
+                    pendingEncryptedImportPayload = payload
                 } else {
-                    viewModel.restoreBackupJson(json) { result ->
+                    viewModel.restoreBackupPayload(payload, null) { result ->
                         result.fold(
-                            onSuccess = { summary ->
-                                val parts = buildList {
-                                    if (summary.tracksRestored > 0) add("треков: ${summary.tracksRestored}")
-                                    if (summary.playlistsRestored > 0) add("плейлистов: ${summary.playlistsRestored}")
-                                    if (summary.searchQueriesRestored > 0) add("запросов: ${summary.searchQueriesRestored}")
-                                    if (summary.settingsRestored) add("настройки")
-                                    if (summary.playbackRestored) add("очередь")
-                                    if (summary.equalizerRestored) add("эквалайзер")
-                                }
-                                val msg = if (parts.isEmpty()) {
-                                    "Резервная копия применена"
-                                } else {
-                                    "Восстановлено (${parts.joinToString(", ")})"
-                                }
-                                onShowMessage(msg)
-                            },
+                            onSuccess = ::notifyRestoreSuccess,
                             onFailure = {
                                 onShowMessage("Некорректный JSON-файл резервной копии")
                             }
@@ -164,6 +193,178 @@ fun SettingsScreen(
                 }
             }
         }
+    }
+
+    if (showExportPasswordDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showExportPasswordDialog = false
+                passwordInput = ""
+                passwordConfirmInput = ""
+                passwordError = null
+            },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+            title = { Text("Пароль для шифрования") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "Архив будет зашифрован по стандарту AES-256-GCM. Запомните пароль — без него восстановление невозможно.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = passwordInput,
+                        onValueChange = {
+                            passwordInput = it
+                            passwordError = null
+                        },
+                        label = { Text("Пароль (мин. 6 символов)") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("backup_export_password_input")
+                    )
+                    OutlinedTextField(
+                        value = passwordConfirmInput,
+                        onValueChange = {
+                            passwordConfirmInput = it
+                            passwordError = null
+                        },
+                        label = { Text("Подтвердите пароль") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("backup_export_password_confirm_input")
+                    )
+                    passwordError?.let { err ->
+                        Text(
+                            text = err,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        when {
+                            passwordInput.length < 6 -> {
+                                passwordError = "Минимум 6 символов"
+                            }
+                            passwordInput != passwordConfirmInput -> {
+                                passwordError = "Пароли не совпадают"
+                            }
+                            else -> {
+                                pendingExportPassword = passwordInput
+                                showExportPasswordDialog = false
+                                passwordInput = ""
+                                passwordConfirmInput = ""
+                                passwordError = null
+                                exportLauncher.launch("sonora_library_backup.sonoraenc")
+                            }
+                        }
+                    },
+                    modifier = Modifier.testTag("backup_export_password_confirm_button")
+                ) {
+                    Text("Продолжить", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showExportPasswordDialog = false
+                        passwordInput = ""
+                        passwordConfirmInput = ""
+                        passwordError = null
+                    }
+                ) {
+                    Text("Отмена")
+                }
+            }
+        )
+    }
+
+    val encryptedPayload = pendingEncryptedImportPayload
+    if (encryptedPayload != null) {
+        AlertDialog(
+            onDismissRequest = {
+                pendingEncryptedImportPayload = null
+                passwordInput = ""
+                passwordError = null
+            },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+            title = { Text("Расшифровка копии") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text(
+                        text = "Введите пароль, заданный при экспорте зашифрованной резервной копии.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = passwordInput,
+                        onValueChange = {
+                            passwordInput = it
+                            passwordError = null
+                        },
+                        label = { Text("Пароль") },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("backup_import_password_input")
+                    )
+                    passwordError?.let { err ->
+                        Text(
+                            text = err,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val secret = passwordInput
+                        if (secret.isBlank()) {
+                            passwordError = "Введите пароль"
+                            return@Button
+                        }
+                        viewModel.restoreBackupPayload(encryptedPayload, secret) { result ->
+                            result.fold(
+                                onSuccess = { summary ->
+                                    pendingEncryptedImportPayload = null
+                                    passwordInput = ""
+                                    passwordError = null
+                                    notifyRestoreSuccess(summary)
+                                },
+                                onFailure = {
+                                    passwordError = "Неверный пароль или файл повреждён"
+                                }
+                            )
+                        }
+                    },
+                    modifier = Modifier.testTag("backup_import_password_confirm_button")
+                ) {
+                    Text("Восстановить", fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        pendingEncryptedImportPayload = null
+                        passwordInput = ""
+                        passwordError = null
+                    }
+                ) {
+                    Text("Отмена")
+                }
+            }
+        )
     }
 
     if (showSleepTimerSheet) {
@@ -243,14 +444,30 @@ fun SettingsScreen(
                 )
                 SonoraCard(modifier = Modifier.fillMaxWidth()) {
                     SonoraSettingsActionRow(
-                        title = "Экспортировать файл JSON",
-                        subtitle = "Выбрать папку и имя архива вручную",
-                        valueText = "Экспорт",
+                        title = if (uiState.settings.encryptBackupsEnabled) {
+                            "Экспортировать зашифрованный архив"
+                        } else {
+                            "Экспортировать файл JSON"
+                        },
+                        subtitle = if (uiState.settings.encryptBackupsEnabled) {
+                            "Защита AES-256 с паролем перед сохранением"
+                        } else {
+                            "Выбрать папку и имя архива вручную"
+                        },
+                        valueText = if (uiState.settings.encryptBackupsEnabled) "AES-256" else "Экспорт",
                         icon = SonoraIcons.FileUpload,
                         iconTint = MaterialTheme.colorScheme.primary,
                         onClick = {
                             showBackupSheet = false
-                            exportLauncher.launch("sonora_library_backup.json")
+                            if (uiState.settings.encryptBackupsEnabled) {
+                                passwordInput = ""
+                                passwordConfirmInput = ""
+                                passwordError = null
+                                showExportPasswordDialog = true
+                            } else {
+                                pendingExportPassword = null
+                                exportLauncher.launch("sonora_library_backup.json")
+                            }
                         },
                         modifier = Modifier.testTag("export_backup_button")
                     )
@@ -563,6 +780,16 @@ fun SettingsScreen(
                         icon = SonoraIcons.FileUpload,
                         onClick = { showBackupSheet = true },
                         modifier = Modifier.testTag("open_backup_sheet_button")
+                    )
+                    SonoraSettingsDivider()
+                    SonoraSettingsActionRow(
+                        title = "Безопасность и защита",
+                        subtitle = "Шифрование, HTTPS (TLS 1.2+), целостность и приватность",
+                        valueText = if (uiState.settings.encryptBackupsEnabled) "TLS • AES" else "TLS 1.2+",
+                        icon = SonoraIcons.Shield,
+                        iconTint = MaterialTheme.colorScheme.primary,
+                        onClick = onOpenSecuritySettings,
+                        modifier = Modifier.testTag("open_security_settings_button")
                     )
                     SonoraSettingsDivider()
                     SonoraSettingsActionRow(

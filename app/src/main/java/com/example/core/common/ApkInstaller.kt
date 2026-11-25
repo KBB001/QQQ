@@ -112,7 +112,11 @@ object ApkInstaller {
                 }
             }
 
-            if (installedDigests.isNotEmpty() && archiveDigests.isNotEmpty() &&
+            if (archiveDigests.isEmpty()) {
+                return ApkInstallCompatibility.InvalidArchive
+            }
+
+            if (installedDigests.isNotEmpty() &&
                 installedDigests.intersect(archiveDigests).isEmpty()
             ) {
                 return ApkInstallCompatibility.SignatureMismatch(
@@ -129,6 +133,22 @@ object ApkInstaller {
 
             ApkInstallCompatibility.Compatible
         }.getOrDefault(ApkInstallCompatibility.InvalidArchive)
+    }
+
+    fun computeFileSha256(file: File): String? {
+        if (!file.exists() || !file.isFile) return null
+        return runCatching {
+            val md = MessageDigest.getInstance("SHA-256")
+            val buf = ByteArray(64 * 1024)
+            file.inputStream().use { input ->
+                while (true) {
+                    val read = input.read(buf)
+                    if (read <= 0) break
+                    md.update(buf, 0, read)
+                }
+            }
+            md.digest().joinToString("") { "%02x".format(it) }
+        }.getOrNull()
     }
 
     fun saveApkToDownloads(context: Context, apkFile: File, displayName: String = apkFile.name): Result<String> {

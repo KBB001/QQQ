@@ -2,13 +2,16 @@ package com.example.ui.account
 
 import android.annotation.SuppressLint
 import android.graphics.Bitmap
+import android.net.http.SslError
 import android.os.Build
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.CookieManager
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebStorage
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -300,6 +303,10 @@ fun YouTubeLoginScreen(
                             settings.allowUniversalAccessFromFileURLs = false
                             settings.setGeolocationEnabled(false)
                             settings.setSupportMultipleWindows(false)
+                            settings.mixedContentMode = WebSettings.MIXED_CONTENT_NEVER_ALLOW
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                settings.safeBrowsingEnabled = true
+                            }
                             settings.useWideViewPort = true
                             settings.loadWithOverviewMode = true
                             webChromeClient = object : WebChromeClient() {
@@ -320,11 +327,25 @@ fun YouTubeLoginScreen(
                                     return false
                                 }
 
+                                override fun onReceivedSslError(
+                                    view: WebView?,
+                                    handler: SslErrorHandler?,
+                                    error: SslError?
+                                ) {
+                                    handler?.cancel()
+                                    onShowMessage("Соединение отклонено: ошибка проверки SSL-сертификата")
+                                }
+
                                 override fun onPageStarted(
                                     view: WebView?,
                                     url: String?,
                                     favicon: Bitmap?
                                 ) {
+                                    if (!url.isNullOrBlank() && !isAllowedAuthWebViewUrl(url)) {
+                                        view?.stopLoading()
+                                        onShowMessage("Заблокирован переход на незащищённый или сторонний адрес")
+                                        return
+                                    }
                                     currentUrl = url.orEmpty()
                                     canGoBack = view?.canGoBack() == true
                                 }

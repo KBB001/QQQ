@@ -48,6 +48,8 @@ kotlinxSerializationJson = "1.8.1"
 desugarJdkLibs = "2.1.5"
 paletteKtx = "1.0.0"
 glance = "1.1.1"
+sqlcipherAndroid = "4.9.0"
+sqlite = "2.5.0"
 
 
 [libraries]
@@ -114,6 +116,8 @@ desugar-jdk-libs = { group = "com.android.tools", name = "desugar_jdk_libs_nio",
 androidx-palette-ktx = { group = "androidx.palette", name = "palette-ktx", version.ref = "paletteKtx" }
 androidx-glance-appwidget = { group = "androidx.glance", name = "glance-appwidget", version.ref = "glance" }
 androidx-glance-material3 = { group = "androidx.glance", name = "glance-material3", version.ref = "glance" }
+sqlcipher-android = { group = "net.zetetic", name = "sqlcipher-android", version.ref = "sqlcipherAndroid" }
+androidx-sqlite = { group = "androidx.sqlite", name = "sqlite", version.ref = "sqlite" }
 
 
 [plugins]

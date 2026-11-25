@@ -187,9 +187,23 @@ class SettingsViewModel @Inject constructor(
 
     suspend fun generateBackupJson(): String = backupCoordinator.exportFullBackupJson()
 
+    suspend fun generateProtectedBackupJson(password: String): String =
+        backupCoordinator.exportProtectedBackupJson(password)
+
+    fun isEncryptedBackup(payload: String): Boolean =
+        backupCoordinator.isEncryptedBackup(payload)
+
     fun restoreBackupJson(json: String, onResult: (Result<BackupRestoreSummary>) -> Unit) {
+        restoreBackupPayload(json, null, onResult)
+    }
+
+    fun restoreBackupPayload(
+        payload: String,
+        password: String? = null,
+        onResult: (Result<BackupRestoreSummary>) -> Unit
+    ) {
         viewModelScope.launch {
-            val result = backupCoordinator.importFullBackupJson(json)
+            val result = backupCoordinator.importBackupPayload(payload, password)
             onResult(result)
         }
     }
@@ -248,6 +262,7 @@ class SettingsViewModel @Inject constructor(
         }
         viewModelScope.launch {
             updateStateFlow.value = AppUpdateUiState.Checking
+            settingsRepository.setLastUpdateCheckAtMs(System.currentTimeMillis())
             when (val outcome = appUpdateRepository.checkForUpdate()) {
                 is UpdateCheckOutcome.UpdateAvailable -> {
                     updateStateFlow.value = AppUpdateUiState.Available(outcome.info)

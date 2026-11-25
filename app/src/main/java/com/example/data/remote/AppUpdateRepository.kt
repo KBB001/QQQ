@@ -2,6 +2,7 @@ package com.example.data.remote
 
 import android.content.Context
 import com.example.BuildConfig
+import com.example.core.common.ApkInstaller
 import com.example.core.common.NetworkMonitor
 import com.example.core.common.SemverComparator
 import com.example.domain.model.AppUpdateInfo
@@ -112,13 +113,18 @@ class AppUpdateRepository @Inject constructor(
                         "Доступна версия $tagName, но APK-файл ещё не загружен в релиз."
                     )
 
+                val sha256FromAsset = fetchExpectedSha256FromAssets(assets, apkAsset.name)
+                val sha256FromNotes = extractSha256FromText(releaseNotes)
+                val expectedSha256 = sha256FromAsset ?: sha256FromNotes
+
                 UpdateCheckOutcome.UpdateAvailable(
                     AppUpdateInfo(
                         tagName = tagName,
                         releaseNotes = releaseNotes,
                         downloadUrl = apkAsset.downloadUrl,
                         assetName = apkAsset.name,
-                        assetSizeBytes = apkAsset.size
+                        assetSizeBytes = apkAsset.size,
+                        expectedSha256 = expectedSha256
                     )
                 )
             }
@@ -158,6 +164,10 @@ class AppUpdateRepository @Inject constructor(
                 .build()
 
             okHttpClient.newCall(request).execute().use { response ->
+                val finalUrl = response.request.url.toString()
+                if (!response.request.url.isHttps || !isTrustedDownloadUrl(finalUrl)) {
+                    throw IllegalStateException("Загрузка заблокирована: ненадёжный источник обновления")
+                }
                 if (!response.isSuccessful) {
                     throw IllegalStateException("Ошибка скачивания APK (HTTP ${response.code})")
                 }
@@ -193,6 +203,17 @@ class AppUpdateRepository @Inject constructor(
 
             if (!tempFile.exists() || tempFile.length() <= 0L) {
                 throw IllegalStateException("Загруженный файл обновления пуст или повреждён")
+            }
+
+            val expectedHash = info.expectedSha256?.lowercase()
+            if (!expectedHash.isNullOrBlank()) {
+                val actualHash = ApkInstaller.computeFileSha256(tempFile)?.lowercase()
+                if (actualHash != expectedHash) {
+                    tempFile.delete()
+                    throw IllegalStateException(
+                        "Проверка целостности не пройдена (SHA-256 не совпадает). Установка отменена."
+                    )
+                }
             }
 
             if (finalFile.exists()) finalFile.delete()
@@ -247,6 +268,36 @@ class AppUpdateRepository @Inject constructor(
             }
         }
         return firstApk ?: fallbackAsset
+    }
+
+    private fun fetchExpectedSha256FromAssets(assets: JSONArray, apkName: String): String? {
+        for (i in 0 until assets.length()) {
+            val item = assets.optJSONObject(i) ?: continue
+            val name = item.optString("name").trim()
+            val url = item.optString("browser_download_url").trim()
+            val isChecksumFile = name.endsWith(".sha256", ignoreCase = true) ||
+                name.contains("sha256", ignoreCase = true) ||
+                name.equals("$apkName.sha256", ignoreCase = true)
+            if (!isChecksumFile || !isTrustedDownloadUrl(url)) continue
+            val text = runCatching {
+                val req = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", "SonoraAndroid/${BuildConfig.VERSION_NAME}")
+                    .build()
+                okHttpClient.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) resp.body?.string().orEmpty() else ""
+                }
+            }.getOrNull().orEmpty()
+            val extracted = extractSha256FromText(text)
+            if (!extracted.isNullOrBlank()) return extracted
+        }
+        return null
+    }
+
+    private fun extractSha256FromText(text: String): String? {
+        if (text.isBlank()) return null
+        val match = Regex("\\b([a-fA-F0-9]{64})\\b").find(text) ?: return null
+        return match.groupValues[1].lowercase()
     }
 
     private fun isTrustedDownloadUrl(url: String): Boolean {

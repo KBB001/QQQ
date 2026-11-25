@@ -4,32 +4,41 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import com.example.core.security.SecurityStatusTracker
 import dagger.hilt.android.qualifiers.ApplicationContext
 import java.security.KeyStore
-import java.security.MessageDigest
 import java.security.SecureRandom
+import java.security.Security
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
 import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
 class SecureAccountCipher @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val securityStatusTracker: SecurityStatusTracker? = null
 ) {
     private val keyLock = Any()
+
+    @Volatile
+    private var jvmEphemeralTestKey: SecretKey? = null
 
     fun isEncryptedPayload(raw: String?): Boolean =
         !raw.isNullOrBlank() && raw.startsWith(CIPHERTEXT_PREFIX)
 
+    fun isKeystoreBacked(): Boolean {
+        val backed = hasAndroidKeyStoreProvider()
+        securityStatusTracker?.setKeystoreBacked(backed)
+        return backed
+    }
+
     fun encrypt(plaintext: String): String {
         val secretKey = getOrCreateSecretKey()
         val cipher = Cipher.getInstance(AES_GCM_TRANSFORMATION)
-        // Use explicit random 12-byte IV on software/fallback keys; KeyStore also accepts generated IV via Cipher.init(ENCRYPT_MODE, key)
-        if (isKeyStoreKey(secretKey)) {
+        if (isKeyStoreBackedKey()) {
             cipher.init(Cipher.ENCRYPT_MODE, secretKey)
         } else {
             val iv = ByteArray(GCM_IV_LENGTH_BYTES).also { SecureRandom().nextBytes(it) }
@@ -60,12 +69,10 @@ class SecureAccountCipher @Inject constructor(
     }
 
     private fun getOrCreateSecretKey(): SecretKey = synchronized(keyLock) {
-        val keystoreKey = runCatching {
+        if (hasAndroidKeyStoreProvider()) {
             val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
             val existing = keyStore.getKey(KEYSTORE_ALIAS, null) as? SecretKey
-            if (existing != null) {
-                existing
-            } else {
+            val resolved = existing ?: run {
                 val generator = KeyGenerator.getInstance(
                     KeyProperties.KEY_ALGORITHM_AES,
                     ANDROID_KEYSTORE
@@ -82,18 +89,23 @@ class SecureAccountCipher @Inject constructor(
                 generator.init(spec)
                 generator.generateKey()
             }
-        }.getOrNull()
+            securityStatusTracker?.setKeystoreBacked(true)
+            return@synchronized resolved
+        }
 
-        if (keystoreKey != null) return@synchronized keystoreKey
-
-        // Fallback for JVM/Robolectric environments where AndroidKeyStore provider is unavailable
-        val fallbackMaterial = MessageDigest.getInstance("SHA-256")
-            .digest("${context.packageName}:$FALLBACK_KEY_DOMAIN".toByteArray(Charsets.UTF_8))
-        SecretKeySpec(fallbackMaterial, KeyProperties.KEY_ALGORITHM_AES)
+        // Only reachable in pure JVM / Robolectric test environments where AndroidKeyStore does not exist
+        securityStatusTracker?.setKeystoreBacked(false)
+        jvmEphemeralTestKey ?: run {
+            val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES)
+            generator.init(AES_KEY_SIZE_BITS, SecureRandom())
+            generator.generateKey().also { jvmEphemeralTestKey = it }
+        }
     }
 
-    private fun isKeyStoreKey(key: SecretKey): Boolean =
-        key !is SecretKeySpec
+    private fun isKeyStoreBackedKey(): Boolean = hasAndroidKeyStoreProvider()
+
+    private fun hasAndroidKeyStoreProvider(): Boolean =
+        Security.getProvider(ANDROID_KEYSTORE) != null && context.packageName.isNotBlank()
 
     private companion object {
         const val ANDROID_KEYSTORE = "AndroidKeyStore"
@@ -103,6 +115,5 @@ class SecureAccountCipher @Inject constructor(
         const val GCM_IV_LENGTH_BYTES = 12
         const val GCM_TAG_LENGTH_BITS = 128
         const val CIPHERTEXT_PREFIX = "enc:v1:"
-        const val FALLBACK_KEY_DOMAIN = "sonora_local_fallback_key_v1"
     }
 }

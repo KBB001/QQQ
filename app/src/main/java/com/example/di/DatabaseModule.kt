@@ -4,6 +4,7 @@ import android.content.Context
 import androidx.room.Room
 import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
+import com.example.core.security.DatabaseEncryptionManager
 import com.example.data.local.SonoraDatabase
 import com.example.data.local.dao.DownloadedTrackDao
 import com.example.data.local.dao.FavoriteDao
@@ -21,6 +22,8 @@ import javax.inject.Singleton
 @Module
 @InstallIn(SingletonComponent::class)
 object DatabaseModule {
+
+    private const val DATABASE_NAME = "sonora_music.db"
 
     internal val MIGRATION_1_2 = object : Migration(1, 2) {
         override fun migrate(db: SupportSQLiteDatabase) {
@@ -80,14 +83,21 @@ object DatabaseModule {
 
     @Provides
     @Singleton
-    fun provideDatabase(@ApplicationContext context: Context): SonoraDatabase =
-        Room.databaseBuilder(
+    fun provideDatabase(
+        @ApplicationContext context: Context,
+        encryptionManager: DatabaseEncryptionManager
+    ): SonoraDatabase {
+        val builder = Room.databaseBuilder(
             context,
             SonoraDatabase::class.java,
-            "sonora_music.db"
-        )
-            .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
-            .build()
+            DATABASE_NAME
+        ).addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
+
+        encryptionManager.createOpenHelperFactory(DATABASE_NAME)?.let { factory ->
+            builder.openHelperFactory(factory)
+        }
+        return builder.build()
+    }
 
     @Provides
     fun provideFavoriteDao(database: SonoraDatabase): FavoriteDao = database.favoriteDao()

@@ -6,6 +6,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import com.example.core.security.BackupCipher
 import com.example.domain.model.BackupSettings
 import com.example.domain.model.LibraryBackup
 import com.example.domain.repository.LibraryRepository
@@ -60,7 +61,10 @@ class BackupCoordinator @Inject constructor(
                 skipSilenceEnabled = currentSettings.skipSilenceEnabled,
                 autoplayEnabled = currentSettings.autoplayEnabled,
                 gaplessPlaybackEnabled = currentSettings.gaplessPlaybackEnabled,
-                autoDownloadFavoritesWifi = currentSettings.autoDownloadFavoritesWifi
+                autoDownloadFavoritesWifi = currentSettings.autoDownloadFavoritesWifi,
+                screenSecurityEnabled = currentSettings.screenSecurityEnabled,
+                encryptBackupsEnabled = currentSettings.encryptBackupsEnabled,
+                autoCheckUpdatesEnabled = currentSettings.autoCheckUpdatesEnabled
             ),
             playback = playbackSnapshot,
             equalizer = equalizerSnapshot
@@ -71,17 +75,41 @@ class BackupCoordinator @Inject constructor(
         jsonCodec.encodeToString(exportFullBackup())
     }
 
+    suspend fun exportProtectedBackupJson(password: String): String = withContext(Dispatchers.IO) {
+        val plainJson = exportFullBackupJson()
+        BackupCipher.encrypt(plainJson, password)
+    }
+
+    fun isEncryptedBackup(payload: String): Boolean = BackupCipher.isEncryptedBackup(payload)
+
+    suspend fun importBackupPayload(
+        payload: String,
+        password: String? = null
+    ): Result<BackupRestoreSummary> = withContext(Dispatchers.IO) {
+        if (BackupCipher.isEncryptedBackup(payload)) {
+            val secret = password.orEmpty()
+            val decrypted = BackupCipher.decrypt(payload, secret)
+            decrypted.fold(
+                onSuccess = { plainJson -> importFullBackupJson(plainJson) },
+                onFailure = { err -> Result.failure(err) }
+            )
+        } else {
+            importFullBackupJson(payload)
+        }
+    }
+
     suspend fun importFullBackupJson(json: String): Result<BackupRestoreSummary> =
         withContext(Dispatchers.IO) {
             runCatching {
                 require(json.isNotBlank() && json.length <= MAX_BACKUP_JSON_CHARS) {
                     "Файл резервной копии пустой или слишком большой"
                 }
-                val backup = jsonCodec.decodeFromString<LibraryBackup>(json)
-                val libraryResult = libraryRepository.importLibraryBackup(backup)
+                val rawBackup = jsonCodec.decodeFromString<LibraryBackup>(json)
+                val sanitizedBackup = sanitizeBackup(rawBackup)
+                val libraryResult = libraryRepository.importLibraryBackup(sanitizedBackup)
 
                 var settingsRestored = false
-                backup.settings?.let { s ->
+                sanitizedBackup.settings?.let { s ->
                     settingsRepository.setAudioQuality(s.audioQuality)
                     settingsRepository.setThemeMode(s.themeMode)
                     settingsRepository.setDynamicColorEnabled(s.dynamicColorEnabled)
@@ -89,17 +117,20 @@ class BackupCoordinator @Inject constructor(
                     settingsRepository.setAutoplayEnabled(s.autoplayEnabled)
                     settingsRepository.setGaplessPlaybackEnabled(s.gaplessPlaybackEnabled)
                     settingsRepository.setAutoDownloadFavoritesWifi(s.autoDownloadFavoritesWifi)
+                    settingsRepository.setScreenSecurityEnabled(s.screenSecurityEnabled)
+                    settingsRepository.setEncryptBackupsEnabled(s.encryptBackupsEnabled)
+                    settingsRepository.setAutoCheckUpdatesEnabled(s.autoCheckUpdatesEnabled)
                     settingsRestored = true
                 }
 
                 var playbackRestored = false
-                backup.playback?.let { p ->
+                sanitizedBackup.playback?.let { p ->
                     playbackManager.applyRestoredState(p)
                     playbackRestored = p.queue.isNotEmpty() || p.playbackSpeed != 1.0f || p.shuffleEnabled
                 }
 
                 var equalizerRestored = false
-                backup.equalizer?.let { eq ->
+                sanitizedBackup.equalizer?.let { eq ->
                     equalizerManager.applyRestoredConfig(eq)
                     equalizerRestored = true
                 }
@@ -114,6 +145,27 @@ class BackupCoordinator @Inject constructor(
                 )
             }
         }
+
+    private fun sanitizeBackup(backup: LibraryBackup): LibraryBackup {
+        fun cleanUrl(url: String?): String =
+            url?.trim()?.takeIf { it.startsWith("https://", ignoreCase = true) }.orEmpty()
+
+        fun cleanTracks(list: List<com.example.domain.model.Track>) =
+            list.map { track ->
+                track.copy(
+                    thumbnailUrl = cleanUrl(track.thumbnailUrl),
+                    streamUrl = null
+                )
+            }
+
+        return backup.copy(
+            favorites = cleanTracks(backup.favorites),
+            history = cleanTracks(backup.history),
+            playlists = backup.playlists.map { pl ->
+                pl.copy(tracks = cleanTracks(pl.tracks))
+            }
+        )
+    }
 
     suspend fun saveUpdateSnapshotToDownloads(): Result<String> = withContext(Dispatchers.IO) {
         runCatching {

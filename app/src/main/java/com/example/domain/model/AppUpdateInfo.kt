@@ -7,7 +7,8 @@ data class AppUpdateInfo(
     val releaseNotes: String,
     val downloadUrl: String,
     val assetName: String,
-    val assetSizeBytes: Long
+    val assetSizeBytes: Long,
+    val expectedSha256: String? = null
 )
 
 sealed interface AppUpdateUiState {

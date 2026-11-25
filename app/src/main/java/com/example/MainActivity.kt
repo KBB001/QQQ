@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -15,9 +16,15 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.core.common.NetworkMonitor
+import com.example.data.remote.AppUpdateRepository
+import com.example.data.remote.UpdateCheckOutcome
 import com.example.domain.model.AppSettings
 import com.example.domain.model.AppThemeMode
 import com.example.domain.repository.SettingsRepository
@@ -25,6 +32,7 @@ import com.example.ui.navigation.SonoraNavHost
 import com.example.ui.theme.SonoraTheme
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import javax.inject.Inject
 
 @AndroidEntryPoint
@@ -32,6 +40,12 @@ class MainActivity : ComponentActivity() {
 
     @Inject
     lateinit var settingsRepository: SettingsRepository
+
+    @Inject
+    lateinit var appUpdateRepository: AppUpdateRepository
+
+    @Inject
+    lateinit var networkMonitor: NetworkMonitor
 
     private val pendingSearchQueryFlow = MutableStateFlow<String?>(null)
 
@@ -47,6 +61,8 @@ class MainActivity : ComponentActivity() {
                 initialValue = AppSettings()
             )
             val pendingSearchQuery by pendingSearchQueryFlow.collectAsStateWithLifecycle()
+            var startupAvailableVersion by remember { mutableStateOf<String?>(null) }
+
             val isDark = when (appSettings.themeMode) {
                 AppThemeMode.DARK -> true
                 AppThemeMode.LIGHT -> false
@@ -63,6 +79,14 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
+            }
+
+            LaunchedEffect(appSettings.screenSecurityEnabled) {
+                if (appSettings.screenSecurityEnabled) {
+                    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                } else {
+                    window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                }
             }
 
             SonoraTheme(
@@ -85,11 +109,28 @@ class MainActivity : ComponentActivity() {
                             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
                         }
                     }
+
+                    runCatching {
+                        val persisted = settingsRepository.settings.first()
+                        val now = System.currentTimeMillis()
+                        val due = persisted.autoCheckUpdatesEnabled &&
+                            networkMonitor.isOnline.value &&
+                            (now - persisted.lastUpdateCheckAtMs >= AUTO_UPDATE_INTERVAL_MS)
+                        if (due) {
+                            settingsRepository.setLastUpdateCheckAtMs(now)
+                            val outcome = appUpdateRepository.checkForUpdate()
+                            if (outcome is UpdateCheckOutcome.UpdateAvailable) {
+                                startupAvailableVersion = outcome.info.tagName
+                            }
+                        }
+                    }
                 }
 
                 SonoraNavHost(
                     pendingSearchQuery = pendingSearchQuery,
-                    onConsumePendingSearchQuery = { pendingSearchQueryFlow.value = null }
+                    onConsumePendingSearchQuery = { pendingSearchQueryFlow.value = null },
+                    startupUpdateTag = startupAvailableVersion,
+                    onConsumeStartupUpdate = { startupAvailableVersion = null }
                 )
             }
         }
@@ -108,5 +149,9 @@ class MainActivity : ComponentActivity() {
         if (!query.isNullOrBlank()) {
             pendingSearchQueryFlow.value = query.trim()
         }
+    }
+
+    private companion object {
+        const val AUTO_UPDATE_INTERVAL_MS = 24L * 60L * 60L * 1000L
     }
 }

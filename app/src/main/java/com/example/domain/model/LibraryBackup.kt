@@ -19,7 +19,10 @@ data class BackupSettings(
     val skipSilenceEnabled: Boolean = false,
     val autoplayEnabled: Boolean = true,
     val gaplessPlaybackEnabled: Boolean = true,
-    val autoDownloadFavoritesWifi: Boolean = false
+    val autoDownloadFavoritesWifi: Boolean = false,
+    val screenSecurityEnabled: Boolean = false,
+    val encryptBackupsEnabled: Boolean = true,
+    val autoCheckUpdatesEnabled: Boolean = true
 )
 
 @Serializable

@@ -22,8 +22,11 @@ private val Context.playbackStateDataStore: DataStore<Preferences> by preference
 
 @Singleton
 class PlaybackPersistenceStore @Inject constructor(
-    @ApplicationContext private val context: Context
+    @ApplicationContext private val context: Context,
+    private val cipher: SecureAccountCipher
 ) {
+    constructor(context: Context) : this(context, SecureAccountCipher(context))
+
     private val jsonCodec = Json {
         ignoreUnknownKeys = true
     }
@@ -31,15 +34,21 @@ class PlaybackPersistenceStore @Inject constructor(
     suspend fun readPlaybackState(): PersistedPlaybackState? = runCatching {
         val prefs = context.playbackStateDataStore.data.first()
         val raw = prefs[KEY_PLAYBACK_STATE] ?: return null
-        sanitizePlaybackState(jsonCodec.decodeFromString<PersistedPlaybackState>(raw))
+        val json = if (cipher.isEncryptedPayload(raw)) {
+            cipher.decrypt(raw) ?: return null
+        } else {
+            raw
+        }
+        sanitizePlaybackState(jsonCodec.decodeFromString<PersistedPlaybackState>(json))
     }.getOrNull()
 
     suspend fun savePlaybackState(state: PersistedPlaybackState) {
         val sanitized = sanitizePlaybackState(state)
         runCatching {
             val encoded = jsonCodec.encodeToString(sanitized)
+            val encrypted = cipher.encrypt(encoded)
             context.playbackStateDataStore.edit { prefs ->
-                prefs[KEY_PLAYBACK_STATE] = encoded
+                prefs[KEY_PLAYBACK_STATE] = encrypted
             }
         }
     }
@@ -47,15 +56,30 @@ class PlaybackPersistenceStore @Inject constructor(
     suspend fun readEqualizerState(): PersistedEqualizerState? = runCatching {
         val prefs = context.playbackStateDataStore.data.first()
         val raw = prefs[KEY_EQUALIZER_STATE] ?: return null
-        sanitizeEqualizerState(jsonCodec.decodeFromString<PersistedEqualizerState>(raw))
+        val json = if (cipher.isEncryptedPayload(raw)) {
+            cipher.decrypt(raw) ?: return null
+        } else {
+            raw
+        }
+        sanitizeEqualizerState(jsonCodec.decodeFromString<PersistedEqualizerState>(json))
     }.getOrNull()
 
     suspend fun saveEqualizerState(state: PersistedEqualizerState) {
         val sanitized = sanitizeEqualizerState(state)
         runCatching {
             val encoded = jsonCodec.encodeToString(sanitized)
+            val encrypted = cipher.encrypt(encoded)
             context.playbackStateDataStore.edit { prefs ->
-                prefs[KEY_EQUALIZER_STATE] = encoded
+                prefs[KEY_EQUALIZER_STATE] = encrypted
+            }
+        }
+    }
+
+    suspend fun clearAll() {
+        runCatching {
+            context.playbackStateDataStore.edit { prefs ->
+                prefs.remove(KEY_PLAYBACK_STATE)
+                prefs.remove(KEY_EQUALIZER_STATE)
             }
         }
     }
@@ -97,7 +121,10 @@ class PlaybackPersistenceStore @Inject constructor(
         title = track.title.trim().take(240).ifBlank { "Без названия" },
         artist = track.artist.trim().take(200).ifBlank { "Неизвестный исполнитель" },
         durationSeconds = track.durationSeconds.coerceAtLeast(0L),
-        thumbnailUrl = track.thumbnailUrl.trim(),
+        thumbnailUrl = track.thumbnailUrl
+            .trim()
+            .takeIf { it.startsWith("https://", ignoreCase = true) }
+            .orEmpty(),
         streamUrl = null
     )
 

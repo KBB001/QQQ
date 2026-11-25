@@ -70,9 +70,11 @@ import com.example.ui.search.SearchScreen
 import com.example.ui.settings.AppUpdateScreen
 import com.example.ui.settings.CacheQualityScreen
 import com.example.ui.settings.EqualizerScreen
+import com.example.ui.settings.SecurityScreen
 import com.example.ui.settings.SettingsScreen
 import com.example.ui.settings.YouTubeAccountScreen
 import com.example.ui.settings.YouTubeSignOutConfirmScreen
+import androidx.compose.material3.SnackbarResult
 import kotlinx.coroutines.launch
 
 private data class TopLevelDestination(
@@ -118,6 +120,8 @@ private val topLevelDestinations = listOf(
 fun SonoraNavHost(
     pendingSearchQuery: String? = null,
     onConsumePendingSearchQuery: () -> Unit = {},
+    startupUpdateTag: String? = null,
+    onConsumeStartupUpdate: () -> Unit = {},
     playerViewModel: PlayerViewModel = hiltViewModel()
 ) {
     val navController = rememberNavController()
@@ -130,7 +134,8 @@ fun SonoraNavHost(
         currentDestination?.hasRoute<SonoraRoute.CacheQualitySettings>() == true ||
         currentDestination?.hasRoute<SonoraRoute.YouTubeAccountSettings>() == true ||
         currentDestination?.hasRoute<SonoraRoute.YouTubeSignOutConfirm>() == true ||
-        currentDestination?.hasRoute<SonoraRoute.AppUpdateSettings>() == true
+        currentDestination?.hasRoute<SonoraRoute.AppUpdateSettings>() == true ||
+        currentDestination?.hasRoute<SonoraRoute.SecuritySettings>() == true
 
     val playerUiState by playerViewModel.uiState.collectAsStateWithLifecycle()
     val playbackState = playerUiState.playbackState
@@ -143,6 +148,20 @@ fun SonoraNavHost(
         if (!message.isNullOrBlank() && !isNowPlayingScreen) {
             snackbarHostState.showSnackbar(message)
             playerViewModel.clearError()
+        }
+    }
+
+    LaunchedEffect(startupUpdateTag) {
+        val tag = startupUpdateTag
+        if (!tag.isNullOrBlank()) {
+            val result = snackbarHostState.showSnackbar(
+                message = "Доступно обновление безопасности Sonora $tag",
+                actionLabel = "Открыть"
+            )
+            if (result == SnackbarResult.ActionPerformed) {
+                navController.navigate(SonoraRoute.AppUpdateSettings)
+            }
+            onConsumeStartupUpdate()
         }
     }
 
@@ -392,7 +411,16 @@ fun SonoraNavHost(
                                     onOpenEqualizer = { navController.navigate(SonoraRoute.EqualizerSettings) },
                                     onOpenCacheQuality = { navController.navigate(SonoraRoute.CacheQualitySettings) },
                                     onOpenYouTubeAccount = { navController.navigate(SonoraRoute.YouTubeAccountSettings) },
-                                    onOpenSignOutConfirm = { navController.navigate(SonoraRoute.YouTubeSignOutConfirm) }
+                                    onOpenSignOutConfirm = { navController.navigate(SonoraRoute.YouTubeSignOutConfirm) },
+                                    onOpenSecuritySettings = { navController.navigate(SonoraRoute.SecuritySettings) }
+                                )
+                            }
+
+                            composable<SonoraRoute.SecuritySettings> {
+                                SecurityScreen(
+                                    onBack = { navController.popBackStack() },
+                                    onOpenAppUpdate = { navController.navigate(SonoraRoute.AppUpdateSettings) },
+                                    onShowMessage = ::showMessage
                                 )
                             }
 

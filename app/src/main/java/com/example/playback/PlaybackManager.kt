@@ -14,6 +14,7 @@ import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.example.core.common.FriendlyErrorMapper
 import com.example.core.common.NetworkMonitor
+import com.example.core.security.SecurityStatusTracker
 import com.example.data.repository.PlaybackPersistenceStore
 import com.example.domain.model.ImplicitSignalType
 import com.example.domain.model.PersistedPlaybackState
@@ -59,7 +60,8 @@ class PlaybackManager @Inject constructor(
     private val playbackPersistenceStore: PlaybackPersistenceStore? = null,
     private val audioCacheProvider: AudioCacheProvider? = null,
     private val tasteSignalTracker: TasteSignalTracker? = null,
-    private val smartRecommendationEngine: SmartRecommendationEngine? = null
+    private val smartRecommendationEngine: SmartRecommendationEngine? = null,
+    private val securityStatusTracker: SecurityStatusTracker? = null
 ) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
@@ -683,17 +685,40 @@ class PlaybackManager @Inject constructor(
             val offlinePath = track.localFilePath?.takeIf { File(it).exists() }
                 ?: libraryRepository.getDownloadedFilePath(track.id)
 
+            val cachedRemoteUrl = track.streamUrl
+                ?.takeIf { it.isNotBlank() }
+                ?.also { candidate ->
+                    if (!isAllowedRemoteStreamUrl(candidate)) {
+                        securityStatusTracker?.recordBlockedInsecureConnection(candidate)
+                    }
+                }
+                ?.takeIf(::isAllowedRemoteStreamUrl)
+
             val playableUriResult: Result<Uri> = if (!offlinePath.isNullOrBlank()) {
                 Result.success(Uri.fromFile(File(offlinePath)))
-            } else if (!forceRefreshStream && !track.streamUrl.isNullOrBlank()) {
-                Result.success(Uri.parse(track.streamUrl))
+            } else if (!forceRefreshStream && cachedRemoteUrl != null) {
+                Result.success(Uri.parse(cachedRemoteUrl))
             } else {
                 val quality = settingsRepository.settings.first().audioQuality
                 youTubeRepository.getAudioStreamUrl(
                     videoId = track.id,
                     audioQuality = quality,
                     forceRefresh = forceRefreshStream
-                ).map { Uri.parse(it) }
+                ).fold(
+                    onSuccess = { url ->
+                        if (isAllowedRemoteStreamUrl(url)) {
+                            Result.success(Uri.parse(url))
+                        } else {
+                            securityStatusTracker?.recordBlockedInsecureConnection(url)
+                            Result.failure(
+                                javax.net.ssl.SSLPeerUnverifiedException(
+                                    "Заблокирован небезопасный аудиопоток без HTTPS"
+                                )
+                            )
+                        }
+                    },
+                    onFailure = { Result.failure(it) }
+                )
             }
 
             playableUriResult.fold(
@@ -1184,12 +1209,16 @@ class PlaybackManager @Inject constructor(
 
                 if (!networkMonitor.isOnline.value) continue
 
-                val streamUrl = track.streamUrl?.takeIf { it.isNotBlank() }
+                val streamUrl = track.streamUrl?.takeIf { isAllowedRemoteStreamUrl(it) }
                     ?: youTubeRepository.getAudioStreamUrl(
                         videoId = track.id,
                         audioQuality = quality,
                         forceRefresh = false
-                    ).getOrNull()
+                    ).getOrNull()?.takeIf { candidate ->
+                        val allowed = isAllowedRemoteStreamUrl(candidate)
+                        if (!allowed) securityStatusTracker?.recordBlockedInsecureConnection(candidate)
+                        allowed
+                    }
                     ?: continue
 
                 if (track.streamUrl != streamUrl) {
@@ -1242,7 +1271,7 @@ class PlaybackManager @Inject constructor(
                     ?.takeIf { File(it).exists() }
                     ?.let { Uri.fromFile(File(it)) }
                 val remoteUri = upcomingTrack.streamUrl
-                    ?.takeIf { it.isNotBlank() }
+                    ?.takeIf { isAllowedRemoteStreamUrl(it) }
                     ?.let { Uri.parse(it) }
                 val resolvedUri = localUri ?: remoteUri ?: break
                 add(buildMediaItem(upcomingTrack, resolvedUri))
@@ -1288,9 +1317,16 @@ class PlaybackManager @Inject constructor(
         return fallback.takeIf { it >= 0 }
     }
 
+    private fun isAllowedRemoteStreamUrl(rawUrl: String): Boolean {
+        val trimmed = rawUrl.trim()
+        if (trimmed.isBlank()) return false
+        val uri = runCatching { java.net.URI(trimmed) }.getOrNull() ?: return false
+        return uri.scheme.equals("https", ignoreCase = true) && !uri.host.isNullOrBlank()
+    }
+
     private fun buildMediaItem(track: Track, mediaUri: Uri): MediaItem {
         val artworkUri = track.thumbnailUrl
-            .takeIf { it.isNotBlank() }
+            .takeIf { it.isNotBlank() && isAllowedRemoteStreamUrl(it) }
             ?.let { Uri.parse(it) }
         val mediaMetadata = MediaMetadata.Builder()
             .setTitle(track.title)

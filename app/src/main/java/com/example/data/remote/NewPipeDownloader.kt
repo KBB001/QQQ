@@ -1,5 +1,6 @@
 package com.example.data.remote
 
+import com.example.core.security.SecurityStatusTracker
 import com.example.data.repository.YouTubeAccountStore
 import okhttp3.Headers.Companion.toHeaders
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -13,17 +14,24 @@ import java.io.IOException
 import java.net.URI
 import javax.inject.Inject
 import javax.inject.Singleton
+import javax.net.ssl.SSLPeerUnverifiedException
 
 @Singleton
 class NewPipeDownloader @Inject constructor(
     private val okHttpClient: OkHttpClient,
-    private val accountStore: YouTubeAccountStore
+    private val accountStore: YouTubeAccountStore,
+    private val securityStatusTracker: SecurityStatusTracker? = null
 ) : Downloader() {
 
     @Throws(IOException::class, ReCaptchaException::class)
     override fun execute(request: Request): Response {
         val httpMethod = request.httpMethod()
         val url = request.url()
+        val parsedUri = runCatching { URI(url) }.getOrNull()
+        if (parsedUri == null || !parsedUri.scheme.equals("https", ignoreCase = true)) {
+            securityStatusTracker?.recordBlockedInsecureConnection(url)
+            throw SSLPeerUnverifiedException("Требуется защищённое HTTPS-соединение")
+        }
         val headers = request.headers()
         val dataToSend = request.dataToSend()
 

@@ -38,4 +38,7 @@ sealed interface SonoraRoute {
 
     @Serializable
     data object AppUpdateSettings : SonoraRoute
+
+    @Serializable
+    data object SecuritySettings : SonoraRoute
 }

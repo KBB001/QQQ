@@ -15,4 +15,8 @@ interface SettingsRepository {
     suspend fun setAutoplayEnabled(enabled: Boolean)
     suspend fun setGaplessPlaybackEnabled(enabled: Boolean)
     suspend fun setAutoDownloadFavoritesWifi(enabled: Boolean)
+    suspend fun setScreenSecurityEnabled(enabled: Boolean)
+    suspend fun setEncryptBackupsEnabled(enabled: Boolean)
+    suspend fun setAutoCheckUpdatesEnabled(enabled: Boolean)
+    suspend fun setLastUpdateCheckAtMs(timestampMs: Long)
 }
