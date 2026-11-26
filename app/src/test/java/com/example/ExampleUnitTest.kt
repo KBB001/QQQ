@@ -390,6 +390,19 @@ class ExampleUnitTest {
         }
     }
 
+    @Test
+    fun releaseNotesFormatter_stripsMarkdownAndFormatsCompareLink() {
+        val raw = """
+            ## What's Changed
+            * **Security** hardening by @dev
+            **Full Changelog**: https://github.com/KBB001/QQQ/compare/v1.0.1...v1.0.2
+        """.trimIndent()
+        val formatted = com.example.ui.settings.formatReleaseNotes(raw)
+        assertTrue(formatted.none { (_, text) -> text.contains("**") || text.contains("##") })
+        assertTrue(formatted.any { (label, text) -> label == "История" && text == "v1.0.1 → v1.0.2" })
+        assertTrue(formatted.any { (_, text) -> text.contains("Security hardening by @dev") })
+    }
+
     private class FakeChain(private val req: okhttp3.Request) : okhttp3.Interceptor.Chain {
         override fun request(): okhttp3.Request = req
         override fun proceed(request: okhttp3.Request): okhttp3.Response {

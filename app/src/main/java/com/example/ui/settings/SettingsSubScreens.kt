@@ -159,9 +159,17 @@ fun AppUpdateScreen(
     val scope = rememberCoroutineScope()
     var pendingInstallFile by remember { mutableStateOf<File?>(null) }
     var savedMismatchApkName by remember { mutableStateOf<String?>(null) }
+    var didAutoCheck by remember { mutableStateOf(false) }
 
     val signatureFingerprint = remember(context) {
         ApkInstaller.getInstalledSignatureFingerprint(context)
+    }
+
+    LaunchedEffect(Unit) {
+        if (!didAutoCheck && uiState.updateState is AppUpdateUiState.Idle) {
+            didAutoCheck = true
+            viewModel.checkForUpdates(onMessage = onShowMessage, silentIfUpToDate = true)
+        }
     }
 
     val installPermissionLauncher = rememberLauncherForActivityResult(
@@ -189,9 +197,12 @@ fun AppUpdateScreen(
                     onShowMessage("Скачанный APK относится к другому пакету (${check.archivePackage}).")
                     return
                 }
-                is ApkInstallCompatibility.SignatureMismatch,
+                is ApkInstallCompatibility.SignatureMismatch -> {
+                    onShowMessage("Ключи подписи не совпадают — используйте сохранение с бэкапом и переустановку.")
+                    return
+                }
                 is ApkInstallCompatibility.VersionDowngrade -> {
-                    onShowMessage("Требуется сохранение APK в «Загрузки» для переустановки.")
+                    onShowMessage("Версия APK ниже установленной — используйте переустановку с бэкапом.")
                     return
                 }
                 ApkInstallCompatibility.Compatible -> Unit
@@ -243,7 +254,7 @@ fun AppUpdateScreen(
                         AppUpdateUiState.Checking -> "Проверка новых релизов на GitHub..."
                         is AppUpdateUiState.Available -> "Доступно обновление приложения Sonora (у вас v${BuildConfig.VERSION_NAME})"
                         is AppUpdateUiState.Downloading -> "Загрузка пакета обновления..."
-                        is AppUpdateUiState.ReadyToInstall -> "Пакет ${updateState.info.tagName} готов к установке"
+                        is AppUpdateUiState.ReadyToInstall -> "Пакет ${updateState.info.tagName} загружен и проверен"
                     }
 
                     Text(
@@ -324,62 +335,59 @@ fun AppUpdateScreen(
                         val compatibility = remember(updateState.apkFile) {
                             ApkInstaller.checkInstallCompatibility(context, updateState.apkFile)
                         }
+                        val hasConflict = compatibility is ApkInstallCompatibility.SignatureMismatch ||
+                            compatibility is ApkInstallCompatibility.VersionDowngrade ||
+                            compatibility is ApkInstallCompatibility.PackageMismatch
+
                         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            if (savedMismatchApkName != null) {
+                            if (compatibility is ApkInstallCompatibility.SignatureMismatch) {
+                                SonoraCard(modifier = Modifier.fillMaxWidth()) {
+                                    Column(
+                                        modifier = Modifier.padding(14.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Text(
+                                            text = "Ключ подписи отличается от установленной сборки",
+                                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                        Text(
+                                            text = "Установлено: ${compatibility.installedCertFingerprint.ifBlank { "неизвестно" }} • Новый APK: ${compatibility.archiveCertFingerprint.ifBlank { "неизвестно" }}.\nAndroid не позволит установить обновление поверх другого ключа («Приложение не установлено»). Сохраните APK и бэкап, удалите старую версию и установите файл — все следующие релизы будут ставиться напрямую.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            } else if (compatibility is ApkInstallCompatibility.VersionDowngrade) {
+                                SonoraCard(modifier = Modifier.fillMaxWidth()) {
+                                    Column(
+                                        modifier = Modifier.padding(14.dp),
+                                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Text(
+                                            text = "Код версии нового APK ниже установленного",
+                                            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                        Text(
+                                            text = "Установлен build ${compatibility.installedVersionCode}, в пакете ${compatibility.archiveVersionCode}. Для установки без ошибки сначала сохраните копию медиатеки и удалите текущую сборку.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                }
+                            } else if (compatibility is ApkInstallCompatibility.PackageMismatch) {
                                 SonoraCard(modifier = Modifier.fillMaxWidth()) {
                                     Text(
-                                        text = "APK «$savedMismatchApkName» сохранён в Загрузки. Удалите текущую сборку и установите новый файл, затем восстановите резервную копию из Downloads/Sonora.",
+                                        text = "Идентификатор пакета (${compatibility.archivePackage}) отличается от ${compatibility.expectedPackage}.",
                                         style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        color = MaterialTheme.colorScheme.error,
                                         modifier = Modifier.padding(14.dp)
                                     )
                                 }
-                                Button(
-                                    onClick = {
-                                        runCatching {
-                                            context.startActivity(ApkInstaller.createAppDetailsSettingsIntent(context))
-                                        }.onFailure {
-                                            onShowMessage("Откройте Настройки → Приложения → Sonora → Удалить")
-                                        }
-                                    },
-                                    shape = CircleShape,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(50.dp)
-                                        .testTag("update_uninstall_old_button")
-                                ) {
-                                    Text("Удалить текущую версию", fontWeight = FontWeight.Bold)
-                                }
-                            } else if (compatibility is ApkInstallCompatibility.SignatureMismatch ||
-                                compatibility is ApkInstallCompatibility.VersionDowngrade
-                            ) {
-                                Button(
-                                    onClick = {
-                                        scope.launch {
-                                            viewModel.savePreUpdateBackupSnapshot()
-                                            val displayName = updateState.info.assetName.ifBlank {
-                                                "sonora-${updateState.info.tagName}.apk"
-                                            }
-                                            val res = withContext(Dispatchers.IO) {
-                                                ApkInstaller.saveApkToDownloads(
-                                                    context = context,
-                                                    apkFile = updateState.apkFile,
-                                                    displayName = displayName
-                                                )
-                                            }
-                                            res.onSuccess { savedMismatchApkName = it }
-                                                .onFailure { onShowMessage(it.localizedMessage ?: "Ошибка сохранения") }
-                                        }
-                                    },
-                                    shape = CircleShape,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .height(50.dp)
-                                        .testTag("update_save_downloads_button")
-                                ) {
-                                    Text("Сохранить APK в Загрузки", fontWeight = FontWeight.Bold)
-                                }
-                            } else {
+                            }
+
+                            if (!hasConflict) {
                                 Button(
                                     onClick = { triggerInstall(updateState.apkFile) },
                                     shape = CircleShape,
@@ -394,6 +402,87 @@ fun AppUpdateScreen(
                                 ) {
                                     Text("Установить обновление", fontWeight = FontWeight.Bold)
                                 }
+                            } else {
+                                if (savedMismatchApkName != null) {
+                                    SonoraCard(modifier = Modifier.fillMaxWidth()) {
+                                        Text(
+                                            text = "APK «$savedMismatchApkName» и резервная копия сохранены в Загрузки. Удалите текущую версию и откройте скачанный APK.",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.padding(14.dp)
+                                        )
+                                    }
+                                    Button(
+                                        onClick = {
+                                            runCatching {
+                                                context.startActivity(ApkInstaller.createAppDetailsSettingsIntent(context))
+                                            }.onFailure {
+                                                onShowMessage("Откройте Настройки → Приложения → Sonora → Удалить")
+                                            }
+                                        },
+                                        shape = CircleShape,
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = MaterialTheme.colorScheme.primary,
+                                            contentColor = MaterialTheme.colorScheme.onPrimary
+                                        ),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(50.dp)
+                                            .testTag("update_uninstall_old_button")
+                                    ) {
+                                        Text("Удалить старую версию", fontWeight = FontWeight.Bold)
+                                    }
+                                } else {
+                                    Button(
+                                        onClick = {
+                                            scope.launch {
+                                                val backupRes = viewModel.savePreUpdateBackupSnapshot()
+                                                val displayName = updateState.info.assetName.ifBlank {
+                                                    "sonora-${updateState.info.tagName}.apk"
+                                                }
+                                                val res = withContext(Dispatchers.IO) {
+                                                    ApkInstaller.saveApkToDownloads(
+                                                        context = context,
+                                                        apkFile = updateState.apkFile,
+                                                        displayName = displayName
+                                                    )
+                                                }
+                                                res.onSuccess {
+                                                    savedMismatchApkName = it
+                                                    if (backupRes.isSuccess) {
+                                                        onShowMessage("Бэкап и APK сохранены в Загрузки")
+                                                    } else {
+                                                        onShowMessage("APK сохранён в Загрузки")
+                                                    }
+                                                }.onFailure {
+                                                    onShowMessage(it.localizedMessage ?: "Ошибка сохранения")
+                                                }
+                                            }
+                                        },
+                                        shape = CircleShape,
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = MaterialTheme.colorScheme.primary,
+                                            contentColor = MaterialTheme.colorScheme.onPrimary
+                                        ),
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .height(50.dp)
+                                            .testTag("update_save_downloads_button")
+                                    ) {
+                                        Text("Сохранить APK и бэкап", fontWeight = FontWeight.Bold)
+                                    }
+                                }
+
+                                OutlinedButton(
+                                    onClick = { triggerInstall(updateState.apkFile, bypassCompatibility = true) },
+                                    shape = CircleShape,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(48.dp)
+                                        .testTag("update_install_apk_button")
+                                ) {
+                                    Text("Установить обновление", fontWeight = FontWeight.SemiBold)
+                                }
                             }
                         }
                     }
@@ -405,10 +494,15 @@ fun AppUpdateScreen(
                                 viewModel.startUpdateDownload(
                                     info = updateState.info,
                                     onReadyToInstall = { downloadedFile ->
-                                        if (ApkInstaller.checkInstallCompatibility(context, downloadedFile)
-                                            is ApkInstallCompatibility.Compatible
-                                        ) {
-                                            triggerInstall(downloadedFile)
+                                        when (ApkInstaller.checkInstallCompatibility(context, downloadedFile)) {
+                                            is ApkInstallCompatibility.Compatible -> triggerInstall(downloadedFile)
+                                            is ApkInstallCompatibility.SignatureMismatch -> {
+                                                onShowMessage("Ключ подписи отличается — следуйте инструкции на экране для переустановки с бэкапом")
+                                            }
+                                            is ApkInstallCompatibility.VersionDowngrade -> {
+                                                onShowMessage("Версия APK ниже установленной — сохраните бэкап для переустановки")
+                                            }
+                                            else -> Unit
                                         }
                                     },
                                     onError = onShowMessage
@@ -430,7 +524,7 @@ fun AppUpdateScreen(
 
                     else -> {
                         Button(
-                            onClick = { viewModel.checkForUpdates(onShowMessage) },
+                            onClick = { viewModel.checkForUpdates(onShowMessage, silentIfUpToDate = false) },
                             enabled = !isChecking && !isDownloading,
                             shape = CircleShape,
                             colors = ButtonDefaults.buttonColors(
@@ -468,19 +562,7 @@ fun AppUpdateScreen(
                         is AppUpdateUiState.ReadyToInstall -> updateState.info.releaseNotes
                         else -> ""
                     }
-                    if (rawNotes.isNotBlank()) {
-                        rawNotes.lines()
-                            .map { it.trim().trimStart('-', '*', '•').trim() }
-                            .filter { it.isNotBlank() }
-                            .take(6)
-                            .mapIndexed { idx, line -> "Изменение ${idx + 1}" to line }
-                    } else {
-                        listOf(
-                            "Аудио движок" to "5-полосный эквалайзер с усилением баса и Spatial Audio",
-                            "Офлайн-режим" to "Автоматическая загрузка избранного по Wi-Fi и кэш треков",
-                            "Синхронизация" to "Двусторонняя интеграция с аккаунтом YouTube Music и JSON-бэкапом"
-                        )
-                    }
+                    formatReleaseNotes(rawNotes)
                 }
 
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -514,6 +596,50 @@ fun AppUpdateScreen(
                     }
                 }
             }
+        }
+    }
+}
+
+internal fun formatReleaseNotes(rawNotes: String): List<Pair<String, String>> {
+    if (rawNotes.isBlank()) {
+        return listOf(
+            "Аудио движок" to "5-полосный эквалайзер с усилением баса и Spatial Audio",
+            "Офлайн-режим" to "Автоматическая загрузка избранного по Wi-Fi и кэш треков",
+            "Синхронизация" to "Двусторонняя интеграция с аккаунтом YouTube Music и JSON-бэкапом"
+        )
+    }
+    val cleanedLines = rawNotes.lines()
+        .map { raw ->
+            var line = raw.trim()
+                .replace(Regex("^#+\\s*"), "")
+                .replace(Regex("^[-*•]+\\s*"), "")
+                .replace(Regex("\\[([^\\]]+)\\]\\([^)]+\\)"), "$1")
+                .replace("**", "")
+                .replace("__", "")
+                .replace("`", "")
+                .trim()
+            val changelogMatch = Regex(
+                "(?i)^full\\s+changelog:?\\s+https?://\\S+/compare/(\\S+)$"
+            ).find(line)
+            if (changelogMatch != null) {
+                val range = changelogMatch.groupValues[1].replace("...", " → ")
+                line = "Сравнение версий: $range"
+            } else if (line.equals("What's Changed", ignoreCase = true)) {
+                line = "Основные изменения"
+            }
+            line
+        }
+        .filter { it.isNotBlank() }
+        .take(6)
+
+    if (cleanedLines.isEmpty()) {
+        return listOf("Обновление" to "Улучшения стабильности и безопасности приложения")
+    }
+    return cleanedLines.mapIndexed { idx, line ->
+        if (line.startsWith("Сравнение версий:")) {
+            "История" to line.removePrefix("Сравнение версий:").trim()
+        } else {
+            "Изменение ${idx + 1}" to line
         }
     }
 }

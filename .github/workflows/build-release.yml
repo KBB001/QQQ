@@ -50,9 +50,20 @@ jobs:
             *)  TAG="v$RAW_TAG" ;;
           esac
           CLEAN_VERSION="${TAG#v}"
+          SEMVER_BASE=$(printf '%s' "$CLEAN_VERSION" | sed 's/[^0-9.].*//')
+          IFS='.' read -r V_MAJ V_MIN V_PAT _ <<< "$SEMVER_BASE"
+          V_MAJ=${V_MAJ:-1}
+          V_MIN=${V_MIN:-0}
+          V_PAT=${V_PAT:-0}
+          SEMVER_CODE=$(( 10#$V_MAJ * 100000 + 10#$V_MIN * 1000 + 10#$V_PAT * 10 ))
+          if [ "$SEMVER_CODE" -ge "${GITHUB_RUN_NUMBER}" ]; then
+            MONOTONIC_VCODE=$(( SEMVER_CODE + (10#${GITHUB_RUN_NUMBER} % 10) ))
+          else
+            MONOTONIC_VCODE="${GITHUB_RUN_NUMBER}"
+          fi
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
           echo "version_name=${CLEAN_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "version_code=${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "version_code=${MONOTONIC_VCODE}" >> "$GITHUB_OUTPUT"
 
       - name: Prepare Android Keystore
         id: keystore
@@ -66,7 +77,8 @@ jobs:
           if [ -f "debug.keystore.base64" ]; then
             tr -d '[:space:]' < debug.keystore.base64 | base64 --decode > debug.keystore
           fi
-          if [ ! -f "debug.keystore" ]; then
+          if [ ! -f "debug.keystore" ] && [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::warning::debug.keystore.base64 and KEYSTORE_BASE64 are both missing. Generating ephemeral keystore (OTA updates over prior builds will require reinstall)."
             keytool -genkeypair -noprompt \
               -keystore debug.keystore \
               -alias androiddebugkey \
@@ -87,7 +99,7 @@ jobs:
             echo "using_fallback=false" >> "$GITHUB_OUTPUT"
             echo "Decoded release keystore from KEYSTORE_BASE64 secret."
           else
-            echo "::notice::KEYSTORE_BASE64 secret is not configured. Reusing the persistent repository keystore certificate so all CI releases share a consistent OTA update signature."
+            echo "::notice::KEYSTORE_BASE64 secret is not configured. Using repository debug.keystore.base64 so CI debug & release builds share the exact same signing certificate."
             rm -f "$KEYSTORE_FILE"
             keytool -importkeystore -noprompt \
               -srckeystore debug.keystore \

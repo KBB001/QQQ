@@ -254,7 +254,10 @@ class SettingsViewModel @Inject constructor(
         }
     }
 
-    fun checkForUpdates(onMessage: (String) -> Unit) {
+    fun checkForUpdates(
+        onMessage: (String) -> Unit,
+        silentIfUpToDate: Boolean = false
+    ) {
         if (updateStateFlow.value is AppUpdateUiState.Checking ||
             updateStateFlow.value is AppUpdateUiState.Downloading
         ) {
@@ -270,12 +273,16 @@ class SettingsViewModel @Inject constructor(
 
                 is UpdateCheckOutcome.UpToDate -> {
                     updateStateFlow.value = AppUpdateUiState.Idle
-                    onMessage("У вас актуальная версия (${outcome.currentVersion})")
+                    if (!silentIfUpToDate) {
+                        onMessage("Установлена актуальная версия (${outcome.currentVersion})")
+                    }
                 }
 
                 is UpdateCheckOutcome.Failure -> {
                     updateStateFlow.value = AppUpdateUiState.Idle
-                    onMessage(outcome.message)
+                    if (!silentIfUpToDate) {
+                        onMessage(outcome.message)
+                    }
                 }
             }
         }
