@@ -1058,17 +1058,90 @@ button {
 /* Toast */
 .toast {
   position: fixed;
-  top: calc(env(safe-area-inset-top) + 12px);
+  top: calc(env(safe-area-inset-top) + 64px);
   left: 50%;
   transform: translateX(-50%);
   z-index: 120;
   padding: 10px 16px;
   border-radius: 999px;
-  background: rgba(28, 28, 30, 0.92);
+  background: rgba(28, 28, 30, 0.94);
   color: #ffffff;
   font-size: 13px;
   font-weight: 600;
   box-shadow: var(--shadow-float);
   max-width: calc(100% - 32px);
   text-align: center;
+  pointer-events: none;
+}
+
+.search-clear-btn {
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  color: var(--text-secondary);
+  display: grid;
+  place-items: center;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+
+.action-pills-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: center;
+  margin-top: 10px;
+}
+
+.artist-hero-avatar {
+  width: 86px;
+  height: 86px;
+  border-radius: 999px;
+  object-fit: cover;
+  margin-bottom: 10px;
+  background: var(--bg-subtle);
+  box-shadow: var(--shadow-card);
+}
+
+.engine-badge {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  background: rgba(255, 255, 255, 0.14);
+  color: rgba(255, 255, 255, 0.88);
+}
+
+.yt-player-wrapper.docked-hidden {
+  position: fixed;
+  right: 2px;
+  bottom: 2px;
+  width: 2px;
+  height: 2px;
+  opacity: 0.01;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 1;
+}
+
+.yt-player-wrapper.docked-stage {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  opacity: 1;
+  pointer-events: auto;
+  border-radius: 22px;
+  overflow: hidden;
+  background: #000000;
+}
+
+.yt-player-wrapper.docked-stage iframe,
+#yt-player-host,
+#yt-player-host iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
 }

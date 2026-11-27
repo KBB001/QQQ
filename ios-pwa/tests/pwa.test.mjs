@@ -106,10 +106,12 @@ test('normalizeBackupPayload and SonoraStorage import/export round-trip Android 
   assert.equal(exported.playlists[0].name, 'Roadtrip');
 });
 
-test('extractVideoId and extractPlaylistId parse YouTube & YouTube Music URLs', () => {
+test('extractVideoId and extractPlaylistId parse YouTube, YouTube Music, and relative Piped URLs', () => {
   assert.equal(extractVideoId('https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=RDAMVM'), 'dQw4w9WgXcQ');
   assert.equal(extractVideoId('https://youtu.be/dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
   assert.equal(extractVideoId('https://www.youtube.com/shorts/dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
+  assert.equal(extractVideoId('/watch?v=1N8hOpMqvYs'), '1N8hOpMqvYs');
+  assert.equal(extractVideoId('/watch?v=1N8hOpMqvYs', { allowBareId: false }), null);
   assert.equal(extractVideoId('not-a-video-url'), null);
   assert.equal(extractVideoId('not-a-video', { allowBareId: false }), null);
 
@@ -117,7 +119,21 @@ test('extractVideoId and extractPlaylistId parse YouTube & YouTube Music URLs', 
     extractPlaylistId('https://music.youtube.com/playlist?list=OLAK5uy_n9abcDEF12345'),
     'OLAK5uy_n9abcDEF12345'
   );
+  assert.equal(
+    extractPlaylistId('/playlist?list=PLXIclLvfETS0GFbNbRpwCgh1CGwO6hLrv'),
+    'PLXIclLvfETS0GFbNbRpwCgh1CGwO6hLrv'
+  );
   assert.equal(extractPlaylistId('PLabcdefgh123456'), 'PLabcdefgh123456');
+});
+
+test('SonoraStorage supports creating and renaming playlists', async () => {
+  const storage = new SonoraStorage();
+  await storage.init();
+  const pl = await storage.createPlaylist('Favorites Mix', 'Chill');
+  await storage.renamePlaylist(pl.id, 'Night Drive', 'Late night vibes');
+  const updated = storage.library.playlists.find((p) => p.id === pl.id);
+  assert.equal(updated.name, 'Night Drive');
+  assert.equal(updated.description, 'Late night vibes');
 });
 
 test('selectBestIosAudioStream prioritizes M4A/AAC over WebM and respects HTTPS', () => {

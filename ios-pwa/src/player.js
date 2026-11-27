@@ -1,5 +1,37 @@
 import { sanitizeTrack } from './security.js';
 
+let ytApiPromise = null;
+
+function loadYouTubeIframeApi() {
+  if (globalThis.YT?.Player) return Promise.resolve(globalThis.YT);
+  if (ytApiPromise) return ytApiPromise;
+
+  ytApiPromise = new Promise((resolve, reject) => {
+    const prevReady = globalThis.onYouTubeIframeAPIReady;
+    const timeout = setTimeout(() => {
+      reject(new Error('Не удалось загрузить плеер YouTube'));
+    }, 10000);
+
+    globalThis.onYouTubeIframeAPIReady = () => {
+      clearTimeout(timeout);
+      prevReady?.();
+      resolve(globalThis.YT);
+    };
+
+    const script = document.createElement('script');
+    script.src = 'https://www.youtube.com/iframe_api';
+    script.async = true;
+    script.onerror = () => {
+      clearTimeout(timeout);
+      ytApiPromise = null;
+      reject(new Error('Ошибка загрузки YouTube IFrame API'));
+    };
+    document.head.appendChild(script);
+  });
+
+  return ytApiPromise;
+}
+
 export class SonoraPlayer {
   constructor({ api, storage, onStateChange, onError }) {
     this.api = api;
@@ -11,6 +43,11 @@ export class SonoraPlayer {
     this.audio.setAttribute('playsinline', '');
     this.audio.setAttribute('webkit-playsinline', '');
     this.audio.preload = 'auto';
+
+    this.engine = 'audio'; // 'audio' | 'youtube_iframe'
+    this.ytPlayer = null;
+    this.ytReady = false;
+    this.ytPollId = null;
 
     this.queue = [];
     this.currentIndex = -1;
@@ -57,6 +94,7 @@ export class SonoraPlayer {
 
   getSnapshot() {
     return {
+      engine: this.engine,
       queue: this.queue,
       currentIndex: this.currentIndex,
       currentTrack: this.currentTrack,
@@ -73,12 +111,46 @@ export class SonoraPlayer {
     };
   }
 
+  /** Must be called synchronously inside click/tap handler to unlock iOS Safari audio */
+  unlockGesture() {
+    try {
+      if (this.audio.paused && !this.audio.src) {
+        this.audio.load();
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
   _emit() {
     this.onStateChange?.(this.getSnapshot());
   }
 
+  _stopInactiveEngines(activeEngine) {
+    if (activeEngine !== 'audio') {
+      try {
+        this.audio.pause();
+        this.audio.removeAttribute('src');
+        this.audio.load();
+      } catch {
+        // Ignore
+      }
+    }
+    if (activeEngine !== 'youtube_iframe') {
+      this._stopYtPolling();
+      try {
+        if (this.ytReady && this.ytPlayer?.pauseVideo) {
+          this.ytPlayer.pauseVideo();
+        }
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
   _bindAudioEvents() {
     this.audio.addEventListener('play', () => {
+      if (this.engine !== 'audio') return;
       this.isPlaying = true;
       this.isBuffering = false;
       this._setMediaPlaybackState('playing');
@@ -87,6 +159,7 @@ export class SonoraPlayer {
     });
 
     this.audio.addEventListener('pause', () => {
+      if (this.engine !== 'audio') return;
       this.isPlaying = false;
       this.isBuffering = false;
       this._setMediaPlaybackState('paused');
@@ -95,16 +168,19 @@ export class SonoraPlayer {
     });
 
     this.audio.addEventListener('waiting', () => {
+      if (this.engine !== 'audio') return;
       this.isBuffering = true;
       this._emit();
     });
 
     this.audio.addEventListener('canplay', () => {
+      if (this.engine !== 'audio') return;
       this.isBuffering = false;
       this._emit();
     });
 
     this.audio.addEventListener('loadedmetadata', () => {
+      if (this.engine !== 'audio') return;
       if (Number.isFinite(this.audio.duration) && this.audio.duration > 0) {
         this.duration = this.audio.duration;
       }
@@ -114,6 +190,7 @@ export class SonoraPlayer {
     });
 
     this.audio.addEventListener('timeupdate', () => {
+      if (this.engine !== 'audio') return;
       this.currentTime = this.audio.currentTime || 0;
       if (Number.isFinite(this.audio.duration) && this.audio.duration > 0) {
         this.duration = this.audio.duration;
@@ -128,6 +205,7 @@ export class SonoraPlayer {
     });
 
     this.audio.addEventListener('ended', async () => {
+      if (this.engine !== 'audio') return;
       this.isPlaying = false;
       if (this.repeatMode === 'ONE') {
         this.seekTo(0);
@@ -138,19 +216,137 @@ export class SonoraPlayer {
     });
 
     this.audio.addEventListener('error', async () => {
+      if (this.engine !== 'audio') return;
       const track = this.currentTrack;
       if (!track) return;
-      if (!this._retriedCurrentStream) {
+      if (!this._retriedCurrentStream && !track.id.startsWith('aud:')) {
         this._retriedCurrentStream = true;
         this.streamCache.delete(track.id);
-        await this._loadAndPlayTrack(track, this.currentTime, true);
+        await this._startYouTubeIframe(track, this.currentTime, true);
       } else {
         this.isBuffering = false;
         this.isPlaying = false;
         this._emit();
-        this.onError?.('Не удалось воспроизвести трек на iOS. Попробуйте сменить качество или источник API.');
+        this.onError?.('Не удалось загрузить поток трека');
       }
     });
+  }
+
+  async _ensureYouTubePlayer(videoId, startSeconds = 0, shouldPlay = true) {
+    const YT = await loadYouTubeIframeApi();
+    if (this.ytPlayer && this.ytReady) {
+      if (shouldPlay) {
+        this.ytPlayer.loadVideoById({ videoId, startSeconds });
+      } else {
+        this.ytPlayer.cueVideoById({ videoId, startSeconds });
+      }
+      this.ytPlayer.setPlaybackRate?.(this.playbackSpeed);
+      return;
+    }
+
+    await new Promise((resolve, reject) => {
+      const host = document.getElementById('yt-player-host');
+      if (!host) {
+        reject(new Error('Контейнер YouTube плеера не найден'));
+        return;
+      }
+      this.ytPlayer = new YT.Player('yt-player-host', {
+        videoId,
+        playerVars: {
+          autoplay: shouldPlay ? 1 : 0,
+          playsinline: 1,
+          controls: 1,
+          rel: 0,
+          modestbranding: 1,
+          start: Math.floor(startSeconds)
+        },
+        events: {
+          onReady: (ev) => {
+            this.ytReady = true;
+            ev.target.setPlaybackRate?.(this.playbackSpeed);
+            if (shouldPlay) ev.target.playVideo();
+            resolve();
+          },
+          onStateChange: (ev) => {
+            if (this.engine !== 'youtube_iframe') return;
+            const state = ev.data;
+            if (state === YT.PlayerState.PLAYING) {
+              this.isPlaying = true;
+              this.isBuffering = false;
+              const d = ev.target.getDuration?.() || 0;
+              if (d > 0) this.duration = d;
+              this._setMediaPlaybackState('playing');
+              this._startYtPolling();
+              this._emit();
+            } else if (state === YT.PlayerState.PAUSED) {
+              this.isPlaying = false;
+              this.isBuffering = false;
+              this._setMediaPlaybackState('paused');
+              this._stopYtPolling();
+              this._persistPlayback(true);
+              this._emit();
+            } else if (state === YT.PlayerState.BUFFERING) {
+              this.isBuffering = true;
+              this._emit();
+            } else if (state === YT.PlayerState.ENDED) {
+              this.isPlaying = false;
+              this._stopYtPolling();
+              if (this.repeatMode === 'ONE') {
+                this.seekTo(0);
+                this.ytPlayer?.playVideo?.();
+              } else {
+                this.next(true);
+              }
+            }
+          },
+          onError: () => {
+            if (this.engine !== 'youtube_iframe') return;
+            this.isBuffering = false;
+            this.isPlaying = false;
+            this._emit();
+            this.onError?.('Видео недоступно для воспроизведения в этом регионе');
+          }
+        }
+      });
+    });
+  }
+
+  _startYtPolling() {
+    this._stopYtPolling();
+    this.ytPollId = setInterval(() => {
+      if (this.engine !== 'youtube_iframe' || !this.ytPlayer?.getCurrentTime) return;
+      const cur = Number(this.ytPlayer.getCurrentTime()) || 0;
+      const dur = Number(this.ytPlayer.getDuration?.()) || 0;
+      this.currentTime = cur;
+      if (dur > 0) this.duration = dur;
+      this._updatePositionState();
+      const now = Date.now();
+      if (now - this._lastSaveAt > 5000) {
+        this._lastSaveAt = now;
+        this._persistPlayback(false);
+      }
+      this._emit();
+    }, 300);
+  }
+
+  _stopYtPolling() {
+    if (this.ytPollId) {
+      clearInterval(this.ytPollId);
+      this.ytPollId = null;
+    }
+  }
+
+  async _startYouTubeIframe(track, resumeSeconds = 0, shouldPlay = true) {
+    this.engine = 'youtube_iframe';
+    this._stopInactiveEngines('youtube_iframe');
+    this.isBuffering = true;
+    this._updateMediaMetadata(track);
+    this._emit();
+
+    await this._ensureYouTubePlayer(track.id, resumeSeconds, shouldPlay);
+    await this.storage.recordPlayback(track);
+    await this._persistPlayback(true);
+    this.loadLyricsForCurrentTrack(track);
   }
 
   _bindMediaSession() {
@@ -160,7 +356,7 @@ export class SonoraPlayer {
       try {
         ms.setActionHandler(action, fn);
       } catch {
-        // Unsupported action on current browser
+        // Unsupported action
       }
     };
 
@@ -199,7 +395,7 @@ export class SonoraPlayer {
         artwork
       });
     } catch {
-      // Ignore metadata error
+      // Ignore
     }
   }
 
@@ -214,9 +410,9 @@ export class SonoraPlayer {
 
   _updatePositionState() {
     if (!('mediaSession' in navigator) || !navigator.mediaSession.setPositionState) return;
-    const dur = Number.isFinite(this.audio.duration) ? this.audio.duration : this.duration;
+    const dur = this.duration;
     if (!dur || dur <= 0) return;
-    const pos = Math.min(dur, Math.max(0, this.audio.currentTime || 0));
+    const pos = Math.min(dur, Math.max(0, this.currentTime || 0));
     try {
       navigator.mediaSession.setPositionState({
         duration: dur,
@@ -224,7 +420,7 @@ export class SonoraPlayer {
         position: pos
       });
     } catch {
-      // Safari rejects invalid values silently
+      // Ignore
     }
   }
 
@@ -243,6 +439,7 @@ export class SonoraPlayer {
   async playTrack(track, list = null) {
     const clean = sanitizeTrack(track);
     if (!clean) return;
+    this.unlockGesture();
 
     if (Array.isArray(list) && list.length > 0) {
       const normalized = list.map(sanitizeTrack).filter(Boolean);
@@ -283,6 +480,13 @@ export class SonoraPlayer {
 
       if (this.currentTrack?.id !== track.id) return;
 
+      if (info.engine === 'youtube_iframe' || !info.streamUrl) {
+        await this._startYouTubeIframe(track, resumeSeconds, shouldPlay);
+        return;
+      }
+
+      this.engine = 'audio';
+      this._stopInactiveEngines('audio');
       this.audio.src = info.streamUrl;
       this.audio.playbackRate = this.playbackSpeed;
       if (resumeSeconds > 0) {
@@ -327,6 +531,13 @@ export class SonoraPlayer {
     const track = this.currentTrack;
     if (!track) return;
 
+    if (this.engine === 'youtube_iframe' && this.ytPlayer && this.ytReady) {
+      const wantPlay = forcePlay !== null ? forcePlay : !this.isPlaying;
+      if (wantPlay) this.ytPlayer.playVideo();
+      else this.ytPlayer.pauseVideo();
+      return;
+    }
+
     const wantPlay = forcePlay !== null ? forcePlay : this.audio.paused;
     if (!wantPlay) {
       this.audio.pause();
@@ -349,11 +560,13 @@ export class SonoraPlayer {
     const dur = this.duration || this.currentTrack?.durationSeconds || 0;
     const clamped = Math.max(0, dur > 0 ? Math.min(dur, seconds) : seconds);
     this.currentTime = clamped;
-    if (this.audio.src) {
+    if (this.engine === 'youtube_iframe' && this.ytPlayer?.seekTo) {
+      this.ytPlayer.seekTo(clamped, true);
+    } else if (this.audio.src) {
       try {
         this.audio.currentTime = clamped;
       } catch {
-        // Ignore until metadata loads
+        // Ignore
       }
     }
     this._updatePositionState();
@@ -361,7 +574,7 @@ export class SonoraPlayer {
   }
 
   seekBy(deltaSeconds) {
-    this.seekTo((this.audio.currentTime || this.currentTime || 0) + deltaSeconds);
+    this.seekTo((this.currentTime || 0) + deltaSeconds);
   }
 
   async next(fromEnded = false) {
@@ -385,10 +598,9 @@ export class SonoraPlayer {
       return;
     }
 
-    // End of queue: trigger smart radio autoplay if enabled
     if (fromEnded && this.storage.settings.autoplayEnabled && this.currentTrack) {
       try {
-        const related = await this.api.getRelatedTracks(this.currentTrack.id);
+        const related = await this.api.getRelatedTracks(this.currentTrack);
         const existingIds = new Set(this.queue.map((t) => t.id));
         const additions = related.filter((t) => !existingIds.has(t.id)).slice(0, 12);
         if (additions.length > 0) {
@@ -399,7 +611,7 @@ export class SonoraPlayer {
           return;
         }
       } catch {
-        // Ignore autoplay network errors at queue end
+        // Ignore
       }
     }
 
@@ -409,7 +621,7 @@ export class SonoraPlayer {
 
   async previous() {
     if (this.queue.length === 0) return;
-    if ((this.audio.currentTime || 0) > 3) {
+    if ((this.currentTime || 0) > 3) {
       this.seekTo(0);
       return;
     }
@@ -446,7 +658,7 @@ export class SonoraPlayer {
   async startRadio(track) {
     await this.playTrack(track);
     try {
-      const related = await this.api.getRelatedTracks(track.id);
+      const related = await this.api.getRelatedTracks(track);
       const unique = related.filter((t) => t.id !== track.id).slice(0, 20);
       if (unique.length > 0) {
         this.queue = [this.currentTrack, ...unique];
@@ -455,7 +667,7 @@ export class SonoraPlayer {
         this._emit();
       }
     } catch {
-      // Keep single track playing
+      // Keep playing track
     }
   }
 
@@ -476,6 +688,9 @@ export class SonoraPlayer {
     const clamped = Math.min(2.0, Math.max(0.5, Number(speed) || 1.0));
     this.playbackSpeed = Math.round(clamped * 100) / 100;
     this.audio.playbackRate = this.playbackSpeed;
+    if (this.engine === 'youtube_iframe' && this.ytPlayer?.setPlaybackRate) {
+      this.ytPlayer.setPlaybackRate(this.playbackSpeed);
+    }
     this._updatePositionState();
     this._persistPlayback(true);
     this._emit();
@@ -490,17 +705,21 @@ export class SonoraPlayer {
 
     const fadeLeadMs = Math.min(5000, Math.floor(ms / 2));
     this.sleepTimeoutId = setTimeout(() => {
-      const startVol = this.audio.volume || 1.0;
       const steps = 10;
       let step = 0;
       const fadeStepMs = Math.max(100, Math.floor(fadeLeadMs / steps));
       const fadeId = setInterval(() => {
         step++;
-        this.audio.volume = Math.max(0, startVol * (1 - step / steps));
+        const ratio = Math.max(0, 1 - step / steps);
+        this.audio.volume = ratio;
+        if (this.ytPlayer?.setVolume) {
+          this.ytPlayer.setVolume(Math.round(ratio * 100));
+        }
         if (step >= steps) {
           clearInterval(fadeId);
-          this.audio.pause();
+          this.togglePlayPause(false);
           this.audio.volume = 1.0;
+          this.ytPlayer?.setVolume?.(100);
           this.cancelSleepTimer();
         }
       }, fadeStepMs);
@@ -517,6 +736,7 @@ export class SonoraPlayer {
     this.sleepIntervalId = null;
     this.sleepTimerEndsAt = 0;
     this.audio.volume = 1.0;
+    this.ytPlayer?.setVolume?.(100);
     this._emit();
   }
 }

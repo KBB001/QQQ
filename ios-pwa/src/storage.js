@@ -311,6 +311,16 @@ export class SonoraStorage {
     await this._saveLibrary();
   }
 
+  async renamePlaylist(playlistId, name, description = '') {
+    const pl = this.library.playlists.find((p) => p.id === playlistId);
+    const cleanName = String(name ?? '').trim().slice(0, 120);
+    if (!pl || !cleanName) throw new Error('Введите название плейлиста');
+    pl.name = cleanName;
+    pl.description = String(description ?? '').trim().slice(0, 500);
+    await this._saveLibrary();
+    return pl;
+  }
+
   async deletePlaylist(playlistId) {
     this.library.playlists = this.library.playlists.filter((p) => p.id !== playlistId);
     await this._saveLibrary();

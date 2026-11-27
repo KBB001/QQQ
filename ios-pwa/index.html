@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' https: data: blob:; media-src 'self' https: blob:; connect-src 'self' https:; worker-src 'self'; object-src 'none'; base-uri 'self';" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' https://www.youtube.com https://s.ytimg.com; style-src 'self'; img-src 'self' https: data: blob:; media-src 'self' https: blob:; connect-src 'self' https:; frame-src https://www.youtube.com https://www.youtube-nocookie.com; worker-src 'self'; object-src 'none'; base-uri 'self';" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-title" content="Sonora" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -59,6 +59,11 @@
 
     <!-- Fullscreen Player Sheet -->
     <div id="player-sheet" class="player-sheet hidden" role="dialog" aria-modal="true" aria-label="Плеер"></div>
+
+    <!-- Persistent YouTube Fallback Engine Host (kept non-hidden for WebKit playback continuity) -->
+    <div id="yt-player-wrapper" class="yt-player-wrapper docked-hidden" aria-hidden="true">
+      <div id="yt-player-host"></div>
+    </div>
 
     <!-- Reusable Modal / Action Sheet -->
     <div id="modal-backdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true">

@@ -58,6 +58,8 @@ class SonoraApp {
       searchError: '',
       searchResults: [],
       searchSuggestions: [],
+      selectedArtist: null,
+      artistLoading: false,
       librarySubtab: 'playlists',
       selectedPlaylistId: null,
       playerExpanded: false,
@@ -71,7 +73,9 @@ class SonoraApp {
 
     this.renderedTracks = new Map();
     this.renderedPlaylists = new Map();
+    this.renderedArtists = new Map();
     this.toastTimer = null;
+    this.suggestTimer = null;
     this.swRegistration = null;
   }
 
@@ -106,7 +110,7 @@ class SonoraApp {
     el.textContent = message;
     el.classList.remove('hidden');
     clearTimeout(this.toastTimer);
-    this.toastTimer = setTimeout(() => el.classList.add('hidden'), 3200);
+    this.toastTimer = setTimeout(() => el.classList.add('hidden'), 2800);
   }
 
   async registerServiceWorker() {
@@ -138,7 +142,7 @@ class SonoraApp {
         window.location.reload();
       });
     } catch {
-      // Ignore SW error on non-HTTPS previews
+      // Ignore
     }
   }
 
@@ -193,7 +197,7 @@ class SonoraApp {
 
     const mood = MOOD_CHIPS.find((m) => m.id === moodId) || MOOD_CHIPS[0];
     try {
-      const items = await this.api.search(mood.query, 'TRACKS');
+      const items = await this.api.search(mood.query, 'TRACKS', { isMoodTrending: true });
       this.state.homeTracks = items.filter((i) => i.type === 'track');
       this.state.homeLoading = false;
     } catch (err) {
@@ -208,10 +212,13 @@ class SonoraApp {
     this.state.searchQuery = clean;
     this.state.searchFilter = filter;
     this.state.searchError = '';
+    this.state.selectedArtist = null;
+    this.state.searchSuggestions = [];
 
     if (filter === 'LOCAL') {
       this.state.searchLoading = false;
       this.state.searchResults = this.searchLocalLibrary(clean);
+      this.renderHeader();
       this.renderMain();
       return;
     }
@@ -219,11 +226,13 @@ class SonoraApp {
     if (!clean) {
       this.state.searchResults = [];
       this.state.searchLoading = false;
+      this.renderHeader();
       this.renderMain();
       return;
     }
 
     this.state.searchLoading = true;
+    this.renderHeader();
     this.renderMain();
     await this.storage.recordSearchQuery(clean);
 
@@ -235,6 +244,31 @@ class SonoraApp {
       this.state.searchError = err?.message || 'Ошибка поиска';
     }
     if (this.state.activeTab === 'search') this.renderMain();
+  }
+
+  async openArtistView(artistItem) {
+    this.state.artistLoading = true;
+    this.state.selectedArtist = {
+      title: artistItem.title,
+      subtitle: artistItem.artist,
+      thumbnailUrl: artistItem.thumbnailUrl,
+      tracks: []
+    };
+    this.renderHeader();
+    this.renderMain();
+
+    try {
+      const details = await this.api.getArtistDetails(artistItem);
+      this.state.selectedArtist = details;
+    } catch (err) {
+      this.showToast(err.message);
+    } finally {
+      this.state.artistLoading = false;
+      if (this.state.activeTab === 'search') {
+        this.renderHeader();
+        this.renderMain();
+      }
+    }
   }
 
   searchLocalLibrary(query) {
@@ -259,13 +293,46 @@ class SonoraApp {
     if (this.state.playerExpanded) {
       const sheet = document.getElementById('player-sheet');
       const snap = this.player.getSnapshot();
-      // If active sheet content belongs to different track or lyrics toggled, re-render full sheet; otherwise update fast-tick controls
-      if (sheet && sheet.dataset.trackId === (snap.currentTrack?.id || '') && !this.state.playerLyricsOpen) {
+      const expectedKey = `${snap.currentTrack?.id || ''}:${snap.engine}:${this.state.playerLyricsOpen ? 'lyr' : 'art'}`;
+      if (sheet && sheet.dataset.renderKey === expectedKey && !this.state.playerLyricsOpen) {
         this.updateFastPlayerProgress(snap);
       } else if (sheet) {
         this.renderPlayerSheet();
       }
+    } else {
+      this.syncYoutubeWrapperPosition();
     }
+  }
+
+  syncYoutubeWrapperPosition() {
+    const wrapper = document.getElementById('yt-player-wrapper');
+    if (!wrapper || !this.player) return;
+    const snap = this.player.getSnapshot();
+    const shouldShowStage =
+      this.state.playerExpanded &&
+      !this.state.playerLyricsOpen &&
+      snap.engine === 'youtube_iframe' &&
+      Boolean(snap.currentTrack);
+
+    if (!shouldShowStage) {
+      wrapper.className = 'yt-player-wrapper docked-hidden';
+      wrapper.style.left = '';
+      wrapper.style.top = '';
+      wrapper.style.width = '';
+      wrapper.style.height = '';
+      return;
+    }
+
+    const anchor = document.getElementById('player-yt-anchor');
+    if (!anchor) return;
+    const rect = anchor.getBoundingClientRect();
+    wrapper.className = 'yt-player-wrapper docked-stage';
+    wrapper.style.position = 'fixed';
+    wrapper.style.zIndex = '85';
+    wrapper.style.left = `${rect.left}px`;
+    wrapper.style.top = `${rect.top}px`;
+    wrapper.style.width = `${rect.width}px`;
+    wrapper.style.height = `${rect.height}px`;
   }
 
   updateFastPlayerProgress(snap) {
@@ -313,6 +380,8 @@ class SonoraApp {
       if (this.state.activeTab === 'library' && this.state.selectedPlaylistId) {
         const pl = this.storage.library.playlists.find((p) => p.id === this.state.selectedPlaylistId);
         titleEl.textContent = pl ? pl.name : 'Плейлист';
+      } else if (this.state.activeTab === 'search' && this.state.selectedArtist) {
+        titleEl.textContent = this.state.selectedArtist.title;
       } else {
         titleEl.textContent = titles[this.state.activeTab] || 'Sonora';
       }
@@ -321,6 +390,8 @@ class SonoraApp {
 
     if (this.state.activeTab === 'library' && this.state.selectedPlaylistId) {
       actionsEl.innerHTML = `<button type="button" class="icon-pill-btn" data-action="close-playlist">Назад</button>`;
+    } else if (this.state.activeTab === 'search' && this.state.selectedArtist) {
+      actionsEl.innerHTML = `<button type="button" class="icon-pill-btn" data-action="close-artist">Назад</button>`;
     } else if (this.state.activeTab === 'library') {
       actionsEl.innerHTML = `
         <button type="button" class="icon-pill-btn" data-action="open-create-playlist" aria-label="Создать плейлист">${SVG.plus}<span>Плейлист</span></button>
@@ -346,6 +417,7 @@ class SonoraApp {
   _renderTrackRowHtml(track, listKey = 'default', idx = 0) {
     this._registerTrack(track);
     const active = this.player?.currentTrack?.id === track.id;
+    const isFav = this.storage.isFavorite(track.id);
     const dur = track.durationSeconds ? formatTime(track.durationSeconds) : '';
     return `
       <div class="track-row ${active ? 'active-track' : ''}" data-track-id="${escapeHtml(track.id)}" data-list-key="${escapeHtml(listKey)}" data-index="${idx}">
@@ -353,6 +425,9 @@ class SonoraApp {
         <button type="button" class="track-meta" data-action="play-track" data-track-id="${escapeHtml(track.id)}" data-list-key="${escapeHtml(listKey)}">
           <div class="track-title">${escapeHtml(track.title)}</div>
           <div class="track-sub">${escapeHtml(track.artist)}${dur ? ` • ${escapeHtml(dur)}` : ''}</div>
+        </button>
+        <button type="button" class="track-more-btn" style="color:${isFav ? 'var(--accent)' : 'var(--text-secondary)'}" data-action="toggle-favorite" data-track-id="${escapeHtml(track.id)}" aria-label="Нравится">
+          ${isFav ? SVG.heart : SVG.heartOutline}
         </button>
         <button type="button" class="track-more-btn" data-action="open-track-menu" data-track-id="${escapeHtml(track.id)}" aria-label="Действия с треком">
           ${SVG.more}
@@ -366,13 +441,16 @@ class SonoraApp {
     if (!main) return;
     this.renderedTracks.clear();
     this.renderedPlaylists.clear();
+    this.renderedArtists.clear();
 
     if (this.state.activeTab === 'home') {
       main.innerHTML = this.renderHomeHtml();
     } else if (this.state.activeTab === 'search') {
       main.innerHTML = this.renderSearchHtml();
       const input = document.getElementById('search-query-input');
-      if (input) input.value = this.state.searchQuery;
+      if (input) {
+        input.value = this.state.searchQuery;
+      }
     } else if (this.state.activeTab === 'library') {
       main.innerHTML = this.renderLibraryHtml();
     } else {
@@ -445,7 +523,7 @@ class SonoraApp {
     let feedHtml = '';
     if (this.state.homeLoading && this.state.homeTracks.length === 0) {
       feedHtml = `<div class="state-card"><h3>Загрузка музыки…</h3><p>Подбираем треки для вас</p></div>`;
-    } else if (this.state.homeError) {
+    } else if (this.state.homeError && this.state.homeTracks.length === 0) {
       feedHtml = `
         <div class="state-card">
           <h3>Нет подключения к каталогу</h3>
@@ -465,13 +543,36 @@ class SonoraApp {
       ${historyStrip}
       <div class="section-header">
         <h2 class="section-title">Подборка дня</h2>
-        <button type="button" class="section-action" data-action="play-all-home">Включить всё</button>
+        ${this.state.homeTracks.length > 0 ? `<button type="button" class="section-action" data-action="play-all-home">Включить всё</button>` : ''}
       </div>
       ${feedHtml}
     `;
   }
 
   renderSearchHtml() {
+    if (this.state.selectedArtist) {
+      const a = this.state.selectedArtist;
+      return `
+        <div class="state-card">
+          <img src="${escapeHtml(getSafeThumb(a.thumbnailUrl))}" alt="" class="artist-hero-avatar" />
+          <h3>${escapeHtml(a.title)}</h3>
+          <p>${escapeHtml(a.subtitle)}</p>
+          ${
+            a.tracks.length > 0
+              ? `<button type="button" class="btn-accent-sm" data-action="play-artist-all">Включить всё</button>`
+              : ''
+          }
+        </div>
+        ${
+          this.state.artistLoading
+            ? `<div class="state-card"><h3>Загрузка треков…</h3></div>`
+            : a.tracks.length > 0
+              ? `<div class="grouped-card" style="margin-top:12px;">${a.tracks.map((t, idx) => this._renderTrackRowHtml(t, 'artist', idx)).join('')}</div>`
+              : `<div class="state-card"><p>Треки не найдены</p></div>`
+        }
+      `;
+    }
+
     const filters = [
       { id: 'TRACKS', label: 'Треки' },
       { id: 'PLAYLISTS', label: 'Плейлисты' },
@@ -490,6 +591,16 @@ class SonoraApp {
           )
           .join('')}
       </div>`;
+
+    const suggestionsHtml =
+      this.state.searchSuggestions.length > 0 && !this.state.searchLoading
+        ? `<div class="chips-row">${this.state.searchSuggestions
+            .map(
+              (s) =>
+                `<button type="button" class="chip-btn" data-action="run-saved-query" data-query="${escapeHtml(s)}">${escapeHtml(s)}</button>`
+            )
+            .join('')}</div>`
+        : '';
 
     let bodyHtml = '';
     if (this.state.searchLoading) {
@@ -535,9 +646,10 @@ class SonoraApp {
               </button>`;
           }
           if (item.type === 'artist') {
+            this.renderedArtists.set(item.id, item);
             return `
-              <button type="button" class="track-row" data-action="run-saved-query" data-query="${escapeHtml(item.title)}">
-                <img src="${escapeHtml(getSafeThumb(item))}" alt="" class="track-thumb" loading="lazy" />
+              <button type="button" class="track-row" data-action="open-artist" data-artist-id="${escapeHtml(item.id)}">
+                <img src="${escapeHtml(getSafeThumb(item))}" alt="" class="track-thumb" style="border-radius:999px;" loading="lazy" />
                 <div class="track-meta">
                   <div class="track-title">${escapeHtml(item.title)}</div>
                   <div class="track-sub">${escapeHtml(item.artist)}</div>
@@ -555,9 +667,15 @@ class SonoraApp {
         <div class="search-input-box">
           ${SVG.search}
           <input id="search-query-input" class="search-input" type="search" placeholder="Трек, артист или ссылка YouTube…" autocomplete="off" />
+          ${
+            this.state.searchQuery
+              ? `<button type="button" class="search-clear-btn" data-action="clear-search-input" aria-label="Очистить">✕</button>`
+              : ''
+          }
         </div>
         <button type="submit" class="btn-accent-sm">Найти</button>
       </form>
+      ${suggestionsHtml}
       ${filterHtml}
       ${bodyHtml}
     `;
@@ -573,19 +691,22 @@ class SonoraApp {
           <div class="state-card">
             <h3>${escapeHtml(pl.name)}</h3>
             <p>${escapeHtml(pl.description || `${pl.tracks.length} треков`)}</p>
-            <div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap;">
+            <div class="action-pills-row">
               ${
                 pl.tracks.length > 0
-                  ? `<button type="button" class="btn-accent-sm" data-action="play-playlist" data-playlist-id="${pl.id}">Включить всё</button>`
+                  ? `<button type="button" class="btn-accent-sm" data-action="play-playlist" data-playlist-id="${pl.id}">Включить всё</button>
+                     <button type="button" class="icon-pill-btn" data-action="shuffle-playlist" data-playlist-id="${pl.id}">Перемешать</button>`
                   : ''
               }
-              <button type="button" class="icon-pill-btn" data-action="delete-playlist" data-playlist-id="${pl.id}">Удалить</button>
+              <button type="button" class="icon-pill-btn" data-action="open-add-tracks-picker" data-playlist-id="${pl.id}">+ Добавить</button>
+              <button type="button" class="icon-pill-btn" data-action="open-rename-playlist" data-playlist-id="${pl.id}">Изменить</button>
+              <button type="button" class="icon-pill-btn" style="color:var(--danger);" data-action="confirm-delete-playlist" data-playlist-id="${pl.id}">Удалить</button>
             </div>
           </div>
           ${
             pl.tracks.length > 0
               ? `<div class="grouped-card" style="margin-top:14px;">${pl.tracks.map((t, idx) => this._renderTrackRowHtml(t, `playlist:${pl.id}`, idx)).join('')}</div>`
-              : `<div class="state-card"><p>В этом плейлисте пока нет треков. Добавляйте треки через меню «⋯».</p></div>`
+              : `<div class="state-card"><p>В этом плейлисте пока нет треков. Нажмите «+ Добавить» или используйте меню «⋯» у любого трека.</p></div>`
           }
         `;
       }
@@ -643,8 +764,15 @@ class SonoraApp {
         ${subtabHtml}
         ${
           favs.length > 0
-            ? `<div class="grouped-card">${favs.map((t, idx) => this._renderTrackRowHtml(t, 'favorites', idx)).join('')}</div>`
-            : `<div class="state-card"><h3>Избранное пусто</h3><p>Нажимайте сердечко в плеере или меню трека, чтобы сохранять музыку сюда.</p></div>`
+            ? `<div class="section-header">
+                 <h2 class="section-title">Любимые (${favs.length})</h2>
+                 <div style="display:flex;gap:8px;">
+                   <button type="button" class="section-action" data-action="shuffle-favorites">Перемешать</button>
+                   <button type="button" class="section-action" data-action="play-favorites">Включить</button>
+                 </div>
+               </div>
+               <div class="grouped-card">${favs.map((t, idx) => this._renderTrackRowHtml(t, 'favorites', idx)).join('')}</div>`
+            : `<div class="state-card"><h3>Избранное пусто</h3><p>Нажимайте сердечко рядом с треком или в плеере, чтобы сохранять музыку сюда.</p></div>`
         }
       `;
     }
@@ -654,7 +782,13 @@ class SonoraApp {
       ${subtabHtml}
       ${
         hist.length > 0
-          ? `<div class="section-header"><h2 class="section-title">Недавние</h2><button type="button" class="section-action" data-action="clear-history">Очистить</button></div>
+          ? `<div class="section-header">
+               <h2 class="section-title">Недавние (${hist.length})</h2>
+               <div style="display:flex;gap:8px;">
+                 <button type="button" class="section-action" data-action="play-history">Включить</button>
+                 <button type="button" class="section-action" data-action="clear-history">Очистить</button>
+               </div>
+             </div>
              <div class="grouped-card">${hist.map((t, idx) => this._renderTrackRowHtml(t, 'history', idx)).join('')}</div>`
           : `<div class="state-card"><h3>История пуста</h3><p>Прослушанные треки появятся здесь автоматически.</p></div>`
       }
@@ -709,7 +843,7 @@ class SonoraApp {
         <button type="button" class="setting-row" data-action="open-custom-api">
           <div>
             <div class="setting-label">Свой сервер каталога (HTTPS)</div>
-            <div class="setting-sub">${escapeHtml(s.customApiBaseUrl || 'Используются публичные шлюзы с резервом')}</div>
+            <div class="setting-sub">${escapeHtml(s.customApiBaseUrl || `Активный узел: ${this.api.activeSourceLabel}`)}</div>
           </div>
           <span class="setting-value">Изменить ›</span>
         </button>
@@ -795,14 +929,16 @@ class SonoraApp {
 
     if (!this.state.playerExpanded || !track) {
       sheet.classList.add('hidden');
-      sheet.dataset.trackId = '';
+      sheet.dataset.renderKey = '';
+      this.syncYoutubeWrapperPosition();
       return;
     }
 
     sheet.classList.remove('hidden');
-    sheet.dataset.trackId = track.id;
+    sheet.dataset.renderKey = `${track.id}:${snap.engine}:${this.state.playerLyricsOpen ? 'lyr' : 'art'}`;
     const isFav = this.storage.isFavorite(track.id);
     const repeatIcon = snap.repeatMode === 'ONE' ? SVG.repeatOne : SVG.repeat;
+    const engineLabel = snap.engine === 'youtube_iframe' ? 'YouTube Плеер' : 'Фоновое аудио';
 
     let stageHtml = '';
     if (this.state.playerLyricsOpen) {
@@ -831,6 +967,8 @@ class SonoraApp {
       } else {
         stageHtml = `<div class="lyrics-panel"><p style="color:rgba(255,255,255,0.65);">Текст песни для этого трека не найден.</p></div>`;
       }
+    } else if (snap.engine === 'youtube_iframe') {
+      stageHtml = `<div class="player-artwork-stage" id="player-yt-anchor"></div>`;
     } else {
       stageHtml = `
         <div class="player-artwork-stage" id="player-artwork-stage">
@@ -844,7 +982,10 @@ class SonoraApp {
       <div class="sheet-grabber" id="player-drag-handle"></div>
       <div class="player-topbar">
         <button type="button" class="player-ctrl-btn" data-action="close-full-player" aria-label="Свернуть плеер">${SVG.chevronDown}</button>
-        <span style="font-size:13px;font-weight:600;color:rgba(255,255,255,0.72);">Сейчас играет</span>
+        <div style="text-align:center;">
+          <div style="font-size:13px;font-weight:600;color:rgba(255,255,255,0.72);">Сейчас играет</div>
+          <span class="engine-badge">${engineLabel}</span>
+        </div>
         <button type="button" class="player-ctrl-btn" data-action="open-track-menu" data-track-id="${escapeHtml(track.id)}" aria-label="Меню трека">${SVG.more}</button>
       </div>
 
@@ -889,6 +1030,8 @@ class SonoraApp {
     `;
 
     this._bindPlayerInteractions();
+    requestAnimationFrame(() => this.syncYoutubeWrapperPosition());
+    setTimeout(() => this.syncYoutubeWrapperPosition(), 310);
   }
 
   _bindPlayerInteractions() {
@@ -907,7 +1050,6 @@ class SonoraApp {
       });
     }
 
-    // Double-tap left/right seek zones on artwork
     const stage = document.getElementById('player-artwork-stage');
     if (stage) {
       let lastTapAt = 0;
@@ -929,7 +1071,6 @@ class SonoraApp {
       });
     }
 
-    // Swipe-down to dismiss full player sheet
     const sheet = document.getElementById('player-sheet');
     if (sheet) {
       let startY = 0;
@@ -969,6 +1110,8 @@ class SonoraApp {
     if (key === 'favorites') return this.storage.library.favorites;
     if (key === 'history') return this.storage.library.history;
     if (key === 'search') return this.state.searchResults.filter((i) => i.type === 'track');
+    if (key === 'artist') return this.state.selectedArtist?.tracks || [];
+    if (key === 'quick') return [...this.storage.library.favorites, ...this.storage.library.history];
     if (key?.startsWith('playlist:')) {
       const pid = Number(key.slice('playlist:'.length));
       return this.storage.library.playlists.find((p) => p.id === pid)?.tracks || [];
@@ -977,23 +1120,64 @@ class SonoraApp {
   }
 
   bindGlobalEvents() {
-    // Tab bar
+    window.addEventListener('resize', () => {
+      if (this.state.playerExpanded) this.syncYoutubeWrapperPosition();
+    });
+
     document.querySelectorAll('.tab-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         this.state.activeTab = btn.dataset.tab;
         if (this.state.activeTab !== 'library') this.state.selectedPlaylistId = null;
+        if (this.state.activeTab !== 'search') this.state.selectedArtist = null;
         this.renderHeader();
         this.renderTabBar();
         this.renderMain();
       });
     });
 
-    // Backdrop close
     document.getElementById('modal-backdrop')?.addEventListener('click', (e) => {
       if (e.target.id === 'modal-backdrop') this.closeModal();
     });
 
-    // Search form submit delegation
+    // Live search input suggestions & local filtering
+    document.addEventListener('input', (e) => {
+      if (e.target.id !== 'search-query-input') return;
+      const val = e.target.value;
+      this.state.searchQuery = val;
+
+      if (this.state.searchFilter === 'LOCAL') {
+        this.state.searchResults = this.searchLocalLibrary(val);
+        this.renderMain();
+        const inp = document.getElementById('search-query-input');
+        if (inp) {
+          inp.focus();
+          inp.setSelectionRange(val.length, val.length);
+        }
+        return;
+      }
+
+      clearTimeout(this.suggestTimer);
+      if (val.trim().length < 2) {
+        this.state.searchSuggestions = [];
+        return;
+      }
+      this.suggestTimer = setTimeout(async () => {
+        const suggestions = await this.api.getSuggestions(val.trim());
+        if (this.state.activeTab === 'search' && this.state.searchQuery.trim() === val.trim() && !this.state.searchLoading) {
+          this.state.searchSuggestions = suggestions;
+          const activeEl = document.activeElement?.id === 'search-query-input';
+          this.renderMain();
+          if (activeEl) {
+            const inp = document.getElementById('search-query-input');
+            if (inp) {
+              inp.focus();
+              inp.setSelectionRange(val.length, val.length);
+            }
+          }
+        }
+      }, 320);
+    });
+
     document.addEventListener('submit', (e) => {
       if (e.target.id === 'search-form') {
         e.preventDefault();
@@ -1007,9 +1191,24 @@ class SonoraApp {
           .createPlaylist(name, desc)
           .then((pl) => {
             this.closeModal();
+            this.state.activeTab = 'library';
+            this.state.librarySubtab = 'playlists';
             this.state.selectedPlaylistId = pl.id;
             this.render();
             this.showToast(`Плейлист «${pl.name}» создан`);
+          })
+          .catch((err) => this.showToast(err.message));
+      } else if (e.target.id === 'rename-playlist-form') {
+        e.preventDefault();
+        const pid = Number(e.target.dataset.playlistId);
+        const name = document.getElementById('rename-playlist-name')?.value || '';
+        const desc = document.getElementById('rename-playlist-desc')?.value || '';
+        this.storage
+          .renamePlaylist(pid, name, desc)
+          .then(() => {
+            this.closeModal();
+            this.render();
+            this.showToast('Плейлист обновлён');
           })
           .catch((err) => this.showToast(err.message));
       } else if (e.target.id === 'import-yt-playlist-form') {
@@ -1053,7 +1252,6 @@ class SonoraApp {
       }
     });
 
-    // Hidden backup file input
     document.getElementById('backup-file-input')?.addEventListener('change', async (e) => {
       const file = e.target.files?.[0];
       e.target.value = '';
@@ -1066,7 +1264,6 @@ class SonoraApp {
       }
     });
 
-    // Global action click delegation
     document.addEventListener('click', (e) => {
       const btn = e.target.closest('[data-action]');
       if (!btn) return;
@@ -1080,7 +1277,7 @@ class SonoraApp {
         this.state.swUpdateWaiting?.postMessage({ type: 'SKIP_WAITING' });
       } else if (action === 'check-sw-update') {
         if (!this.swRegistration) {
-          this.showToast('Автообновление активно только на HTTPS (GitHub Pages)');
+          this.showToast('Автообновление активно на HTTPS (GitHub Pages)');
         } else {
           this.showToast('Проверка обновления…');
           this.swRegistration.update().then(() => {
@@ -1110,7 +1307,15 @@ class SonoraApp {
         const list = this.getListForKey(btn.dataset.listKey);
         if (track) this.player.playTrack(track, list.length > 0 ? list : [track]);
       } else if (action === 'set-search-filter') {
-        this.runSearch(document.getElementById('search-query-input')?.value || this.state.searchQuery, btn.dataset.filter);
+        const val = document.getElementById('search-query-input')?.value || this.state.searchQuery;
+        this.runSearch(val, btn.dataset.filter);
+      } else if (action === 'clear-search-input') {
+        this.state.searchQuery = '';
+        this.state.searchResults = [];
+        this.state.searchSuggestions = [];
+        this.state.searchError = '';
+        this.renderMain();
+        document.getElementById('search-query-input')?.focus();
       } else if (action === 'retry-search') {
         this.runSearch(this.state.searchQuery, this.state.searchFilter);
       } else if (action === 'run-saved-query') {
@@ -1120,6 +1325,16 @@ class SonoraApp {
       } else if (action === 'open-remote-playlist') {
         const item = this.renderedPlaylists.get(btn.dataset.remoteId);
         if (item) this.openRemotePlaylistModal(item);
+      } else if (action === 'open-artist') {
+        const item = this.renderedArtists.get(btn.dataset.artistId);
+        if (item) this.openArtistView(item);
+      } else if (action === 'close-artist') {
+        this.state.selectedArtist = null;
+        this.renderHeader();
+        this.renderMain();
+      } else if (action === 'play-artist-all') {
+        const tracks = this.state.selectedArtist?.tracks || [];
+        if (tracks.length > 0) this.player.playTrack(tracks[0], tracks);
       } else if (action === 'set-library-subtab') {
         this.state.librarySubtab = btn.dataset.subtab;
         this.renderMain();
@@ -1134,13 +1349,68 @@ class SonoraApp {
       } else if (action === 'play-playlist') {
         const pl = this.storage.library.playlists.find((p) => p.id === Number(btn.dataset.playlistId));
         if (pl && pl.tracks.length > 0) this.player.playTrack(pl.tracks[0], pl.tracks);
+      } else if (action === 'shuffle-playlist') {
+        const pl = this.storage.library.playlists.find((p) => p.id === Number(btn.dataset.playlistId));
+        if (pl && pl.tracks.length > 0) {
+          this.player.shuffleEnabled = true;
+          const rnd = pl.tracks[Math.floor(Math.random() * pl.tracks.length)];
+          this.player.playTrack(rnd, pl.tracks);
+        }
+      } else if (action === 'open-add-tracks-picker') {
+        const pid = Number(btn.dataset.playlistId);
+        this.openAddTracksPickerModal(pid);
+      } else if (action === 'pick-track-for-playlist') {
+        const pid = Number(btn.dataset.playlistId);
+        const track = this.renderedTracks.get(btn.dataset.trackId);
+        if (track) {
+          this.storage.addTrackToPlaylist(pid, track).then((added) => {
+            this.renderMain();
+            this.showToast(added ? 'Добавлено в плейлист' : 'Уже в плейлисте');
+          });
+        }
+      } else if (action === 'open-rename-playlist') {
+        const pl = this.storage.library.playlists.find((p) => p.id === Number(btn.dataset.playlistId));
+        if (pl) {
+          this.openModal(`
+            <h3 class="modal-title">Изменить плейлист</h3>
+            <form id="rename-playlist-form" data-playlist-id="${pl.id}">
+              <input id="rename-playlist-name" class="ios-field" type="text" value="${escapeHtml(pl.name)}" required />
+              <input id="rename-playlist-desc" class="ios-field" type="text" placeholder="Описание" value="${escapeHtml(pl.description || '')}" />
+              <button type="submit" class="btn-primary-full">Сохранить</button>
+              <button type="button" class="btn-secondary-full" data-action="close-modal">Отмена</button>
+            </form>
+          `);
+        }
+      } else if (action === 'confirm-delete-playlist') {
+        const pl = this.storage.library.playlists.find((p) => p.id === Number(btn.dataset.playlistId));
+        if (pl) {
+          this.openModal(`
+            <h3 class="modal-title">Удалить плейлист «${escapeHtml(pl.name)}»?</h3>
+            <p style="font-size:13px;color:var(--text-secondary);margin-top:0;">Это действие удалит список треков из медиатеки.</p>
+            <button type="button" class="btn-danger-full" data-action="delete-playlist" data-playlist-id="${pl.id}">Удалить</button>
+            <button type="button" class="btn-secondary-full" data-action="close-modal">Отмена</button>
+          `);
+        }
       } else if (action === 'delete-playlist') {
         const pid = Number(btn.dataset.playlistId);
         this.storage.deletePlaylist(pid).then(() => {
+          this.closeModal();
           this.state.selectedPlaylistId = null;
           this.render();
           this.showToast('Плейлист удалён');
         });
+      } else if (action === 'play-favorites') {
+        const favs = this.storage.library.favorites;
+        if (favs.length > 0) this.player.playTrack(favs[0], favs);
+      } else if (action === 'shuffle-favorites') {
+        const favs = this.storage.library.favorites;
+        if (favs.length > 0) {
+          this.player.shuffleEnabled = true;
+          this.player.playTrack(favs[Math.floor(Math.random() * favs.length)], favs);
+        }
+      } else if (action === 'play-history') {
+        const hist = this.storage.library.history;
+        if (hist.length > 0) this.player.playTrack(hist[0], hist);
       } else if (action === 'clear-history') {
         this.storage.clearHistory().then(() => this.renderMain());
       } else if (action === 'open-create-playlist') {
@@ -1232,8 +1502,8 @@ class SonoraApp {
         const track = this.renderedTracks.get(btn.dataset.trackId) || this.player.currentTrack;
         if (track) {
           this.storage.toggleFavorite(track).then((added) => {
-            this.renderPlayerSheet();
-            if (this.state.activeTab === 'library') this.renderMain();
+            if (this.state.playerExpanded) this.renderPlayerSheet();
+            this.renderMain();
             this.showToast(added ? 'Добавлено в Избранное' : 'Удалено из Избранного');
           });
         }
@@ -1319,6 +1589,43 @@ class SonoraApp {
     });
   }
 
+  openAddTracksPickerModal(playlistId) {
+    const pool = [...this.storage.library.favorites, ...this.storage.library.history, ...this.state.homeTracks];
+    const seen = new Set();
+    const unique = [];
+    for (const t of pool) {
+      if (!seen.has(t.id)) {
+        seen.add(t.id);
+        unique.push(t);
+        this._registerTrack(t);
+      }
+      if (unique.length >= 25) break;
+    }
+
+    this.openModal(`
+      <h3 class="modal-title">Добавить треки</h3>
+      ${
+        unique.length > 0
+          ? `<div class="grouped-card">
+               ${unique
+                 .map(
+                   (t) => `
+                 <button type="button" class="track-row" data-action="pick-track-for-playlist" data-playlist-id="${playlistId}" data-track-id="${escapeHtml(t.id)}">
+                   <img src="${escapeHtml(getSafeThumb(t))}" alt="" class="track-thumb" />
+                   <div class="track-meta">
+                     <div class="track-title">${escapeHtml(t.title)}</div>
+                     <div class="track-sub">${escapeHtml(t.artist)}</div>
+                   </div>
+                 </button>`
+                 )
+                 .join('')}
+             </div>`
+          : `<p style="font-size:14px;color:var(--text-secondary);">Сначала найдите или прослушайте треки на Главной или в Поиске.</p>`
+      }
+      <button type="button" class="btn-secondary-full" data-action="close-modal">Готово</button>
+    `);
+  }
+
   openTrackMenu(track) {
     this._registerTrack(track);
     const isFav = this.storage.isFavorite(track.id);
@@ -1364,11 +1671,26 @@ class SonoraApp {
     try {
       const remote = item.tracks ? item : await this.api.getPlaylist(item.id);
       const tracks = remote.tracks || [];
+      const previewRows = tracks
+        .slice(0, 8)
+        .map(
+          (t) => `
+          <div class="track-row">
+            <img src="${escapeHtml(getSafeThumb(t))}" alt="" class="track-thumb" />
+            <div class="track-meta">
+              <div class="track-title">${escapeHtml(t.title)}</div>
+              <div class="track-sub">${escapeHtml(t.artist)}</div>
+            </div>
+          </div>`
+        )
+        .join('');
+
       this.openModal(`
         <h3 class="modal-title">${escapeHtml(remote.title || item.title)}</h3>
         <p style="font-size:13px;color:var(--text-secondary);margin-top:0;">${tracks.length} треков</p>
         <button type="button" class="btn-primary-full" id="remote-pl-play">Включить всё</button>
         <button type="button" class="btn-secondary-full" id="remote-pl-save">Сохранить в Медиатеку</button>
+        ${previewRows ? `<div class="grouped-card" style="margin-top:12px;">${previewRows}</div>` : ''}
         <button type="button" class="btn-secondary-full" data-action="close-modal">Закрыть</button>
       `);
       document.getElementById('remote-pl-play')?.addEventListener('click', () => {

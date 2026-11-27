@@ -1,18 +1,13 @@
 import { sanitizeHttpsUrl, sanitizeTrack } from './security.js';
 
 const DEFAULT_PIPED_INSTANCES = [
-  'https://pipedapi.kavin.rocks',
-  'https://pipedapi.adminforge.de',
   'https://api.piped.private.coffee',
-  'https://pipedapi.in.projectsegfau.lt'
+  'https://pipedapi.ducks.party',
+  'https://pipedapi.adminforge.de',
+  'https://pipedapi.kavin.rocks'
 ];
 
-const DEFAULT_INVIDIOUS_INSTANCES = [
-  'https://inv.nadeko.net',
-  'https://iv.ggtyler.dev',
-  'https://yt.artemislena.eu',
-  'https://invidious.nerdvpn.de'
-];
+const AUDIUS_DISCOVERY_BASE = 'https://discoveryprovider.audius.co/v1';
 
 export const MOOD_CHIPS = [
   { id: 'ALL', label: 'Для вас', query: 'popular music hits' },
@@ -58,7 +53,6 @@ export default {
       body
     });
     const data = await resp.json();
-    // Возвращаем нормализованные данные для Sonora iOS PWA
     return Response.json({ account: { name: 'YouTube Music' }, raw: data }, { headers: cors });
   }
 };`;
@@ -67,8 +61,11 @@ export function extractVideoId(input, { allowBareId = true } = {}) {
   const raw = String(input ?? '').trim();
   if (!raw) return null;
   if (allowBareId && /^[A-Za-z0-9_-]{11}$/.test(raw)) return raw;
+  const isRelativePath = raw.startsWith('/');
+  if (!allowBareId && isRelativePath) return null;
+
   try {
-    const url = new URL(raw);
+    const url = isRelativePath ? new URL(raw, 'https://www.youtube.com') : new URL(raw);
     const host = url.hostname.replace(/^www\.|^m\.|^music\./, '');
     if (host === 'youtu.be') {
       const id = url.pathname.split('/').filter(Boolean)[0];
@@ -92,8 +89,11 @@ export function extractPlaylistId(input, { allowBareId = true } = {}) {
   const raw = String(input ?? '').trim();
   if (!raw) return null;
   if (allowBareId && /^(PL|OLAK5uy_|RD|UU|FL|LP)[A-Za-z0-9_-]{6,}$/.test(raw)) return raw;
+  const isRelativePath = raw.startsWith('/');
+  if (!allowBareId && isRelativePath) return null;
+
   try {
-    const url = new URL(raw);
+    const url = isRelativePath ? new URL(raw, 'https://www.youtube.com') : new URL(raw);
     const list = url.searchParams.get('list');
     if (list && /^[A-Za-z0-9_-]{2,}$/.test(list)) return list;
   } catch {
@@ -145,7 +145,6 @@ export function selectBestIosAudioStream(audioStreams = [], hlsUrl = null, quali
     }
   }
 
-  // If only WebM/Opus direct streams exist and HLS is present, prefer HLS on iOS Safari
   if (m4aStreams.length === 0 && safeHls) {
     return {
       url: safeHls,
@@ -203,6 +202,14 @@ export function parseLrcLines(lrcText) {
   return rows.sort((a, b) => a.timeSeconds - b.timeSeconds);
 }
 
+export function formatSubscribersRu(count) {
+  const n = Number(count) || 0;
+  if (n <= 0) return 'Исполнитель';
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace('.0', '')} млн подписчиков`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)} тыс. подписчиков`;
+  return `${n} подписчиков`;
+}
+
 function getPreferredThumbnail(videoId, candidate) {
   const safe = sanitizeHttpsUrl(candidate);
   if (safe) return safe;
@@ -238,10 +245,27 @@ function normalizeInvidiousTrack(item) {
   });
 }
 
+function normalizeAudiusTrack(item) {
+  if (!item?.id) return null;
+  const thumb =
+    sanitizeHttpsUrl(item.artwork?.['480x480']) ||
+    sanitizeHttpsUrl(item.artwork?.['150x150']) ||
+    '';
+  return sanitizeTrack({
+    id: `aud:${item.id}`,
+    title: item.title || 'Без названия',
+    artist: item.user?.name || item.user?.handle || 'Исполнитель',
+    durationSeconds: Number(item.duration) || 0,
+    thumbnailUrl: thumb
+  });
+}
+
 export class SonoraApi {
   constructor(getCustomBaseUrl = () => '') {
     this.getCustomBaseUrl = getCustomBaseUrl;
     this.activeInstance = null;
+    this.activeSourceLabel = 'Автоподбор';
+    this.invidiousInstancesCache = { fetchedAt: 0, urls: [] };
   }
 
   _getPipedPool() {
@@ -257,7 +281,7 @@ export class SonoraApi {
     return pool;
   }
 
-  async _fetchJson(url, options = {}, timeoutMs = 8500) {
+  async _fetchJson(url, options = {}, timeoutMs = 6000) {
     const safeUrl = sanitizeHttpsUrl(url);
     if (!safeUrl) throw new Error('Недопустимый URL запроса (разрешён только HTTPS)');
     const controller = new AbortController();
@@ -284,8 +308,12 @@ export class SonoraApi {
     const errors = [];
     for (const base of this._getPipedPool()) {
       try {
-        const data = await this._fetchJson(`${base}${path}`);
+        const data = await this._fetchJson(`${base}${path}`, {}, 5500);
+        if (data?.error) {
+          throw new Error(data.message || data.error);
+        }
         this.activeInstance = base;
+        this.activeSourceLabel = new URL(base).hostname;
         return { base, data };
       } catch (err) {
         errors.push(`${base}: ${err.message}`);
@@ -294,11 +322,36 @@ export class SonoraApi {
     throw new Error(errors[0] || 'Серверы Piped недоступны');
   }
 
+  async _getInvidiousPool() {
+    if (Date.now() - this.invidiousInstancesCache.fetchedAt < 10 * 60 * 1000) {
+      return this.invidiousInstancesCache.urls;
+    }
+    try {
+      const list = await this._fetchJson(
+        'https://api.invidious.io/instances.json?sort_by=type,health,api',
+        {},
+        4500
+      );
+      const urls = Array.isArray(list)
+        ? list
+            .filter(([, meta]) => meta?.type === 'https' && meta?.api)
+            .slice(0, 6)
+            .map(([host]) => `https://${host}`)
+        : [];
+      this.invidiousInstancesCache = { fetchedAt: Date.now(), urls };
+      return urls;
+    } catch {
+      return [];
+    }
+  }
+
   async _tryInvidious(path) {
+    const pool = await this._getInvidiousPool();
+    if (pool.length === 0) throw new Error('Нет доступных узлов Invidious');
     const errors = [];
-    for (const base of DEFAULT_INVIDIOUS_INSTANCES) {
+    for (const base of pool) {
       try {
-        const data = await this._fetchJson(`${base}${path}`);
+        const data = await this._fetchJson(`${base}${path}`, {}, 5000);
         return { base, data };
       } catch (err) {
         errors.push(`${base}: ${err.message}`);
@@ -307,7 +360,20 @@ export class SonoraApi {
     throw new Error(errors[0] || 'Серверы Invidious недоступны');
   }
 
-  async search(rawQuery, filter = 'TRACKS') {
+  async _searchAudius(query = '', trending = false) {
+    const url = trending || !query
+      ? `${AUDIUS_DISCOVERY_BASE}/tracks/trending?app_name=Sonora&limit=25`
+      : `${AUDIUS_DISCOVERY_BASE}/tracks/search?query=${encodeURIComponent(query)}&app_name=Sonora`;
+    const json = await this._fetchJson(url, {}, 6500);
+    const rows = Array.isArray(json?.data) ? json.data : [];
+    const tracks = rows.map(normalizeAudiusTrack).filter(Boolean);
+    if (tracks.length > 0) {
+      this.activeSourceLabel = 'Audius (прямое аудио)';
+    }
+    return tracks.map((t) => ({ type: 'track', ...t }));
+  }
+
+  async search(rawQuery, filter = 'TRACKS', { isMoodTrending = false } = {}) {
     const query = String(rawQuery ?? '').trim();
     if (!query) return [];
 
@@ -331,16 +397,16 @@ export class SonoraApi {
     // Direct YouTube Track URL support
     const directVideoId = extractVideoId(query, { allowBareId: false });
     if (directVideoId) {
-      const info = await this.getStreamInfo(directVideoId, 'HIGH');
+      const info = await this.getStreamInfo(directVideoId, 'HIGH').catch(() => null);
       return [
         {
           type: 'track',
           ...sanitizeTrack({
             id: directVideoId,
-            title: info.title,
-            artist: info.artist,
-            durationSeconds: info.durationSeconds,
-            thumbnailUrl: info.thumbnailUrl
+            title: info?.title || `YouTube трек (${directVideoId})`,
+            artist: info?.artist || 'YouTube',
+            durationSeconds: info?.durationSeconds || 0,
+            thumbnailUrl: getPreferredThumbnail(directVideoId, info?.thumbnailUrl)
           })
         }
       ];
@@ -353,13 +419,15 @@ export class SonoraApi {
           ? 'music_artists'
           : 'music_songs';
 
+    let lastError = null;
+
     try {
       const { data } = await this._tryPiped(
         `/search?q=${encodeURIComponent(query)}&filter=${encodeURIComponent(pipedFilter)}`
       );
       const items = Array.isArray(data?.items) ? data.items : [];
       if (filter === 'PLAYLISTS') {
-        return items
+        const playlists = items
           .map((it) => {
             const pid = extractPlaylistId(it.url || '');
             if (!pid) return null;
@@ -369,62 +437,133 @@ export class SonoraApi {
               title: it.name || it.title || 'Плейлист',
               artist: it.uploaderName || 'YouTube Music',
               thumbnailUrl: sanitizeHttpsUrl(it.thumbnail) || '',
-              trackCount: Number(it.videos) || 0
+              trackCount: Number(it.videos) > 0 ? Number(it.videos) : 0
             };
           })
           .filter(Boolean);
-      }
-      if (filter === 'ARTISTS') {
-        return items
+        if (playlists.length > 0) return playlists;
+      } else if (filter === 'ARTISTS') {
+        const artists = items
           .map((it) => ({
             type: 'artist',
             id: String(it.url || it.name || ''),
+            channelUrl: String(it.url || ''),
             title: it.name || it.uploaderName || 'Исполнитель',
-            artist: it.subscribers ? `${it.subscribers} подписчиков` : 'Исполнитель',
+            artist: formatSubscribersRu(it.subscribers),
             thumbnailUrl: sanitizeHttpsUrl(it.thumbnail) || ''
           }))
           .filter((it) => it.title);
+        if (artists.length > 0) return artists;
+      } else {
+        const tracks = items.map(normalizePipedTrack).filter(Boolean);
+        if (tracks.length > 0) {
+          return tracks.map((t) => ({ type: 'track', ...t }));
+        }
       }
+    } catch (err) {
+      lastError = err;
+    }
 
-      const tracks = items.map(normalizePipedTrack).filter(Boolean);
-      if (tracks.length > 0) {
-        return tracks.map((t) => ({ type: 'track', ...t }));
+    // Secondary Piped general 'all' search for tracks if music_songs returned empty
+    if (filter === 'TRACKS') {
+      try {
+        const { data } = await this._tryPiped(
+          `/search?q=${encodeURIComponent(query)}&filter=all`
+        );
+        const tracks = (Array.isArray(data?.items) ? data.items : [])
+          .filter((it) => it.type === 'stream')
+          .map(normalizePipedTrack)
+          .filter(Boolean);
+        if (tracks.length > 0) {
+          return tracks.map((t) => ({ type: 'track', ...t }));
+        }
+      } catch (err) {
+        lastError = err;
       }
-    } catch {
-      // Fall through to Invidious below
     }
 
-    // Invidious fallback
-    const invType = filter === 'PLAYLISTS' ? 'playlist' : filter === 'ARTISTS' ? 'channel' : 'video';
-    const { data: invItems } = await this._tryInvidious(
-      `/api/v1/search?q=${encodeURIComponent(query)}&type=${invType}`
-    );
-    const arr = Array.isArray(invItems) ? invItems : [];
-    if (filter === 'PLAYLISTS') {
-      return arr
-        .map((it) => ({
-          type: 'playlist',
-          id: String(it.playlistId || ''),
-          title: it.title || 'Плейлист',
-          artist: it.author || 'YouTube',
-          thumbnailUrl: sanitizeHttpsUrl(it.playlistThumbnail) || '',
-          trackCount: Number(it.videoCount) || 0
-        }))
-        .filter((p) => p.id);
+    // Dynamic Invidious fallback
+    try {
+      const invType = filter === 'PLAYLISTS' ? 'playlist' : filter === 'ARTISTS' ? 'channel' : 'video';
+      const { data: invItems } = await this._tryInvidious(
+        `/api/v1/search?q=${encodeURIComponent(query)}&type=${invType}`
+      );
+      const arr = Array.isArray(invItems) ? invItems : [];
+      if (filter === 'PLAYLISTS') {
+        const playlists = arr
+          .map((it) => ({
+            type: 'playlist',
+            id: String(it.playlistId || ''),
+            title: it.title || 'Плейлист',
+            artist: it.author || 'YouTube',
+            thumbnailUrl: sanitizeHttpsUrl(it.playlistThumbnail) || '',
+            trackCount: Number(it.videoCount) || 0
+          }))
+          .filter((p) => p.id);
+        if (playlists.length > 0) return playlists;
+      } else if (filter === 'ARTISTS') {
+        const artists = arr.map((it) => ({
+          type: 'artist',
+          id: String(it.authorId || it.author || ''),
+          channelUrl: it.authorId ? `/channel/${it.authorId}` : '',
+          title: it.author || 'Исполнитель',
+          artist: formatSubscribersRu(it.subCount),
+          thumbnailUrl: sanitizeHttpsUrl(it.authorThumbnails?.[0]?.url) || ''
+        }));
+        if (artists.length > 0) return artists;
+      } else {
+        const tracks = arr.map(normalizeInvidiousTrack).filter(Boolean);
+        if (tracks.length > 0) return tracks.map((t) => ({ type: 'track', ...t }));
+      }
+    } catch (err) {
+      lastError = err;
     }
-    if (filter === 'ARTISTS') {
-      return arr.map((it) => ({
-        type: 'artist',
-        id: String(it.authorId || it.author || ''),
-        title: it.author || 'Исполнитель',
-        artist: it.subCount ? `${it.subCount} подписчиков` : 'Исполнитель',
-        thumbnailUrl: sanitizeHttpsUrl(it.authorThumbnails?.[0]?.url) || ''
-      }));
+
+    // Audius full-audio catalog fallback for Tracks / Home
+    if (filter === 'TRACKS') {
+      try {
+        const audiusTracks = await this._searchAudius(query, isMoodTrending && query === 'popular music hits');
+        if (audiusTracks.length > 0) return audiusTracks;
+      } catch (err) {
+        lastError = err;
+      }
     }
-    return arr
-      .map(normalizeInvidiousTrack)
-      .filter(Boolean)
-      .map((t) => ({ type: 'track', ...t }));
+
+    if (lastError) throw lastError;
+    return [];
+  }
+
+  async getArtistDetails(artistItem) {
+    const name = String(artistItem?.title || '').trim();
+    const channelPath = String(artistItem?.channelUrl || '').trim();
+    let avatar = sanitizeHttpsUrl(artistItem?.thumbnailUrl) || '';
+    let subText = artistItem?.artist || 'Исполнитель';
+    let tracks = [];
+
+    if (channelPath.startsWith('/channel/')) {
+      try {
+        const { data } = await this._tryPiped(channelPath);
+        avatar = sanitizeHttpsUrl(data.avatarUrl) || avatar;
+        if (data.subscriberCount > 0) subText = formatSubscribersRu(data.subscriberCount);
+        tracks = (Array.isArray(data.relatedStreams) ? data.relatedStreams : [])
+          .map(normalizePipedTrack)
+          .filter(Boolean);
+      } catch {
+        // Fallback to track search below
+      }
+    }
+
+    if (tracks.length === 0 && name) {
+      const results = await this.search(name, 'TRACKS');
+      tracks = results.filter((r) => r.type === 'track');
+    }
+
+    return {
+      title: name,
+      subtitle: subText,
+      thumbnailUrl: avatar,
+      tracks
+    };
   }
 
   async getSuggestions(query) {
@@ -439,14 +578,42 @@ export class SonoraApi {
   }
 
   async getStreamInfo(videoId, quality = 'HIGH') {
-    const cleanId = extractVideoId(videoId);
+    const rawId = String(videoId ?? '').trim();
+    if (rawId.startsWith('aud:')) {
+      const audId = rawId.slice(4);
+      if (!/^[A-Za-z0-9_-]{3,32}$/.test(audId)) {
+        throw new Error('Некорректный идентификатор трека Audius');
+      }
+      const streamUrl = `${AUDIUS_DISCOVERY_BASE}/tracks/${encodeURIComponent(audId)}/stream?app_name=Sonora`;
+      return {
+        engine: 'audio',
+        id: rawId,
+        title: 'Audius Track',
+        artist: 'Audius',
+        durationSeconds: 0,
+        thumbnailUrl: '',
+        streamUrl,
+        fallbackUrl: null,
+        mimeType: 'audio/mpeg',
+        relatedTracks: []
+      };
+    }
+
+    const cleanId = extractVideoId(rawId);
     if (!cleanId) throw new Error('Неверный идентификатор трека');
 
+    // Tier 1: Direct Piped Audio / Muxed Video / HLS
     try {
       const { data } = await this._tryPiped(`/streams/${encodeURIComponent(cleanId)}`);
-      const selected = selectBestIosAudioStream(data.audioStreams, data.hls, quality);
+      const audioCandidates =
+        Array.isArray(data.audioStreams) && data.audioStreams.length > 0
+          ? data.audioStreams
+          : (Array.isArray(data.videoStreams) ? data.videoStreams : []).filter((v) => !v.videoOnly);
+
+      const selected = selectBestIosAudioStream(audioCandidates, data.hls, quality);
       if (selected) {
         return {
+          engine: 'audio',
           id: cleanId,
           title: data.title || 'Без названия',
           artist: data.uploader || 'Исполнитель',
@@ -461,43 +628,76 @@ export class SonoraApi {
         };
       }
     } catch {
-      // Fall through to Invidious
+      // Fall through to Invidious / YouTube IFrame Player API
     }
 
-    const { data: inv } = await this._tryInvidious(`/api/v1/videos/${encodeURIComponent(cleanId)}`);
-    const formats = Array.isArray(inv?.adaptiveFormats)
-      ? inv.adaptiveFormats
-          .filter((f) => String(f.type || '').startsWith('audio/'))
-          .map((f) => ({
-            url: f.url,
-            bitrate: Number(f.bitrate) || 0,
-            mimeType: f.type,
-            codec: f.encoding || ''
-          }))
-      : [];
-    const selected = selectBestIosAudioStream(formats, inv?.hlsUrl, quality);
-    if (!selected) {
-      throw new Error('Не удалось получить совместимый аудиопоток для iOS');
+    // Tier 2: Dynamic Invidious
+    try {
+      const { data: inv } = await this._tryInvidious(`/api/v1/videos/${encodeURIComponent(cleanId)}`);
+      const formats = Array.isArray(inv?.adaptiveFormats)
+        ? inv.adaptiveFormats
+            .filter((f) => String(f.type || '').startsWith('audio/'))
+            .map((f) => ({
+              url: f.url,
+              bitrate: Number(f.bitrate) || 0,
+              mimeType: f.type,
+              codec: f.encoding || ''
+            }))
+        : [];
+      const selected = selectBestIosAudioStream(formats, inv?.hlsUrl, quality);
+      if (selected) {
+        return {
+          engine: 'audio',
+          id: cleanId,
+          title: inv.title || 'Без названия',
+          artist: inv.author || 'Исполнитель',
+          durationSeconds: Number(inv.lengthSeconds) || 0,
+          thumbnailUrl: getPreferredThumbnail(cleanId, inv.videoThumbnails?.[0]?.url),
+          streamUrl: selected.url,
+          fallbackUrl: selected.fallbackUrl,
+          mimeType: selected.mimeType,
+          relatedTracks: (Array.isArray(inv.recommendedVideos) ? inv.recommendedVideos : [])
+            .map(normalizeInvidiousTrack)
+            .filter(Boolean)
+        };
+      }
+    } catch {
+      // Fall through to Tier 3
     }
 
+    // Tier 3: Official YouTube IFrame Player fallback (bypasses datacenter IP bot walls)
     return {
+      engine: 'youtube_iframe',
       id: cleanId,
-      title: inv.title || 'Без названия',
-      artist: inv.author || 'Исполнитель',
-      durationSeconds: Number(inv.lengthSeconds) || 0,
-      thumbnailUrl: getPreferredThumbnail(cleanId, inv.videoThumbnails?.[0]?.url),
-      streamUrl: selected.url,
-      fallbackUrl: selected.fallbackUrl,
-      mimeType: selected.mimeType,
-      relatedTracks: (Array.isArray(inv.recommendedVideos) ? inv.recommendedVideos : [])
-        .map(normalizeInvidiousTrack)
-        .filter(Boolean)
+      youtubeId: cleanId,
+      title: null,
+      artist: null,
+      durationSeconds: 0,
+      thumbnailUrl: getPreferredThumbnail(cleanId, ''),
+      streamUrl: null,
+      fallbackUrl: null,
+      mimeType: 'video/youtube',
+      relatedTracks: []
     };
   }
 
-  async getRelatedTracks(videoId) {
-    const info = await this.getStreamInfo(videoId, 'HIGH');
-    return info.relatedTracks || [];
+  async getRelatedTracks(track) {
+    const id = typeof track === 'string' ? track : track?.id;
+    const title = typeof track === 'object' ? track?.title : '';
+    const artist = typeof track === 'object' ? track?.artist : '';
+
+    if (id && !String(id).startsWith('aud:')) {
+      try {
+        const info = await this.getStreamInfo(id, 'HIGH');
+        if (info.relatedTracks?.length > 0) return info.relatedTracks;
+      } catch {
+        // Fallback to search-based radio recommendations
+      }
+    }
+
+    const radioQuery = `${artist || ''} ${title || ''}`.trim() || 'popular music hits';
+    const items = await this.search(radioQuery, 'TRACKS').catch(() => []);
+    return items.filter((it) => it.type === 'track' && it.id !== id);
   }
 
   async getPlaylist(rawPlaylistInput) {
@@ -522,7 +722,7 @@ export class SonoraApi {
       );
       return {
         id: playlistId,
-        title: inv.title || 'Плейлист YouTube',
+        title: inv.title || 'Плейлист YouTube Music',
         author: inv.author || 'YouTube Music',
         description: inv.description || '',
         thumbnailUrl: sanitizeHttpsUrl(inv.playlistThumbnail) || '',
