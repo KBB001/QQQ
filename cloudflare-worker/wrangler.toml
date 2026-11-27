@@ -1,0 +1,7 @@
+name = "sonora-catalog-worker"
+main = "worker.js"
+compatibility_date = "2025-03-01"
+
+[vars]
+# Опционально: перечислите разрешённые домены сайта через запятую, например "https://kbb001.github.io"
+ALLOWED_ORIGINS = ""

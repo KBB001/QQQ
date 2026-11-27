@@ -18,44 +18,169 @@ export const MOOD_CHIPS = [
   { id: 'LOFI', label: 'Lo-Fi биты', query: 'lofi hip hop radio' }
 ];
 
-export const CLOUDFLARE_WORKER_TEMPLATE = `// Cloudflare Worker: HTTPS-прокси для синхронизации личного YouTube Music
-export default {
-  async fetch(request) {
-    const cors = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type'
-    };
-    if (request.method === 'OPTIONS') return new Response(null, { headers: cors });
-    if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405, headers: cors });
+export const CLOUDFLARE_WORKER_TEMPLATE = `// Личный Cloudflare Worker прокси для каталога Sonora (без рекламы)
+const PIPED_UPSTREAMS = [
+  'https://api.piped.private.coffee',
+  'https://pipedapi.ducks.party',
+  'https://pipedapi.adminforge.de',
+  'https://pipedapi.kavin.rocks'
+];
 
-    const { cookie } = await request.json().catch(() => ({}));
-    if (!cookie) {
-      return Response.json({ error: 'Cookie is required' }, { status: 400, headers: cors });
+const INVIDIOUS_UPSTREAMS = [
+  'https://invidious.nerdvpn.de',
+  'https://invidious.privacyredirect.com',
+  'https://iv.datura.network'
+];
+
+function corsHeaders(request, env) {
+  const origin = request.headers.get('Origin') || '*';
+  const allowedRaw = String(env?.ALLOWED_ORIGINS || '').trim();
+  let allowOrigin = '*';
+  if (allowedRaw) {
+    const allowed = allowedRaw.split(',').map((s) => s.trim()).filter(Boolean);
+    allowOrigin = allowed.includes(origin) ? origin : allowed[0] || '';
+  }
+  return {
+    'Access-Control-Allow-Origin': allowOrigin,
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Range',
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Range, Accept-Ranges, Content-Type',
+    'Vary': 'Origin'
+  };
+}
+
+function jsonResponse(payload, status, request, env) {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': status === 200 ? 'public, max-age=120' : 'no-store',
+      ...corsHeaders(request, env)
     }
+  });
+}
 
-    const ytHeaders = {
-      'Cookie': cookie,
-      'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)',
-      'Origin': 'https://music.youtube.com',
-      'Referer': 'https://music.youtube.com/',
-      'Content-Type': 'application/json'
-    };
+function isAllowedMediaUrl(rawUrl) {
+  try {
+    const parsed = new URL(rawUrl);
+    if (parsed.protocol !== 'https:') return false;
+    const host = parsed.hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host === '::1' ||
+      /^(10\\.|192\\.168\\.|172\\.(1[6-9]|2\\d|3[01])\\.|169\\.254\\.)/.test(host) ||
+      /^\\d+\\.\\d+\\.\\d+\\.\\d+$/.test(host)
+    ) return false;
+    return host === 'googlevideo.com' || host.endsWith('.googlevideo.com');
+  } catch {
+    return false;
+  }
+}
 
-    const body = JSON.stringify({
-      context: { client: { clientName: 'WEB_REMIX', clientVersion: '1.20240724.01.00' } },
-      browseId: 'FEmusic_liked_videos'
+async function fetchJsonWithTimeout(url, timeoutMs = 6500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, {
+      signal: controller.signal,
+      headers: { Accept: 'application/json', 'User-Agent': 'SonoraWorker/2.0' }
     });
-
-    const resp = await fetch('https://music.youtube.com/youtubei/v1/browse?prettyPrint=false', {
-      method: 'POST',
-      headers: ytHeaders,
-      body
-    });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const data = await resp.json();
-    return Response.json({ account: { name: 'YouTube Music' }, raw: data }, { headers: cors });
+    if (data && data.error) throw new Error(data.message || data.error);
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function tryPipedPath(pathAndQuery) {
+  let lastErr = null;
+  for (const base of PIPED_UPSTREAMS) {
+    try {
+      return await fetchJsonWithTimeout(base + pathAndQuery);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error('All Piped upstreams unavailable');
+}
+
+export default {
+  async fetch(request, env) {
+    if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: corsHeaders(request, env) });
+    if (request.method !== 'GET' && request.method !== 'HEAD') return jsonResponse({ error: 'Method Not Allowed' }, 405, request, env);
+    const reqUrl = new URL(request.url);
+    const path = reqUrl.pathname.replace(/\\/+$/, '') || '/';
+    if (path === '/' || path === '/health') {
+      return jsonResponse({ ok: true, service: 'sonora-cf-worker', version: '2.0.0' }, 200, request, env);
+    }
+    try {
+      if (path === '/search') {
+        const q = (reqUrl.searchParams.get('q') || '').trim();
+        const filter = (reqUrl.searchParams.get('filter') || 'music_songs').trim();
+        if (!q) return jsonResponse({ items: [] }, 200, request, env);
+        return jsonResponse(await tryPipedPath('/search?q=' + encodeURIComponent(q) + '&filter=' + encodeURIComponent(filter)), 200, request, env);
+      }
+      if (path === '/suggestions') {
+        const q = (reqUrl.searchParams.get('query') || '').trim();
+        return jsonResponse(q ? await tryPipedPath('/suggestions?query=' + encodeURIComponent(q)) : [], 200, request, env);
+      }
+      if (path.startsWith('/playlists/') || path.startsWith('/channel/')) {
+        return jsonResponse(await tryPipedPath(path), 200, request, env);
+      }
+      if (path.startsWith('/streams/')) {
+        const vid = decodeURIComponent(path.slice('/streams/'.length)).trim();
+        try {
+          return jsonResponse(await tryPipedPath('/streams/' + encodeURIComponent(vid)), 200, request, env);
+        } catch (pipedErr) {
+          for (const invBase of INVIDIOUS_UPSTREAMS) {
+            try {
+              const inv = await fetchJsonWithTimeout(invBase + '/api/v1/videos/' + encodeURIComponent(vid));
+              const audioStreams = (inv.adaptiveFormats || [])
+                .filter((f) => String(f.type || '').startsWith('audio/') && f.url)
+                .map((f) => ({ url: f.url, bitrate: Number(f.bitrate) || 0, mimeType: String(f.type || '').split(';')[0], codec: f.encoding || '' }));
+              return jsonResponse({ title: inv.title, uploader: inv.author, duration: inv.lengthSeconds, hls: inv.hlsUrl || null, audioStreams, videoStreams: [], relatedStreams: [] }, 200, request, env);
+            } catch {}
+          }
+          throw pipedErr;
+        }
+      }
+      if (path === '/audio-proxy') {
+        const target = reqUrl.searchParams.get('url') || '';
+        if (!isAllowedMediaUrl(target)) return jsonResponse({ error: 'Blocked media host' }, 403, request, env);
+        const h = new Headers();
+        if (request.headers.get('Range')) h.set('Range', request.headers.get('Range'));
+        const upstream = await fetch(target, { headers: h });
+        const out = new Headers(corsHeaders(request, env));
+        for (const k of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+          if (upstream.headers.get(k)) out.set(k, upstream.headers.get(k));
+        }
+        return new Response(upstream.body, { status: upstream.status, headers: out });
+      }
+      return jsonResponse({ error: 'Not Found' }, 404, request, env);
+    } catch (err) {
+      return jsonResponse({ error: err?.message || 'Upstream proxy error' }, 502, request, env);
+    }
   }
 };`;
+
+function sanitizeEndpointUrl(rawUrl) {
+  const safe = sanitizeHttpsUrl(rawUrl);
+  if (safe) return safe.replace(/\/+$/, '');
+  if (typeof rawUrl === 'string') {
+    try {
+      const u = new URL(rawUrl.trim());
+      if (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) {
+        return u.origin + u.pathname.replace(/\/+$/, '');
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
 
 export function extractVideoId(input, { allowBareId = true } = {}) {
   const raw = String(input ?? '').trim();
@@ -261,28 +386,126 @@ function normalizeAudiusTrack(item) {
 }
 
 export class SonoraApi {
-  constructor(getCustomBaseUrl = () => '') {
-    this.getCustomBaseUrl = getCustomBaseUrl;
+  constructor(configOrLegacyFn = () => '') {
+    if (typeof configOrLegacyFn === 'function') {
+      this.getConfig = () => {
+        const res = configOrLegacyFn();
+        if (res && typeof res === 'object') return res;
+        return {
+          workerCatalogUrl: '',
+          serverUrl: '',
+          customApiBaseUrl: typeof res === 'string' ? res : '',
+          activeAccount: null
+        };
+      };
+    } else {
+      this.getConfig = () => configOrLegacyFn || {};
+    }
     this.activeInstance = null;
     this.activeSourceLabel = 'Автоподбор';
     this.invidiousInstancesCache = { fetchedAt: 0, urls: [] };
+    // Server Bearer session tokens stored strictly in JS memory (never localStorage)
+    this.serverTokens = new Map();
   }
 
-  _getPipedPool() {
-    const custom = sanitizeHttpsUrl(this.getCustomBaseUrl?.());
-    const pool = [];
-    if (custom) pool.push(custom.replace(/\/$/, ''));
-    if (this.activeInstance && !pool.includes(this.activeInstance)) {
-      pool.push(this.activeInstance);
+  getServerToken(serverUrl) {
+    const clean = sanitizeEndpointUrl(serverUrl);
+    if (!clean) return '';
+    const rec = this.serverTokens.get(clean);
+    if (!rec) return '';
+    if (rec.expiresAt && rec.expiresAt <= Date.now()) {
+      this.serverTokens.delete(clean);
+      return '';
     }
+    return rec.token;
+  }
+
+  setServerToken(serverUrl, token, expiresAt = Date.now() + 7 * 24 * 3600 * 1000) {
+    const clean = sanitizeEndpointUrl(serverUrl);
+    if (!clean || !token) return;
+    this.serverTokens.set(clean, { token, expiresAt });
+  }
+
+  clearServerToken(serverUrl) {
+    const clean = sanitizeEndpointUrl(serverUrl);
+    if (clean) this.serverTokens.delete(clean);
+  }
+
+  _getConfig() {
+    const cfg = this.getConfig?.() || {};
+    return {
+      workerCatalogUrl: sanitizeEndpointUrl(cfg.workerCatalogUrl) || '',
+      serverUrl: sanitizeEndpointUrl(cfg.serverUrl) || '',
+      customApiBaseUrl: sanitizeEndpointUrl(cfg.customApiBaseUrl) || '',
+      activeAccount: cfg.activeAccount || null
+    };
+  }
+
+  _getCatalogGateways() {
+    const { workerCatalogUrl, serverUrl, customApiBaseUrl } = this._getConfig();
+    const gateways = [];
+
+    // 1. Personal Cloudflare Worker (Priority #1 per user choice)
+    if (workerCatalogUrl) {
+      gateways.push({
+        kind: 'worker',
+        base: workerCatalogUrl,
+        label: 'Cloudflare Worker',
+        prefix: '',
+        headers: () => ({})
+      });
+    }
+
+    // 2. Render / Node backend catalog proxy (if authenticated)
+    if (serverUrl && this.getServerToken(serverUrl)) {
+      gateways.push({
+        kind: 'server',
+        base: serverUrl,
+        label: 'Сервер Node/Render',
+        prefix: '/api/catalog',
+        headers: () => ({ Authorization: `Bearer ${this.getServerToken(serverUrl)}` })
+      });
+    }
+
+    // 3. Custom Piped URL
+    if (customApiBaseUrl && !gateways.some((g) => g.base === customApiBaseUrl)) {
+      gateways.push({
+        kind: 'piped',
+        base: customApiBaseUrl,
+        label: new URL(customApiBaseUrl).hostname,
+        prefix: '',
+        headers: () => ({})
+      });
+    }
+
+    // 4. Last fastest active Piped node
+    if (this.activeInstance && !gateways.some((g) => g.base === this.activeInstance)) {
+      gateways.push({
+        kind: 'piped',
+        base: this.activeInstance,
+        label: new URL(this.activeInstance).hostname,
+        prefix: '',
+        headers: () => ({})
+      });
+    }
+
+    // 5. Public Piped fallbacks
     for (const url of DEFAULT_PIPED_INSTANCES) {
-      if (!pool.includes(url)) pool.push(url);
+      if (!gateways.some((g) => g.base === url)) {
+        gateways.push({
+          kind: 'piped',
+          base: url,
+          label: new URL(url).hostname,
+          prefix: '',
+          headers: () => ({})
+        });
+      }
     }
-    return pool;
+    return gateways;
   }
 
-  async _fetchJson(url, options = {}, timeoutMs = 6000) {
-    const safeUrl = sanitizeHttpsUrl(url);
+  async _fetchJson(url, options = {}, timeoutMs = 6500, { allowLocalhostHttp = false } = {}) {
+    const safeUrl = allowLocalhostHttp ? sanitizeEndpointUrl(url) : sanitizeHttpsUrl(url);
     if (!safeUrl) throw new Error('Недопустимый URL запроса (разрешён только HTTPS)');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -295,31 +518,48 @@ export class SonoraApi {
           ...(options.headers || {})
         }
       });
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
+      const text = await resp.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : {};
+      } catch {
+        json = null;
       }
-      return await resp.json();
+      if (!resp.ok) {
+        const err = new Error(json?.error || `HTTP ${resp.status}`);
+        err.status = resp.status;
+        err.payload = json;
+        throw err;
+      }
+      return json ?? {};
     } finally {
       clearTimeout(timer);
     }
   }
 
-  async _tryPiped(path) {
+  async _tryCatalogGateway(path) {
     const errors = [];
-    for (const base of this._getPipedPool()) {
+    for (const gw of this._getCatalogGateways()) {
       try {
-        const data = await this._fetchJson(`${base}${path}`, {}, 5500);
+        const data = await this._fetchJson(
+          `${gw.base}${gw.prefix}${path}`,
+          { headers: gw.headers() },
+          6000,
+          { allowLocalhostHttp: true }
+        );
         if (data?.error) {
           throw new Error(data.message || data.error);
         }
-        this.activeInstance = base;
-        this.activeSourceLabel = new URL(base).hostname;
-        return { base, data };
+        if (gw.kind === 'piped') {
+          this.activeInstance = gw.base;
+        }
+        this.activeSourceLabel = gw.label;
+        return { gateway: gw, data };
       } catch (err) {
-        errors.push(`${base}: ${err.message}`);
+        errors.push(`${gw.label}: ${err.message}`);
       }
     }
-    throw new Error(errors[0] || 'Серверы Piped недоступны');
+    throw new Error(errors[0] || 'Каталог недоступен');
   }
 
   async _getInvidiousPool() {
@@ -361,9 +601,10 @@ export class SonoraApi {
   }
 
   async _searchAudius(query = '', trending = false) {
-    const url = trending || !query
-      ? `${AUDIUS_DISCOVERY_BASE}/tracks/trending?app_name=Sonora&limit=25`
-      : `${AUDIUS_DISCOVERY_BASE}/tracks/search?query=${encodeURIComponent(query)}&app_name=Sonora`;
+    const url =
+      trending || !query
+        ? `${AUDIUS_DISCOVERY_BASE}/tracks/trending?app_name=Sonora&limit=25`
+        : `${AUDIUS_DISCOVERY_BASE}/tracks/search?query=${encodeURIComponent(query)}&app_name=Sonora`;
     const json = await this._fetchJson(url, {}, 6500);
     const rows = Array.isArray(json?.data) ? json.data : [];
     const tracks = rows.map(normalizeAudiusTrack).filter(Boolean);
@@ -373,11 +614,94 @@ export class SonoraApi {
     return tracks.map((t) => ({ type: 'track', ...t }));
   }
 
+  async testHealthEndpoint(baseUrl) {
+    const safe = sanitizeEndpointUrl(baseUrl);
+    if (!safe) throw new Error('Укажите корректный URL (https://...)');
+    const started = performance.now();
+    const data = await this._fetchJson(`${safe}/health`, {}, 6000, { allowLocalhostHttp: true });
+    const latencyMs = Math.round(performance.now() - started);
+    return { ...data, latencyMs };
+  }
+
+  async getServerAuthStatus(serverUrl) {
+    const safe = sanitizeEndpointUrl(serverUrl);
+    if (!safe) throw new Error('Укажите URL Node-сервера');
+    const token = this.getServerToken(safe);
+    return this._fetchJson(
+      `${safe}/api/auth/status`,
+      { headers: token ? { Authorization: `Bearer ${token}` } : {} },
+      6000,
+      { allowLocalhostHttp: true }
+    );
+  }
+
+  async claimServerPasscode(serverUrl, passcode) {
+    const safe = sanitizeEndpointUrl(serverUrl);
+    if (!safe) throw new Error('Укажите URL Node-сервера');
+    const data = await this._fetchJson(
+      `${safe}/api/auth/claim`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passcode })
+      },
+      8000,
+      { allowLocalhostHttp: true }
+    );
+    if (data?.token) {
+      this.setServerToken(safe, data.token, data.expiresAt);
+    }
+    return data;
+  }
+
+  async loginServerPasscode(serverUrl, passcode) {
+    const safe = sanitizeEndpointUrl(serverUrl);
+    if (!safe) throw new Error('Укажите URL Node-сервера');
+    const data = await this._fetchJson(
+      `${safe}/api/auth/login`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ passcode })
+      },
+      8000,
+      { allowLocalhostHttp: true }
+    );
+    if (data?.token) {
+      this.setServerToken(safe, data.token, data.expiresAt);
+    }
+    return data;
+  }
+
+  async _serverPost(endpoint, payload = {}, overrideServerUrl = '', timeoutMs = 18000) {
+    const cfg = this._getConfig();
+    const base = sanitizeEndpointUrl(overrideServerUrl) || cfg.serverUrl;
+    if (!base) throw new Error('Укажите адрес Node/Render-сервера в настройках');
+    const token = this.getServerToken(base);
+    if (!token) {
+      const err = new Error('Требуется вход на Node/Render-сервер');
+      err.needsServerAuth = true;
+      throw err;
+    }
+    return this._fetchJson(
+      `${base}${endpoint}`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify(payload)
+      },
+      timeoutMs,
+      { allowLocalhostHttp: true }
+    );
+  }
+
   async search(rawQuery, filter = 'TRACKS', { isMoodTrending = false } = {}) {
     const query = String(rawQuery ?? '').trim();
     if (!query) return [];
 
-    // Direct YouTube Playlist URL support
     const directPlaylistId = extractPlaylistId(query, { allowBareId: false });
     if (directPlaylistId) {
       const playlist = await this.getPlaylist(directPlaylistId);
@@ -394,7 +718,6 @@ export class SonoraApi {
       ];
     }
 
-    // Direct YouTube Track URL support
     const directVideoId = extractVideoId(query, { allowBareId: false });
     if (directVideoId) {
       const info = await this.getStreamInfo(directVideoId, 'HIGH').catch(() => null);
@@ -422,7 +745,7 @@ export class SonoraApi {
     let lastError = null;
 
     try {
-      const { data } = await this._tryPiped(
+      const { data } = await this._tryCatalogGateway(
         `/search?q=${encodeURIComponent(query)}&filter=${encodeURIComponent(pipedFilter)}`
       );
       const items = Array.isArray(data?.items) ? data.items : [];
@@ -464,10 +787,9 @@ export class SonoraApi {
       lastError = err;
     }
 
-    // Secondary Piped general 'all' search for tracks if music_songs returned empty
     if (filter === 'TRACKS') {
       try {
-        const { data } = await this._tryPiped(
+        const { data } = await this._tryCatalogGateway(
           `/search?q=${encodeURIComponent(query)}&filter=all`
         );
         const tracks = (Array.isArray(data?.items) ? data.items : [])
@@ -482,7 +804,6 @@ export class SonoraApi {
       }
     }
 
-    // Dynamic Invidious fallback
     try {
       const invType = filter === 'PLAYLISTS' ? 'playlist' : filter === 'ARTISTS' ? 'channel' : 'video';
       const { data: invItems } = await this._tryInvidious(
@@ -519,7 +840,6 @@ export class SonoraApi {
       lastError = err;
     }
 
-    // Audius full-audio catalog fallback for Tracks / Home
     if (filter === 'TRACKS') {
       try {
         const audiusTracks = await this._searchAudius(query, isMoodTrending && query === 'popular music hits');
@@ -542,7 +862,7 @@ export class SonoraApi {
 
     if (channelPath.startsWith('/channel/')) {
       try {
-        const { data } = await this._tryPiped(channelPath);
+        const { data } = await this._tryCatalogGateway(channelPath);
         avatar = sanitizeHttpsUrl(data.avatarUrl) || avatar;
         if (data.subscriberCount > 0) subText = formatSubscribersRu(data.subscriberCount);
         tracks = (Array.isArray(data.relatedStreams) ? data.relatedStreams : [])
@@ -570,11 +890,25 @@ export class SonoraApi {
     const clean = String(query ?? '').trim();
     if (clean.length < 2) return [];
     try {
-      const { data } = await this._tryPiped(`/suggestions?query=${encodeURIComponent(clean)}`);
+      const { data } = await this._tryCatalogGateway(`/suggestions?query=${encodeURIComponent(clean)}`);
       return Array.isArray(data) ? data.slice(0, 6) : [];
     } catch {
       return [];
     }
+  }
+
+  buildWorkerAudioProxyUrl(directUrl) {
+    const { workerCatalogUrl } = this._getConfig();
+    if (!workerCatalogUrl || !directUrl) return null;
+    try {
+      const u = new URL(directUrl);
+      if (u.protocol === 'https:' && u.hostname.endsWith('.googlevideo.com')) {
+        return `${workerCatalogUrl}/audio-proxy?url=${encodeURIComponent(directUrl)}`;
+      }
+    } catch {
+      return null;
+    }
+    return null;
   }
 
   async getStreamInfo(videoId, quality = 'HIGH') {
@@ -593,6 +927,7 @@ export class SonoraApi {
         durationSeconds: 0,
         thumbnailUrl: '',
         streamUrl,
+        proxyCacheUrl: streamUrl,
         fallbackUrl: null,
         mimeType: 'audio/mpeg',
         relatedTracks: []
@@ -602,9 +937,46 @@ export class SonoraApi {
     const cleanId = extractVideoId(rawId);
     if (!cleanId) throw new Error('Неверный идентификатор трека');
 
-    // Tier 1: Direct Piped Audio / Muxed Video / HLS
+    // Tier 0: Authenticated YouTube Music session via Render/Node server (ad-free direct M4A)
+    const { serverUrl, activeAccount } = this._getConfig();
+    if (serverUrl && this.getServerToken(serverUrl) && activeAccount?.cookieHeader) {
+      try {
+        const authStream = await this._serverPost(
+          '/api/yt/stream',
+          {
+            cookie: activeAccount.cookieHeader,
+            dataSyncId: activeAccount.dataSyncId || '',
+            authUserIndex: activeAccount.authUserIndex || 0,
+            videoId: cleanId,
+            quality
+          },
+          serverUrl,
+          10000
+        );
+        if (authStream?.streamUrl) {
+          this.activeSourceLabel = 'YouTube Music (прямой поток)';
+          return {
+            engine: 'audio',
+            id: cleanId,
+            title: authStream.title || 'Без названия',
+            artist: authStream.artist || 'Исполнитель',
+            durationSeconds: Number(authStream.durationSeconds) || 0,
+            thumbnailUrl: getPreferredThumbnail(cleanId, authStream.thumbnailUrl),
+            streamUrl: authStream.streamUrl,
+            proxyCacheUrl: authStream.streamUrl,
+            fallbackUrl: authStream.directUrl || null,
+            mimeType: authStream.mimeType || 'audio/mp4',
+            relatedTracks: []
+          };
+        }
+      } catch {
+        // Fall through to Cloudflare Worker / Piped
+      }
+    }
+
+    // Tier 1: Personal Cloudflare Worker -> Node Server catalog -> Piped pool
     try {
-      const { data } = await this._tryPiped(`/streams/${encodeURIComponent(cleanId)}`);
+      const { data } = await this._tryCatalogGateway(`/streams/${encodeURIComponent(cleanId)}`);
       const audioCandidates =
         Array.isArray(data.audioStreams) && data.audioStreams.length > 0
           ? data.audioStreams
@@ -620,6 +992,7 @@ export class SonoraApi {
           durationSeconds: Number(data.duration) || 0,
           thumbnailUrl: getPreferredThumbnail(cleanId, data.thumbnailUrl),
           streamUrl: selected.url,
+          proxyCacheUrl: this.buildWorkerAudioProxyUrl(selected.url) || selected.url,
           fallbackUrl: selected.fallbackUrl,
           mimeType: selected.mimeType,
           relatedTracks: (Array.isArray(data.relatedStreams) ? data.relatedStreams : [])
@@ -654,6 +1027,7 @@ export class SonoraApi {
           durationSeconds: Number(inv.lengthSeconds) || 0,
           thumbnailUrl: getPreferredThumbnail(cleanId, inv.videoThumbnails?.[0]?.url),
           streamUrl: selected.url,
+          proxyCacheUrl: this.buildWorkerAudioProxyUrl(selected.url) || selected.url,
           fallbackUrl: selected.fallbackUrl,
           mimeType: selected.mimeType,
           relatedTracks: (Array.isArray(inv.recommendedVideos) ? inv.recommendedVideos : [])
@@ -665,7 +1039,7 @@ export class SonoraApi {
       // Fall through to Tier 3
     }
 
-    // Tier 3: Official YouTube IFrame Player fallback (bypasses datacenter IP bot walls)
+    // Tier 3: YouTube IFrame Player last-resort fallback
     return {
       engine: 'youtube_iframe',
       id: cleanId,
@@ -675,6 +1049,7 @@ export class SonoraApi {
       durationSeconds: 0,
       thumbnailUrl: getPreferredThumbnail(cleanId, ''),
       streamUrl: null,
+      proxyCacheUrl: null,
       fallbackUrl: null,
       mimeType: 'video/youtube',
       relatedTracks: []
@@ -705,7 +1080,7 @@ export class SonoraApi {
     if (!playlistId) throw new Error('Некорректная ссылка или ID плейлиста YouTube');
 
     try {
-      const { data } = await this._tryPiped(`/playlists/${encodeURIComponent(playlistId)}`);
+      const { data } = await this._tryCatalogGateway(`/playlists/${encodeURIComponent(playlistId)}`);
       return {
         id: playlistId,
         title: data.name || 'Плейлист YouTube',
@@ -781,28 +1156,31 @@ export class SonoraApi {
     return { synced: [], plain: '', source: '' };
   }
 
-  async syncYouTubeAccount(proxyUrl, cookieHeader) {
-    const safeProxy = sanitizeHttpsUrl(proxyUrl);
+  async syncYouTubeAccount(serverUrl, cookieHeader, { dataSyncId = '', authUserIndex = 0 } = {}) {
+    const safeProxy = sanitizeEndpointUrl(serverUrl);
     if (!safeProxy) {
-      throw new Error('Укажите корректный HTTPS-адрес вашего прокси-сервера');
+      throw new Error('Укажите корректный адрес Node/Render-сервера');
     }
     if (!cookieHeader || String(cookieHeader).trim().length < 10) {
       throw new Error('Вставьте строку Cookie из сессии music.youtube.com');
     }
 
-    const endpoint = safeProxy.endsWith('/sync') ? safeProxy : `${safeProxy.replace(/\/$/, '')}/sync`;
-    const data = await this._fetchJson(
-      endpoint,
+    const data = await this._serverPost(
+      '/api/yt/sync',
       {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ cookie: String(cookieHeader).trim() })
+        cookie: String(cookieHeader).trim(),
+        dataSyncId,
+        authUserIndex
       },
-      15000
+      safeProxy,
+      25000
     );
 
     const likedTracks = Array.isArray(data?.likedTracks)
       ? data.likedTracks.map(sanitizeTrack).filter(Boolean)
+      : [];
+    const historyTracks = Array.isArray(data?.historyTracks)
+      ? data.historyTracks.map(sanitizeTrack).filter(Boolean)
       : [];
     const playlists = Array.isArray(data?.playlists)
       ? data.playlists.map((pl) => ({
@@ -814,10 +1192,71 @@ export class SonoraApi {
       : [];
 
     return {
+      accountId: String(data?.account?.id || '').trim(),
       accountName: String(data?.account?.name || 'YouTube Music').trim(),
+      accountHandle: String(data?.account?.handle || '').trim(),
       accountEmail: String(data?.account?.email || '').trim(),
+      avatarUrl: sanitizeHttpsUrl(data?.account?.avatarUrl) || '',
       likedTracks,
+      historyTracks,
       playlists
     };
+  }
+
+  async ytSetLike(videoId, liked) {
+    const { serverUrl, activeAccount } = this._getConfig();
+    if (!serverUrl || !this.getServerToken(serverUrl) || !activeAccount?.cookieHeader) return false;
+    await this._serverPost('/api/yt/like', {
+      cookie: activeAccount.cookieHeader,
+      dataSyncId: activeAccount.dataSyncId || '',
+      authUserIndex: activeAccount.authUserIndex || 0,
+      videoId,
+      liked
+    });
+    return true;
+  }
+
+  async ytCreatePlaylist(title, description = '', videoIds = []) {
+    const { serverUrl, activeAccount } = this._getConfig();
+    if (!serverUrl || !this.getServerToken(serverUrl) || !activeAccount?.cookieHeader) return null;
+    const res = await this._serverPost('/api/yt/playlist/create', {
+      cookie: activeAccount.cookieHeader,
+      dataSyncId: activeAccount.dataSyncId || '',
+      authUserIndex: activeAccount.authUserIndex || 0,
+      title,
+      description,
+      videoIds
+    });
+    return res?.playlistId || null;
+  }
+
+  async ytAddTracksToPlaylist(youtubePlaylistId, videoIds = []) {
+    const { serverUrl, activeAccount } = this._getConfig();
+    if (!youtubePlaylistId || !serverUrl || !this.getServerToken(serverUrl) || !activeAccount?.cookieHeader) {
+      return false;
+    }
+    await this._serverPost('/api/yt/playlist/add', {
+      cookie: activeAccount.cookieHeader,
+      dataSyncId: activeAccount.dataSyncId || '',
+      authUserIndex: activeAccount.authUserIndex || 0,
+      playlistId: youtubePlaylistId,
+      videoIds
+    });
+    return true;
+  }
+
+  async ytRemoveTrackFromPlaylist(youtubePlaylistId, videoId) {
+    const { serverUrl, activeAccount } = this._getConfig();
+    if (!youtubePlaylistId || !serverUrl || !this.getServerToken(serverUrl) || !activeAccount?.cookieHeader) {
+      return false;
+    }
+    await this._serverPost('/api/yt/playlist/remove', {
+      cookie: activeAccount.cookieHeader,
+      dataSyncId: activeAccount.dataSyncId || '',
+      authUserIndex: activeAccount.authUserIndex || 0,
+      playlistId: youtubePlaylistId,
+      videoId
+    });
+    return true;
   }
 }

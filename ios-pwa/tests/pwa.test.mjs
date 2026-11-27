@@ -12,8 +12,16 @@ import {
   extractPlaylistId,
   extractVideoId,
   parseLrcLines,
-  selectBestIosAudioStream
+  selectBestIosAudioStream,
+  SonoraApi
 } from '../src/api.js';
+import { formatBytesRu } from '../src/offline.js';
+import {
+  ImplicitSignalType,
+  MoodCategory,
+  SmartRecommendationEngine,
+  TrackMoodProfiler
+} from '../src/recommendations.js';
 import { SonoraStorage } from '../src/storage.js';
 
 test('BackupCipher encrypts and decrypts with Android-compatible sonora-enc:v1 envelope', async () => {
@@ -126,7 +134,7 @@ test('extractVideoId and extractPlaylistId parse YouTube, YouTube Music, and rel
   assert.equal(extractPlaylistId('PLabcdefgh123456'), 'PLabcdefgh123456');
 });
 
-test('SonoraStorage supports creating and renaming playlists', async () => {
+test('SonoraStorage supports creating/renaming playlists and multi-account switching', async () => {
   const storage = new SonoraStorage();
   await storage.init();
   const pl = await storage.createPlaylist('Favorites Mix', 'Chill');
@@ -134,6 +142,17 @@ test('SonoraStorage supports creating and renaming playlists', async () => {
   const updated = storage.library.playlists.find((p) => p.id === pl.id);
   assert.equal(updated.name, 'Night Drive');
   assert.equal(updated.description, 'Late night vibes');
+
+  await storage.upsertAccount({ id: 'acc1', name: 'Main YT', cookieHeader: 'SAPISID=aaa' });
+  await storage.upsertAccount({ id: 'acc2', name: 'Brand YT', cookieHeader: 'SAPISID=bbb' });
+  assert.equal(storage.accounts.length, 2);
+  assert.equal(storage.activeAccount.id, 'acc2');
+
+  await storage.switchAccount('acc1');
+  assert.equal(storage.activeAccount.id, 'acc1');
+  await storage.removeAccount('acc1');
+  assert.equal(storage.accounts.length, 1);
+  assert.equal(storage.activeAccount.id, 'acc2');
 });
 
 test('selectBestIosAudioStream prioritizes M4A/AAC over WebM and respects HTTPS', () => {
@@ -166,3 +185,53 @@ test('parseLrcLines parses timestamps and sorts lyrics chronologically', () => {
   assert.ok(Math.abs(lines[0].timeSeconds - 5.25) < 0.01);
   assert.equal(lines[1].text, 'Second line');
 });
+
+test('SmartRecommendationEngine builds personalized mixes and demotes quick-skipped moods', async () => {
+  const storage = new SonoraStorage();
+  await storage.init();
+  const profiler = new TrackMoodProfiler();
+  assert.equal(profiler.profile({ title: 'Midnight Synthwave Drive', artist: 'Kavinsky', durationSeconds: 210 }).mood, MoodCategory.NIGHT_SYNTH);
+  assert.equal(profiler.profile({ title: 'Lo-Fi Study Beats', artist: 'ChilledCow', durationSeconds: 180 }).mood, MoodCategory.CHILL_FOCUS);
+
+  const engine = new SmartRecommendationEngine({ api: null, storage });
+  const lofi1 = { id: 'lofi0000001', title: 'Lo-Fi Rain Study', artist: 'Chill', durationSeconds: 190 };
+  const lofi2 = { id: 'lofi0000002', title: 'Lofi Coffee Ambient', artist: 'Chill', durationSeconds: 200 };
+  const phonk1 = { id: 'phonk000001', title: 'Gym Phonk Drift', artist: 'Aggressive', durationSeconds: 140 };
+  const phonk2 = { id: 'phonk000002', title: 'Workout Hardstyle Bass', artist: 'Aggressive', durationSeconds: 145 };
+
+  await engine.tasteTracker.recordSignal(lofi1, ImplicitSignalType.COMPLETE_PLAY);
+  await engine.tasteTracker.recordSignal(phonk1, ImplicitSignalType.QUICK_SKIP);
+  await engine.tasteTracker.recordSignal(phonk2, ImplicitSignalType.QUICK_SKIP);
+
+  const reranked = engine.softRerankUpcoming(
+    [phonk2, lofi2],
+    lofi1,
+    [phonk1, phonk2]
+  );
+  assert.equal(reranked[0].id, lofi2.id);
+
+  const mixes = engine.buildPersonalizedMixes([lofi1, lofi2, phonk1, phonk2]);
+  assert.ok(mixes.dailyMixTracks.length >= 2);
+  assert.ok(mixes.madeForYou.length >= 1);
+});
+
+test('SonoraApi orders personal Cloudflare Worker #1 and Render server #2 when configured', () => {
+  const api = new SonoraApi(() => ({
+    workerCatalogUrl: 'https://sonora-worker.example.workers.dev/',
+    serverUrl: 'https://sonora-server.onrender.com/',
+    customApiBaseUrl: 'https://custom-piped.example.com'
+  }));
+  api.setServerToken('https://sonora-server.onrender.com', 'mem-jwt-token');
+
+  const gateways = api._getCatalogGateways();
+  assert.equal(gateways[0].kind, 'worker');
+  assert.equal(gateways[0].base, 'https://sonora-worker.example.workers.dev');
+  assert.equal(gateways[1].kind, 'server');
+  assert.equal(gateways[1].prefix, '/api/catalog');
+  assert.equal(gateways[2].kind, 'piped');
+  assert.equal(gateways[2].base, 'https://custom-piped.example.com');
+
+  assert.equal(formatBytesRu(0), '0 КБ');
+  assert.equal(formatBytesRu(5242880), '5.0 МБ');
+});
+

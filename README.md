@@ -106,3 +106,19 @@ git push origin v1.0.1
 2. Нажмите кнопку **«Поделиться»** внизу экрана и выберите **«На экран «Домой»»**.
 3. Запускайте **Sonora** с домашнего экрана как обычное приложение — обновления будут загружаться автоматически при каждом пуше в GitHub.
 
+### Личный Cloudflare Worker (ускорение Главной, Поиска и потоков без сбоев)
+
+1. Создайте бесплатный Worker на [Cloudflare Workers](https://dash.cloudflare.com/) (или задеплойте из каталога `cloudflare-worker/` командой `npx wrangler deploy`).
+2. Вставьте код из `cloudflare-worker/worker.js` (при желании задайте переменную `ALLOWED_ORIGINS` = ваш URL GitHub Pages).
+3. В приложении Sonora откройте **Настройки → Маршрутизация и ускорение каталога** и укажите URL вашего Worker (`https://sonora-worker.<subdomain>.workers.dev`).
+
+### Сервер входа в YouTube Music (Node.js / Render)
+
+1. В каталоге `server/` находится автономный Node.js-сервер с конфигом `server/render.yaml` и `server/Dockerfile`.
+2. На **Render** создайте новый Web Service (Blueprint из `server/render.yaml` или Web Service с `Root Directory: server`, `Start Command: npm start`).
+3. Задайте переменные окружения:
+   - `CORS_ALLOWED_ORIGINS` — например `https://<OWNER>.github.io`
+   - `SONORA_SERVER_PASSCODE` — ваш личный код доступа к серверу (или задайте его прямо в приложении при первом подключении)
+4. Откройте **Настройки → Аккаунты YouTube Music** в приложении, укажите адрес Render-сервера, войдите по коду доступа и вставьте Cookie с `music.youtube.com` для синхронизации лайков, истории, плейлистов и прямых потоков без рекламы.
+
+

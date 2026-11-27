@@ -1,3 +1,4 @@
+import { ImplicitSignalType } from './recommendations.js';
 import { sanitizeTrack } from './security.js';
 
 let ytApiPromise = null;
@@ -33,9 +34,11 @@ function loadYouTubeIframeApi() {
 }
 
 export class SonoraPlayer {
-  constructor({ api, storage, onStateChange, onError }) {
+  constructor({ api, storage, offline, recommendations, onStateChange, onError }) {
     this.api = api;
     this.storage = storage;
+    this.offline = offline;
+    this.recommendations = recommendations;
     this.onStateChange = onStateChange;
     this.onError = onError;
 
@@ -45,6 +48,7 @@ export class SonoraPlayer {
     this.audio.preload = 'auto';
 
     this.engine = 'audio'; // 'audio' | 'youtube_iframe'
+    this.isOfflineSource = false;
     this.ytPlayer = null;
     this.ytReady = false;
     this.ytPollId = null;
@@ -62,6 +66,7 @@ export class SonoraPlayer {
     this.streamCache = new Map();
     this.lyricsCache = new Map();
     this.activeLyrics = { synced: [], plain: '', source: '', loading: false };
+    this.recentSkippedTracks = [];
     this.sleepTimerEndsAt = 0;
     this.sleepTimeoutId = null;
     this.sleepIntervalId = null;
@@ -95,6 +100,7 @@ export class SonoraPlayer {
   getSnapshot() {
     return {
       engine: this.engine,
+      isOfflineSource: this.isOfflineSource,
       queue: this.queue,
       currentIndex: this.currentIndex,
       currentTrack: this.currentTrack,
@@ -207,6 +213,15 @@ export class SonoraPlayer {
     this.audio.addEventListener('ended', async () => {
       if (this.engine !== 'audio') return;
       this.isPlaying = false;
+      const finished = this.currentTrack;
+      if (finished) {
+        this.recommendations?.tasteTracker?.recordSignal(
+          finished,
+          this.repeatMode === 'ONE'
+            ? ImplicitSignalType.REPEAT_PLAY
+            : ImplicitSignalType.COMPLETE_PLAY
+        );
+      }
       if (this.repeatMode === 'ONE') {
         this.seekTo(0);
         await this.audio.play().catch(() => {});
@@ -291,6 +306,12 @@ export class SonoraPlayer {
             } else if (state === YT.PlayerState.ENDED) {
               this.isPlaying = false;
               this._stopYtPolling();
+              if (this.currentTrack) {
+                this.recommendations?.tasteTracker?.recordSignal(
+                  this.currentTrack,
+                  ImplicitSignalType.COMPLETE_PLAY
+                );
+              }
               if (this.repeatMode === 'ONE') {
                 this.seekTo(0);
                 this.ytPlayer?.playVideo?.();
@@ -338,12 +359,14 @@ export class SonoraPlayer {
 
   async _startYouTubeIframe(track, resumeSeconds = 0, shouldPlay = true) {
     this.engine = 'youtube_iframe';
+    this.isOfflineSource = false;
     this._stopInactiveEngines('youtube_iframe');
     this.isBuffering = true;
     this._updateMediaMetadata(track);
     this._emit();
 
     await this._ensureYouTubePlayer(track.id, resumeSeconds, shouldPlay);
+    this.recommendations?.markHeardInSession(track.id);
     await this.storage.recordPlayback(track);
     await this._persistPlayback(true);
     this.loadLyricsForCurrentTrack(track);
@@ -441,6 +464,10 @@ export class SonoraPlayer {
     if (!clean) return;
     this.unlockGesture();
 
+    if (this.currentTrack?.id === clean.id && this.isPlaying) {
+      this.recommendations?.tasteTracker?.recordSignal(clean, ImplicitSignalType.REPEAT_PLAY);
+    }
+
     if (Array.isArray(list) && list.length > 0) {
       const normalized = list.map(sanitizeTrack).filter(Boolean);
       const idx = normalized.findIndex((t) => t.id === clean.id);
@@ -463,12 +490,32 @@ export class SonoraPlayer {
   async _loadAndPlayTrack(track, resumeSeconds = 0, shouldPlay = true) {
     if (!track) return;
     this.isBuffering = true;
+    this.isOfflineSource = false;
     this.currentTime = resumeSeconds;
     this.duration = track.durationSeconds || 0;
     this._updateMediaMetadata(track);
     this._emit();
 
     try {
+      // Check offline cache first so downloaded tracks play immediately without network
+      const offlineUrl = await this.offline?.getOfflinePlaybackUrl(track.id);
+      if (this.currentTrack?.id !== track.id) return;
+
+      if (offlineUrl) {
+        this.engine = 'audio';
+        this.isOfflineSource = true;
+        this._stopInactiveEngines('audio');
+        this.audio.src = offlineUrl;
+        this.audio.playbackRate = this.playbackSpeed;
+        if (resumeSeconds > 0) this.audio.currentTime = resumeSeconds;
+        if (shouldPlay) await this.audio.play();
+        this.recommendations?.markHeardInSession(track.id);
+        await this.storage.recordPlayback(track);
+        await this._persistPlayback(true);
+        this.loadLyricsForCurrentTrack(track);
+        return;
+      }
+
       const cached = this.streamCache.get(track.id);
       let info;
       if (cached && Date.now() - cached.fetchedAt < 18 * 60 * 1000) {
@@ -486,6 +533,7 @@ export class SonoraPlayer {
       }
 
       this.engine = 'audio';
+      this.isOfflineSource = false;
       this._stopInactiveEngines('audio');
       this.audio.src = info.streamUrl;
       this.audio.playbackRate = this.playbackSpeed;
@@ -496,6 +544,7 @@ export class SonoraPlayer {
         await this.audio.play();
       }
 
+      this.recommendations?.markHeardInSession(track.id);
       await this.storage.recordPlayback(track);
       await this._persistPlayback(true);
       this.loadLyricsForCurrentTrack(track);
@@ -580,6 +629,35 @@ export class SonoraPlayer {
   async next(fromEnded = false) {
     if (this.queue.length === 0) return;
 
+    // Record skip feedback and dynamically adapt upcoming queue
+    const prevTrack = this.currentTrack;
+    if (!fromEnded && prevTrack && this.recommendations) {
+      const dur = this.duration || prevTrack.durationSeconds || 0;
+      const pos = this.currentTime || 0;
+      const ratio = dur > 0 ? pos / dur : 0;
+      if (pos < 25 && ratio < 0.2) {
+        this.recentSkippedTracks = [prevTrack, ...this.recentSkippedTracks].slice(0, 4);
+        this.recommendations.tasteTracker.recordSignal(prevTrack, ImplicitSignalType.QUICK_SKIP);
+
+        // Soft-rerank upcoming tracks after current index
+        if (!this.shuffleEnabled && this.currentIndex + 2 < this.queue.length) {
+          const head = this.queue.slice(0, this.currentIndex + 1);
+          const tail = this.queue.slice(this.currentIndex + 1);
+          const reranked = this.recommendations.softRerankUpcoming(
+            tail,
+            prevTrack,
+            this.recentSkippedTracks
+          );
+          this.queue = [...head, ...reranked];
+        }
+      } else if (ratio < 0.65) {
+        this.recommendations.tasteTracker.recordSignal(prevTrack, ImplicitSignalType.PARTIAL_SKIP);
+      } else {
+        this.recentSkippedTracks = [];
+        this.recommendations.tasteTracker.recordSignal(prevTrack, ImplicitSignalType.COMPLETE_PLAY);
+      }
+    }
+
     let nextIdx = -1;
     if (this.shuffleEnabled && this.queue.length > 1) {
       do {
@@ -600,9 +678,18 @@ export class SonoraPlayer {
 
     if (fromEnded && this.storage.settings.autoplayEnabled && this.currentTrack) {
       try {
-        const related = await this.api.getRelatedTracks(this.currentTrack);
-        const existingIds = new Set(this.queue.map((t) => t.id));
-        const additions = related.filter((t) => !existingIds.has(t.id)).slice(0, 12);
+        const excludeIds = new Set(this.queue.map((t) => t.id));
+        const additions = this.recommendations
+          ? await this.recommendations.generateNextQueueTracks(
+              this.currentTrack,
+              12,
+              excludeIds,
+              this.recentSkippedTracks
+            )
+          : (await this.api.getRelatedTracks(this.currentTrack))
+              .filter((t) => !excludeIds.has(t.id))
+              .slice(0, 12);
+
         if (additions.length > 0) {
           this.queue = [...this.queue, ...additions];
           this.currentIndex += 1;
@@ -655,11 +742,28 @@ export class SonoraPlayer {
     this._emit();
   }
 
+  async addTracksToQueue(tracks = []) {
+    const cleanList = tracks.map(sanitizeTrack).filter(Boolean);
+    if (cleanList.length === 0) return 0;
+    if (this.queue.length === 0) {
+      await this.playTrack(cleanList[0], cleanList);
+      return cleanList.length;
+    }
+    const existing = new Set(this.queue.map((t) => t.id));
+    const additions = cleanList.filter((t) => !existing.has(t.id));
+    if (additions.length === 0) return 0;
+    this.queue = [...this.queue, ...additions];
+    await this._persistPlayback(true);
+    this._emit();
+    return additions.length;
+  }
+
   async startRadio(track) {
     await this.playTrack(track);
     try {
-      const related = await this.api.getRelatedTracks(track);
-      const unique = related.filter((t) => t.id !== track.id).slice(0, 20);
+      const unique = this.recommendations
+        ? await this.recommendations.generateNextQueueTracks(track, 20, new Set([track.id]), [])
+        : (await this.api.getRelatedTracks(track)).filter((t) => t.id !== track.id).slice(0, 20);
       if (unique.length > 0) {
         this.queue = [this.currentTrack, ...unique];
         this.currentIndex = 0;

@@ -15,6 +15,8 @@ const KEY_LIBRARY = 'library_state_v1';
 const KEY_SETTINGS = 'app_settings_v1';
 const KEY_PLAYBACK = 'playback_state_v1';
 const KEY_ACCOUNT = 'account_state_v1';
+const KEY_AFFINITIES = 'taste_affinities_v1';
+const KEY_OFFLINE = 'offline_tracks_v1';
 const KEY_DEVICE_KEY = 'device_aes_key_v1';
 
 const DEFAULT_SETTINGS = {
@@ -22,7 +24,11 @@ const DEFAULT_SETTINGS = {
   themeMode: 'SYSTEM',
   autoplayEnabled: true,
   encryptBackupsEnabled: true,
-  customApiBaseUrl: ''
+  workerCatalogUrl: '',
+  serverUrl: '',
+  customApiBaseUrl: '',
+  autoSyncEnabled: true,
+  writeThroughSyncEnabled: true
 };
 
 const DEFAULT_LIBRARY = {
@@ -80,6 +86,23 @@ async function idbDelete(db, key) {
   });
 }
 
+function sanitizeServerOrWorkerUrl(raw) {
+  const safe = sanitizeHttpsUrl(raw);
+  if (safe) return safe.replace(/\/+$/, '');
+  // Allow http://localhost or http://127.0.0.1 for local developer server testing
+  if (typeof raw === 'string') {
+    try {
+      const u = new URL(raw.trim());
+      if (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) {
+        return u.origin + u.pathname.replace(/\/+$/, '');
+      }
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
 export class SonoraStorage {
   constructor() {
     this.db = null;
@@ -94,11 +117,34 @@ export class SonoraStorage {
       repeatMode: 'OFF',
       playbackSpeed: 1.0
     };
-    this.account = {
+    this.accounts = [];
+    this.activeAccountId = '';
+    this.affinities = [];
+    this.downloadedTracks = [];
+  }
+
+  get activeAccount() {
+    return (
+      this.accounts.find((a) => a.id === this.activeAccountId) ||
+      this.accounts[0] ||
+      null
+    );
+  }
+
+  // Backwards-compatible getter for single account view
+  get account() {
+    const active = this.activeAccount;
+    if (active) return active;
+    return {
+      id: '',
       name: '',
+      handle: '',
       email: '',
-      proxyUrl: '',
+      avatarUrl: '',
+      proxyUrl: this.settings.serverUrl || '',
       cookieHeader: '',
+      dataSyncId: '',
+      authUserIndex: 0,
       lastSyncTimestamp: 0,
       syncedLikedCount: 0,
       syncedPlaylistsCount: 0
@@ -158,12 +204,15 @@ export class SonoraStorage {
       this.db = null;
     }
 
-    const [savedLib, savedSettings, savedPlayback, savedAccount] = await Promise.all([
-      this._read(KEY_LIBRARY),
-      this._read(KEY_SETTINGS),
-      this._read(KEY_PLAYBACK),
-      this._read(KEY_ACCOUNT)
-    ]);
+    const [savedLib, savedSettings, savedPlayback, savedAccountState, savedAffinities, savedOffline] =
+      await Promise.all([
+        this._read(KEY_LIBRARY),
+        this._read(KEY_SETTINGS),
+        this._read(KEY_PLAYBACK),
+        this._read(KEY_ACCOUNT),
+        this._read(KEY_AFFINITIES),
+        this._read(KEY_OFFLINE)
+      ]);
 
     if (savedLib && typeof savedLib === 'object') {
       this.library = {
@@ -182,28 +231,125 @@ export class SonoraStorage {
       this.playback = { ...this.playback, ...savedPlayback };
     }
 
-    if (savedAccount && typeof savedAccount === 'object') {
-      let decryptedCookie = '';
-      if (savedAccount.encryptedCookie) {
-        const key = await this._getOrCreateDeviceKey();
-        if (key) {
-          decryptedCookie = await decryptLocalSecret(savedAccount.encryptedCookie, key).catch(() => '');
+    if (Array.isArray(savedAffinities)) {
+      this.affinities = savedAffinities;
+    }
+
+    if (Array.isArray(savedOffline)) {
+      this.downloadedTracks = savedOffline.filter((t) => t?.id);
+    }
+
+    if (savedAccountState && typeof savedAccountState === 'object') {
+      const key = await this._getOrCreateDeviceKey();
+      const rawList = Array.isArray(savedAccountState.accounts)
+        ? savedAccountState.accounts
+        : savedAccountState.name || savedAccountState.encryptedCookie || savedAccountState.proxyUrl
+          ? [{ id: 'yt_legacy', ...savedAccountState }]
+          : [];
+
+      const hydratedAccounts = [];
+      for (const item of rawList) {
+        let decryptedCookie = '';
+        if (item.encryptedCookie && key) {
+          decryptedCookie = await decryptLocalSecret(item.encryptedCookie, key).catch(() => '');
+        }
+        if (item.name || decryptedCookie) {
+          hydratedAccounts.push({
+            id: String(item.id || `yt_${hydratedAccounts.length + 1}`),
+            name: String(item.name || 'YouTube Music'),
+            handle: String(item.handle || ''),
+            email: String(item.email || ''),
+            avatarUrl: sanitizeHttpsUrl(item.avatarUrl) || '',
+            proxyUrl: sanitizeServerOrWorkerUrl(item.proxyUrl) || this.settings.serverUrl || '',
+            cookieHeader: decryptedCookie,
+            dataSyncId: String(item.dataSyncId || ''),
+            authUserIndex: Number(item.authUserIndex) || 0,
+            lastSyncTimestamp: Number(item.lastSyncTimestamp) || 0,
+            syncedLikedCount: Number(item.syncedLikedCount) || 0,
+            syncedPlaylistsCount: Number(item.syncedPlaylistsCount) || 0
+          });
         }
       }
-      this.account = {
-        name: savedAccount.name || '',
-        email: savedAccount.email || '',
-        proxyUrl: sanitizeHttpsUrl(savedAccount.proxyUrl) || '',
-        cookieHeader: decryptedCookie,
-        lastSyncTimestamp: Number(savedAccount.lastSyncTimestamp) || 0,
-        syncedLikedCount: Number(savedAccount.syncedLikedCount) || 0,
-        syncedPlaylistsCount: Number(savedAccount.syncedPlaylistsCount) || 0
-      };
+      this.accounts = hydratedAccounts;
+      this.activeAccountId =
+        savedAccountState.activeAccountId ||
+        hydratedAccounts[0]?.id ||
+        '';
+      if (!this.settings.serverUrl && hydratedAccounts[0]?.proxyUrl) {
+        this.settings.serverUrl = hydratedAccounts[0].proxyUrl;
+      }
     }
   }
 
   async _saveLibrary() {
     await this._write(KEY_LIBRARY, this.library);
+  }
+
+  async _saveAccounts() {
+    if (this.accounts.length === 0) {
+      await this._remove(KEY_ACCOUNT);
+      return;
+    }
+    const key = await this._getOrCreateDeviceKey();
+    const serialized = [];
+    for (const acc of this.accounts) {
+      const encryptedCookie =
+        acc.cookieHeader && key
+          ? await encryptLocalSecret(acc.cookieHeader, key)
+          : '';
+      serialized.push({
+        id: acc.id,
+        name: acc.name,
+        handle: acc.handle || '',
+        email: acc.email || '',
+        avatarUrl: acc.avatarUrl || '',
+        proxyUrl: acc.proxyUrl || '',
+        encryptedCookie,
+        dataSyncId: acc.dataSyncId || '',
+        authUserIndex: Number(acc.authUserIndex) || 0,
+        lastSyncTimestamp: Number(acc.lastSyncTimestamp) || 0,
+        syncedLikedCount: Number(acc.syncedLikedCount) || 0,
+        syncedPlaylistsCount: Number(acc.syncedPlaylistsCount) || 0
+      });
+    }
+    await this._write(KEY_ACCOUNT, {
+      activeAccountId: this.activeAccountId,
+      accounts: serialized
+    });
+  }
+
+  async saveAffinityEntity(entity) {
+    if (!entity?.trackId) return;
+    const idx = this.affinities.findIndex((a) => a.trackId === entity.trackId);
+    if (idx >= 0) {
+      this.affinities[idx] = entity;
+    } else {
+      this.affinities.push(entity);
+    }
+    if (this.affinities.length > 500) {
+      this.affinities.sort((a, b) => (b.lastInteractedAt || 0) - (a.lastInteractedAt || 0));
+      this.affinities = this.affinities.slice(0, 500);
+    }
+    await this._write(KEY_AFFINITIES, this.affinities);
+  }
+
+  async saveDownloadedTrack(trackMeta) {
+    if (!trackMeta?.id) return;
+    this.downloadedTracks = [
+      trackMeta,
+      ...this.downloadedTracks.filter((t) => t.id !== trackMeta.id)
+    ];
+    await this._write(KEY_OFFLINE, this.downloadedTracks);
+  }
+
+  async removeDownloadedTrack(trackId) {
+    this.downloadedTracks = this.downloadedTracks.filter((t) => t.id !== trackId);
+    await this._write(KEY_OFFLINE, this.downloadedTracks);
+  }
+
+  async clearDownloadedTracks() {
+    this.downloadedTracks = [];
+    await this._remove(KEY_OFFLINE);
   }
 
   isFavorite(trackId) {
@@ -263,11 +409,20 @@ export class SonoraStorage {
       description: String(description ?? '').trim().slice(0, 500),
       tracks: cleanTracks,
       youtubePlaylistId: youtubePlaylistId || null,
-      createdAt: Date.now()
+      createdAt: Date.now(),
+      updatedAt: Date.now()
     };
     this.library.playlists = [playlist, ...this.library.playlists];
     await this._saveLibrary();
     return playlist;
+  }
+
+  async setPlaylistYoutubeId(playlistId, youtubePlaylistId) {
+    const pl = this.library.playlists.find((p) => p.id === playlistId);
+    if (!pl || !youtubePlaylistId) return;
+    pl.youtubePlaylistId = youtubePlaylistId;
+    pl.updatedAt = Date.now();
+    await this._saveLibrary();
   }
 
   async mergePlaylist(name, description = '', tracks = [], youtubePlaylistId = null) {
@@ -290,6 +445,7 @@ export class SonoraStorage {
     if (description && !existing.description) {
       existing.description = description;
     }
+    existing.updatedAt = Date.now();
     await this._saveLibrary();
     return { playlist: existing, addedCount: additions.length };
   }
@@ -300,6 +456,7 @@ export class SonoraStorage {
     if (!pl || !clean) return false;
     if (pl.tracks.some((t) => t.id === clean.id)) return false;
     pl.tracks = [...pl.tracks, clean];
+    pl.updatedAt = Date.now();
     await this._saveLibrary();
     return true;
   }
@@ -308,6 +465,7 @@ export class SonoraStorage {
     const pl = this.library.playlists.find((p) => p.id === playlistId);
     if (!pl) return;
     pl.tracks = pl.tracks.filter((t) => t.id !== trackId);
+    pl.updatedAt = Date.now();
     await this._saveLibrary();
   }
 
@@ -317,6 +475,7 @@ export class SonoraStorage {
     if (!pl || !cleanName) throw new Error('Введите название плейлиста');
     pl.name = cleanName;
     pl.description = String(description ?? '').trim().slice(0, 500);
+    pl.updatedAt = Date.now();
     await this._saveLibrary();
     return pl;
   }
@@ -330,9 +489,17 @@ export class SonoraStorage {
     this.settings = {
       ...this.settings,
       ...patch,
+      workerCatalogUrl:
+        patch.workerCatalogUrl !== undefined
+          ? sanitizeServerOrWorkerUrl(patch.workerCatalogUrl)
+          : this.settings.workerCatalogUrl,
+      serverUrl:
+        patch.serverUrl !== undefined
+          ? sanitizeServerOrWorkerUrl(patch.serverUrl)
+          : this.settings.serverUrl,
       customApiBaseUrl:
         patch.customApiBaseUrl !== undefined
-          ? sanitizeHttpsUrl(patch.customApiBaseUrl) || ''
+          ? sanitizeServerOrWorkerUrl(patch.customApiBaseUrl)
           : this.settings.customApiBaseUrl
     };
     await this._write(KEY_SETTINGS, this.settings);
@@ -350,50 +517,59 @@ export class SonoraStorage {
     await this._write(KEY_PLAYBACK, this.playback);
   }
 
-  async saveAccountConfig(config) {
-    this.account = {
-      name: String(config.name ?? this.account.name ?? '').trim(),
-      email: String(config.email ?? this.account.email ?? '').trim(),
-      proxyUrl:
-        config.proxyUrl !== undefined
-          ? sanitizeHttpsUrl(config.proxyUrl) || ''
-          : this.account.proxyUrl,
-      cookieHeader:
-        config.cookieHeader !== undefined
-          ? String(config.cookieHeader).trim()
-          : this.account.cookieHeader,
-      lastSyncTimestamp: Number(config.lastSyncTimestamp ?? this.account.lastSyncTimestamp) || 0,
-      syncedLikedCount: Number(config.syncedLikedCount ?? this.account.syncedLikedCount) || 0,
-      syncedPlaylistsCount: Number(config.syncedPlaylistsCount ?? this.account.syncedPlaylistsCount) || 0
+  async upsertAccount(config) {
+    const id = String(config.id || config.email || config.handle || `yt_${Date.now()}`).trim();
+    const record = {
+      id,
+      name: String(config.name || 'YouTube Music').trim(),
+      handle: String(config.handle || '').trim(),
+      email: String(config.email || '').trim(),
+      avatarUrl: sanitizeHttpsUrl(config.avatarUrl) || '',
+      proxyUrl: sanitizeServerOrWorkerUrl(config.proxyUrl || this.settings.serverUrl) || '',
+      cookieHeader: String(config.cookieHeader ?? '').trim(),
+      dataSyncId: String(config.dataSyncId || '').trim(),
+      authUserIndex: Math.max(0, Number(config.authUserIndex) || 0),
+      lastSyncTimestamp: Number(config.lastSyncTimestamp) || Date.now(),
+      syncedLikedCount: Number(config.syncedLikedCount) || 0,
+      syncedPlaylistsCount: Number(config.syncedPlaylistsCount) || 0
     };
 
-    const key = await this._getOrCreateDeviceKey();
-    const encryptedCookie =
-      this.account.cookieHeader && key
-        ? await encryptLocalSecret(this.account.cookieHeader, key)
-        : '';
+    const idx = this.accounts.findIndex((a) => a.id === id);
+    if (idx >= 0) {
+      this.accounts[idx] = { ...this.accounts[idx], ...record };
+    } else {
+      this.accounts = [...this.accounts, record];
+    }
+    this.activeAccountId = id;
+    if (record.proxyUrl && !this.settings.serverUrl) {
+      await this.updateSettings({ serverUrl: record.proxyUrl });
+    }
+    await this._saveAccounts();
+    return record;
+  }
 
-    await this._write(KEY_ACCOUNT, {
-      name: this.account.name,
-      email: this.account.email,
-      proxyUrl: this.account.proxyUrl,
-      encryptedCookie,
-      lastSyncTimestamp: this.account.lastSyncTimestamp,
-      syncedLikedCount: this.account.syncedLikedCount,
-      syncedPlaylistsCount: this.account.syncedPlaylistsCount
-    });
+  async switchAccount(accountId) {
+    if (!this.accounts.some((a) => a.id === accountId)) return null;
+    this.activeAccountId = accountId;
+    await this._saveAccounts();
+    return this.activeAccount;
+  }
+
+  async removeAccount(accountId) {
+    this.accounts = this.accounts.filter((a) => a.id !== accountId);
+    if (this.activeAccountId === accountId) {
+      this.activeAccountId = this.accounts[0]?.id || '';
+    }
+    await this._saveAccounts();
+  }
+
+  async saveAccountConfig(config) {
+    return this.upsertAccount(config);
   }
 
   async signOutAccount() {
-    this.account = {
-      name: '',
-      email: '',
-      proxyUrl: '',
-      cookieHeader: '',
-      lastSyncTimestamp: 0,
-      syncedLikedCount: 0,
-      syncedPlaylistsCount: 0
-    };
+    this.accounts = [];
+    this.activeAccountId = '';
     await this._remove(KEY_ACCOUNT);
   }
 

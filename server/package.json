@@ -1,0 +1,14 @@
+{
+  "name": "sonora-backend",
+  "version": "2.0.0",
+  "description": "Dedicated Node.js backend for Sonora Web / iOS PWA: YouTube Music InnerTube sync, ad-free audio stream relay, and catalog fallback.",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test tests/server.test.mjs"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
