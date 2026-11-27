@@ -96,8 +96,8 @@ git push origin v1.0.1
 
 ### Включение публикации на GitHub Pages
 
-1. В репозитории на GitHub откройте **Settings → Pages**.
-2. В разделе **Build and deployment → Source** выберите **GitHub Actions**.
+1. Убедитесь, что репозиторий **публичный (Public)** (на бесплатном тарифе GitHub Pages не поддерживается для приватных репозиториев).
+2. При необходимости откройте в репозитории **Settings → Pages** и выберите **Build and deployment → Source: GitHub Actions** (при пуше workflow также пытается включить Pages автоматически).
 3. Workflow `.github/workflows/deploy-ios-pwa.yml` автоматически протестирует PWA, обновит версию Service Worker и опубликует сайт по HTTPS. Также его можно запустить вручную во вкладке **Actions → Build & Deploy iOS PWA (GitHub Pages) → Run workflow**.
 
 ### Установка на iPhone

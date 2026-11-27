@@ -52,8 +52,24 @@ jobs:
           sed -i "s/__BUILD_VERSION__/${GITHUB_SHA}/g" _site/sw.js
           touch _site/.nojekyll
 
-      - name: Setup Pages
+      - name: Upload Packaged iOS PWA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sonora-ios-pwa-bundle
+          path: "_site"
+
+      - name: Setup Pages (Auto-Enable if Needed)
+        id: pages
+        continue-on-error: true
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - name: Explain Pages Setup Error
+        if: steps.pages.outcome != 'success'
+        run: |
+          echo "::error::GitHub Pages не включён или недоступен для этого репозитория. Откройте Settings → Pages → Source: GitHub Actions. Если репозиторий приватный (Private) на бесплатном тарифе GitHub, переведите его в Public (Settings → General → Change repository visibility) — GitHub Pages для Private-репозиториев требует план Pro/Team. Собранный архив sonora-ios-pwa-bundle при этом сохранён в Artifacts этого запуска."
+          exit 1
 
       - name: Upload Pages Artifact
         uses: actions/upload-pages-artifact@v3
