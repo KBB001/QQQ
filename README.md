@@ -87,3 +87,22 @@ git tag v1.0.1
 git push origin v1.0.1
 ```
 После завершения workflow во вкладке **Releases** появится релиз с файлом `sonora-v1.0.1.apk`.
+
+---
+
+## Версия для iPhone (iOS PWA с автообновлением через GitHub)
+
+В каталоге `ios-pwa/` находится веб-приложение **Sonora** для iPhone в нативном стиле iOS (адаптивная светлая/тёмная тема, мини-плеер и полноэкранный плеер, синхронизированные тексты `LRCLIB`, управление с экрана блокировки `MediaSession`, импорт плейлистов YouTube Music и совместимые с Android зашифрованные резервные копии `.sonoraenc`).
+
+### Включение публикации на GitHub Pages
+
+1. В репозитории на GitHub откройте **Settings → Pages**.
+2. В разделе **Build and deployment → Source** выберите **GitHub Actions**.
+3. Workflow `.github/workflows/deploy-ios-pwa.yml` автоматически протестирует PWA, обновит версию Service Worker и опубликует сайт по HTTPS. Также его можно запустить вручную во вкладке **Actions → Build & Deploy iOS PWA (GitHub Pages) → Run workflow**.
+
+### Установка на iPhone
+
+1. Откройте опубликованный URL вида `https://<OWNER>.github.io/<REPO>/` в **Safari** на iPhone.
+2. Нажмите кнопку **«Поделиться»** внизу экрана и выберите **«На экран «Домой»»**.
+3. Запускайте **Sonora** с домашнего экрана как обычное приложение — обновления будут загружаться автоматически при каждом пуше в GitHub.
+

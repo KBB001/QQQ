@@ -1,0 +1,28 @@
+{
+  "id": "./",
+  "name": "Sonora",
+  "short_name": "Sonora",
+  "description": "Музыкальный плеер Sonora для iPhone с поиском YouTube, медиатекой, текстами песен и совместимыми зашифрованными бэкапами.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#000000",
+  "theme_color": "#1ED760",
+  "lang": "ru",
+  "categories": ["music", "entertainment"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}
