@@ -39,7 +39,10 @@ export const MOOD_CHIPS = [
 ];
 
 const NODE_COOLDOWN_MS = 90 * 1000;
-const POOL_CACHE_TTL_MS = 10 * 60 * 1000;
+const POOL_CACHE_TTL_MS = 15 * 60 * 1000;
+const SEARCH_CACHE_TTL_MS = 5 * 60 * 1000;
+const ARTIST_CACHE_TTL_MS = 15 * 60 * 1000;
+const PLAYLIST_CACHE_TTL_MS = 10 * 60 * 1000;
 
 function sanitizeCustomNodeUrl(rawUrl) {
   const safe = sanitizeHttpsUrl(rawUrl);
@@ -191,6 +194,35 @@ export function parseLrcLines(lrcText) {
   return rows.sort((a, b) => a.timeSeconds - b.timeSeconds);
 }
 
+export function parseLyricsTrackQuery(rawTitle, rawArtist = '') {
+  const stripNoise = (str) =>
+    String(str || '')
+      .replace(/\(official.*?\)|\[official.*?\]|\(lyrics.*?\)|\[lyrics.*?\]|\(audio.*?\)|\[audio.*?\]|\(visualizer.*?\)|\[hd\]|\[4k\]|\(feat\.?.*?\)/gi, '')
+      .replace(/\s+\|\s+.*$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const cleanArtist = stripNoise(String(rawArtist || '').replace(/ - Topic$/i, '').replace(/VEVO$/i, ''));
+  const cleanTitle = stripNoise(rawTitle);
+
+  const dashMatch = cleanTitle.match(/^(.{2,60}?)\s+[–—-]\s+(.{2,120})$/);
+  if (dashMatch) {
+    return {
+      artist: dashMatch[1].trim(),
+      title: dashMatch[2].trim(),
+      fallbackArtist: cleanArtist,
+      fallbackTitle: cleanTitle
+    };
+  }
+
+  return {
+    artist: cleanArtist,
+    title: cleanTitle,
+    fallbackArtist: cleanArtist,
+    fallbackTitle: cleanTitle
+  };
+}
+
 export function formatSubscribersRu(count) {
   const n = Number(count) || 0;
   if (n <= 0) return 'Исполнитель';
@@ -267,13 +299,23 @@ export class SonoraApi {
     this.pipedInstancesCache = { fetchedAt: 0, urls: [] };
     this.invidiousInstancesCache = { fetchedAt: 0, urls: [] };
     this.audiusNodesCache = { fetchedAt: 0, urls: [] };
+    this.lastFastNodes = { piped: '', invidious: '', audius: '' };
     this.unhealthyUntil = new Map();
+
+    // Performance caches & in-flight deduplication
+    this.inflightStreams = new Map();
+    this.inflightSearches = new Map();
+    this.searchCache = new Map();
+    this.artistCache = new Map();
+    this.playlistCache = new Map();
   }
 
   _getConfig() {
     const cfg = this.getConfig?.() || {};
     return {
-      customApiBaseUrl: sanitizeCustomNodeUrl(cfg.customApiBaseUrl)
+      customApiBaseUrl: sanitizeCustomNodeUrl(cfg.customApiBaseUrl),
+      fastNodes: cfg.fastNodes || {},
+      onFastNode: typeof cfg.onFastNode === 'function' ? cfg.onFastNode : null
     };
   }
 
@@ -293,9 +335,12 @@ export class SonoraApi {
     }
   }
 
-  _markHealthy(base) {
-    if (base) {
-      this.unhealthyUntil.delete(base);
+  _markHealthy(base, kind = null) {
+    if (!base) return;
+    this.unhealthyUntil.delete(base);
+    if (kind && ['piped', 'invidious', 'audius'].includes(kind)) {
+      this.lastFastNodes[kind] = base;
+      this._getConfig().onFastNode?.(kind, base);
     }
   }
 
@@ -308,11 +353,12 @@ export class SonoraApi {
     return [...healthy, ...cooling];
   }
 
-  async _fetchJson(url, options = {}, timeoutMs = 4500) {
+  async _fetchJson(url, options = {}, timeoutMs = 3600) {
     const safeUrl = sanitizeHttpsUrl(url);
     if (!safeUrl) throw new Error('Разрешены только HTTPS-запросы');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    timer.unref?.();
     try {
       const resp = await fetch(safeUrl, {
         ...options,
@@ -344,99 +390,106 @@ export class SonoraApi {
     }
   }
 
-  async _getPipedPool() {
-    const { customApiBaseUrl } = this._getConfig();
-    let dynamicUrls = [];
-    if (
-      Date.now() - this.pipedInstancesCache.fetchedAt < POOL_CACHE_TTL_MS &&
-      this.pipedInstancesCache.urls.length > 0
-    ) {
-      dynamicUrls = this.pipedInstancesCache.urls;
-    } else {
-      try {
-        const list = await this._fetchJson('https://piped-instances.kavin.rocks/', {}, 3500);
-        dynamicUrls = Array.isArray(list)
-          ? list
-              .filter((item) => item?.api_url)
-              .slice(0, 8)
-              .map((item) => sanitizeCustomNodeUrl(item.api_url))
-              .filter(Boolean)
-          : [];
-        if (dynamicUrls.length > 0) {
-          this.pipedInstancesCache = { fetchedAt: Date.now(), urls: dynamicUrls };
-        }
-      } catch {
-        dynamicUrls = [];
-      }
+  async warmUpPools() {
+    const now = Date.now();
+    const tasks = [];
+    if (now - this.pipedInstancesCache.fetchedAt > POOL_CACHE_TTL_MS) {
+      tasks.push(
+        this._fetchJson('https://piped-instances.kavin.rocks/', {}, 3200)
+          .then((list) => {
+            const urls = Array.isArray(list)
+              ? list
+                  .filter((item) => item?.api_url)
+                  .slice(0, 8)
+                  .map((item) => sanitizeCustomNodeUrl(item.api_url))
+                  .filter(Boolean)
+              : [];
+            if (urls.length > 0) {
+              this.pipedInstancesCache = { fetchedAt: Date.now(), urls };
+            }
+          })
+          .catch(() => {})
+      );
     }
+    if (now - this.invidiousInstancesCache.fetchedAt > POOL_CACHE_TTL_MS) {
+      tasks.push(
+        this._fetchJson('https://api.invidious.io/instances.json?sort_by=type,health,api', {}, 3200)
+          .then((list) => {
+            const urls = Array.isArray(list)
+              ? list
+                  .filter(([, meta]) => meta?.type === 'https' && meta?.api)
+                  .slice(0, 8)
+                  .map(([host]) => `https://${host}`)
+              : [];
+            if (urls.length > 0) {
+              this.invidiousInstancesCache = { fetchedAt: Date.now(), urls };
+            }
+          })
+          .catch(() => {})
+      );
+    }
+    if (now - this.audiusNodesCache.fetchedAt > POOL_CACHE_TTL_MS) {
+      tasks.push(
+        this._fetchJson('https://api.audius.co', {}, 3200)
+          .then((res) => {
+            const urls = Array.isArray(res?.data)
+              ? res.data.slice(0, 5).map(sanitizeCustomNodeUrl).filter(Boolean)
+              : [];
+            if (urls.length > 0) {
+              this.audiusNodesCache = { fetchedAt: Date.now(), urls };
+            }
+          })
+          .catch(() => {})
+      );
+    }
+    await Promise.allSettled(tasks);
+  }
 
+  _getPipedPool() {
+    const { customApiBaseUrl, fastNodes } = this._getConfig();
     return Array.from(
       new Set(
         [
           customApiBaseUrl,
           this.activeInstance,
+          this.lastFastNodes.piped,
+          fastNodes.piped,
           ...DEFAULT_PIPED_INSTANCES,
-          ...dynamicUrls
+          ...this.pipedInstancesCache.urls
         ].filter(Boolean)
       )
     );
   }
 
-  async _getInvidiousPool() {
-    let dynamicUrls = [];
-    if (
-      Date.now() - this.invidiousInstancesCache.fetchedAt < POOL_CACHE_TTL_MS &&
-      this.invidiousInstancesCache.urls.length > 0
-    ) {
-      dynamicUrls = this.invidiousInstancesCache.urls;
-    } else {
-      try {
-        const list = await this._fetchJson(
-          'https://api.invidious.io/instances.json?sort_by=type,health,api',
-          {},
-          3500
-        );
-        dynamicUrls = Array.isArray(list)
-          ? list
-              .filter(([, meta]) => meta?.type === 'https' && meta?.api)
-              .slice(0, 8)
-              .map(([host]) => `https://${host}`)
-          : [];
-        if (dynamicUrls.length > 0) {
-          this.invidiousInstancesCache = { fetchedAt: Date.now(), urls: dynamicUrls };
-        }
-      } catch {
-        dynamicUrls = [];
-      }
-    }
-
-    return Array.from(new Set([...DEFAULT_INVIDIOUS_INSTANCES, ...dynamicUrls]));
+  _getInvidiousPool() {
+    const { fastNodes } = this._getConfig();
+    return Array.from(
+      new Set(
+        [
+          this.lastFastNodes.invidious,
+          fastNodes.invidious,
+          ...DEFAULT_INVIDIOUS_INSTANCES,
+          ...this.invidiousInstancesCache.urls
+        ].filter(Boolean)
+      )
+    );
   }
 
-  async _getAudiusPool() {
-    let dynamicUrls = [];
-    if (
-      Date.now() - this.audiusNodesCache.fetchedAt < POOL_CACHE_TTL_MS &&
-      this.audiusNodesCache.urls.length > 0
-    ) {
-      dynamicUrls = this.audiusNodesCache.urls;
-    } else {
-      try {
-        const res = await this._fetchJson('https://api.audius.co', {}, 3500);
-        dynamicUrls = Array.isArray(res?.data)
-          ? res.data.slice(0, 5).map(sanitizeCustomNodeUrl).filter(Boolean)
-          : [];
-        if (dynamicUrls.length > 0) {
-          this.audiusNodesCache = { fetchedAt: Date.now(), urls: dynamicUrls };
-        }
-      } catch {
-        dynamicUrls = [];
-      }
-    }
-    return Array.from(new Set([...dynamicUrls, ...DEFAULT_AUDIUS_NODES]));
+  _getAudiusPool() {
+    const { fastNodes } = this._getConfig();
+    return Array.from(
+      new Set(
+        [
+          this.lastFastNodes.audius,
+          fastNodes.audius,
+          ...this.audiusNodesCache.urls,
+          ...DEFAULT_AUDIUS_NODES
+        ].filter(Boolean)
+      )
+    );
   }
 
-  async _raceNodesInBatches(nodes, fetcher, batchSize = 3) {
+  async _raceNodesInBatches(nodes, fetcher, batchSize = 3, kind = null) {
     if (!Array.isArray(nodes) || nodes.length === 0) {
       throw new Error('Нет доступных узлов каталога');
     }
@@ -449,7 +502,7 @@ export class SonoraApi {
           batch.map(async (node) => {
             try {
               const result = await fetcher(node);
-              this._markHealthy(node);
+              this._markHealthy(node, kind);
               return { node, data: result };
             } catch (err) {
               this._markUnhealthy(node);
@@ -466,45 +519,60 @@ export class SonoraApi {
     throw lastError || new Error('Каталог временно недоступен');
   }
 
-  async _tryPipedPool(path, { excludeGateways = new Set(), validate = null } = {}) {
-    const rawPool = await this._getPipedPool();
+  async _tryPipedPool(path, { excludeGateways = new Set(), validate = null, timeoutMs = 3600 } = {}) {
+    const rawPool = this._getPipedPool();
     const ordered = this._prioritizePool(rawPool, excludeGateways);
-    const { node, data } = await this._raceNodesInBatches(ordered, async (base) => {
-      const json = await this._fetchJson(`${base}${path}`, {}, 4500);
-      if (validate) return validate(json, base);
-      return json;
-    });
+    const { node, data } = await this._raceNodesInBatches(
+      ordered,
+      async (base) => {
+        const json = await this._fetchJson(`${base}${path}`, {}, timeoutMs);
+        if (validate) return validate(json, base);
+        return json;
+      },
+      3,
+      'piped'
+    );
     this.activeInstance = node;
     this.activeSourceLabel = `${new URL(node).hostname} (без рекламы)`;
     return { base: node, data };
   }
 
-  async _tryInvidiousPool(path, { excludeGateways = new Set(), validate = null } = {}) {
-    const rawPool = await this._getInvidiousPool();
+  async _tryInvidiousPool(path, { excludeGateways = new Set(), validate = null, timeoutMs = 3600 } = {}) {
+    const rawPool = this._getInvidiousPool();
     const ordered = this._prioritizePool(rawPool, excludeGateways);
-    const { node, data } = await this._raceNodesInBatches(ordered, async (base) => {
-      const json = await this._fetchJson(`${base}${path}`, {}, 4500);
-      if (validate) return validate(json, base);
-      return json;
-    });
+    const { node, data } = await this._raceNodesInBatches(
+      ordered,
+      async (base) => {
+        const json = await this._fetchJson(`${base}${path}`, {}, timeoutMs);
+        if (validate) return validate(json, base);
+        return json;
+      },
+      3,
+      'invidious'
+    );
     this.activeSourceLabel = `${new URL(node).hostname} (без рекламы)`;
     return { base: node, data };
   }
 
   async _searchAudius(query = '', trending = false) {
-    const pool = this._prioritizePool(await this._getAudiusPool());
+    const pool = this._prioritizePool(this._getAudiusPool());
     const suffix =
       trending || !query
         ? '/v1/tracks/trending?app_name=Sonora&limit=25'
         : `/v1/tracks/search?query=${encodeURIComponent(query)}&app_name=Sonora`;
 
-    const { data: tracks } = await this._raceNodesInBatches(pool, async (base) => {
-      const json = await this._fetchJson(`${base}${suffix}`, {}, 4500);
-      const rows = Array.isArray(json?.data) ? json.data : [];
-      const normalized = rows.map(normalizeAudiusTrack).filter(Boolean);
-      if (normalized.length === 0) throw new Error('Audius: пустой результат');
-      return normalized;
-    });
+    const { data: tracks } = await this._raceNodesInBatches(
+      pool,
+      async (base) => {
+        const json = await this._fetchJson(`${base}${suffix}`, {}, 3600);
+        const rows = Array.isArray(json?.data) ? json.data : [];
+        const normalized = rows.map(normalizeAudiusTrack).filter(Boolean);
+        if (normalized.length === 0) throw new Error('Audius: пустой результат');
+        return normalized;
+      },
+      3,
+      'audius'
+    );
 
     this.activeSourceLabel = 'Audius Audio (без рекламы)';
     return tracks.map((t) => ({ type: 'track', ...t }));
@@ -521,8 +589,9 @@ export class SonoraApi {
           : DEFAULT_PIPED_INSTANCES.slice(0, 6);
         const { node } = await this._raceNodesInBatches(
           pool,
-          (base) => this._fetchJson(`${base}/suggestions?query=music`, {}, 4000),
-          3
+          (base) => this._fetchJson(`${base}/suggestions?query=music`, {}, 3600),
+          3,
+          'piped'
         );
         return {
           ok: true,
@@ -539,8 +608,9 @@ export class SonoraApi {
       try {
         const { node } = await this._raceNodesInBatches(
           DEFAULT_INVIDIOUS_INSTANCES.slice(0, 6),
-          (base) => this._fetchJson(`${base}/api/v1/stats`, {}, 4000),
-          3
+          (base) => this._fetchJson(`${base}/api/v1/stats`, {}, 3600),
+          3,
+          'invidious'
         );
         return {
           ok: true,
@@ -557,8 +627,9 @@ export class SonoraApi {
       try {
         const { node } = await this._raceNodesInBatches(
           DEFAULT_AUDIUS_NODES,
-          (base) => this._fetchJson(`${base}/v1/tracks/trending?app_name=Sonora&limit=1`, {}, 4000),
-          3
+          (base) => this._fetchJson(`${base}/v1/tracks/trending?app_name=Sonora&limit=1`, {}, 3600),
+          3,
+          'audius'
         );
         return {
           ok: true,
@@ -579,10 +650,42 @@ export class SonoraApi {
     return { piped, invidious, audius };
   }
 
-  async search(rawQuery, filter = 'TRACKS', { isMoodTrending = false } = {}) {
+  async search(rawQuery, filter = 'TRACKS', { isMoodTrending = false, forceFresh = false } = {}) {
     const query = String(rawQuery ?? '').trim();
     if (!query) return [];
 
+    const cacheKey = `${filter}:${query.toLowerCase()}`;
+    if (!forceFresh) {
+      const cached = this.searchCache.get(cacheKey);
+      if (cached && Date.now() - cached.fetchedAt < SEARCH_CACHE_TTL_MS) {
+        return cached.results;
+      }
+    }
+
+    if (this.inflightSearches.has(cacheKey)) {
+      return this.inflightSearches.get(cacheKey);
+    }
+
+    const promise = this._performSearch(query, filter, { isMoodTrending }).then((results) => {
+      if (Array.isArray(results) && results.length > 0) {
+        this.searchCache.set(cacheKey, { fetchedAt: Date.now(), results });
+        if (this.searchCache.size > 40) {
+          const oldestKey = this.searchCache.keys().next().value;
+          this.searchCache.delete(oldestKey);
+        }
+      }
+      return results;
+    });
+
+    this.inflightSearches.set(cacheKey, promise);
+    try {
+      return await promise;
+    } finally {
+      this.inflightSearches.delete(cacheKey);
+    }
+  }
+
+  async _performSearch(query, filter, { isMoodTrending = false } = {}) {
     const directPlaylistId = extractPlaylistId(query, { allowBareId: false });
     if (directPlaylistId) {
       const playlist = await this.getPlaylist(directPlaylistId);
@@ -759,6 +862,12 @@ export class SonoraApi {
   }
 
   async getArtistDetails(artistItem) {
+    const cacheKey = String(artistItem?.channelUrl || artistItem?.id || artistItem?.title || '').trim();
+    const cached = this.artistCache.get(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < ARTIST_CACHE_TTL_MS) {
+      return cached.details;
+    }
+
     const name = String(artistItem?.title || '').trim();
     const channelPath = String(artistItem?.channelUrl || '').trim();
     let avatar = sanitizeHttpsUrl(artistItem?.thumbnailUrl) || '';
@@ -774,28 +883,56 @@ export class SonoraApi {
           .map(normalizePipedTrack)
           .filter(Boolean);
       } catch {
-        // Fallback to search below
+        // Fallback to Invidious channel endpoint below
+      }
+
+      if (tracks.length === 0) {
+        const channelId = channelPath.slice('/channel/'.length).split('/')[0];
+        if (channelId) {
+          try {
+            const { data: inv } = await this._tryInvidiousPool(
+              `/api/v1/channels/${encodeURIComponent(channelId)}`
+            );
+            const thumbs = Array.isArray(inv?.authorThumbnails) ? inv.authorThumbnails : [];
+            avatar = sanitizeHttpsUrl(thumbs[thumbs.length - 1]?.url || thumbs[0]?.url) || avatar;
+            if (inv?.subCount > 0) subText = formatSubscribersRu(inv.subCount);
+            const rawVideos = Array.isArray(inv?.latestVideos)
+              ? inv.latestVideos
+              : Array.isArray(inv?.topVideos)
+                ? inv.topVideos
+                : [];
+            tracks = rawVideos.map(normalizeInvidiousTrack).filter(Boolean);
+          } catch {
+            // Fallback to search by name below
+          }
+        }
       }
     }
 
     if (tracks.length === 0 && name) {
-      const results = await this.search(name, 'TRACKS');
+      const results = await this.search(name, 'TRACKS').catch(() => []);
       tracks = results.filter((r) => r.type === 'track');
     }
 
-    return {
+    const details = {
       title: name,
       subtitle: subText,
       thumbnailUrl: avatar,
       tracks
     };
+    if (cacheKey && tracks.length > 0) {
+      this.artistCache.set(cacheKey, { fetchedAt: Date.now(), details });
+    }
+    return details;
   }
 
   async getSuggestions(query) {
     const clean = String(query ?? '').trim();
     if (clean.length < 2) return [];
     try {
-      const { data } = await this._tryPipedPool(`/suggestions?query=${encodeURIComponent(clean)}`);
+      const { data } = await this._tryPipedPool(`/suggestions?query=${encodeURIComponent(clean)}`, {
+        timeoutMs: 2600
+      });
       return Array.isArray(data) ? data.slice(0, 6) : [];
     } catch {
       return [];
@@ -816,13 +953,71 @@ export class SonoraApi {
   }
 
   async getStreamInfo(videoId, quality = 'HIGH', { excludeGateways = new Set() } = {}) {
+    const excludeKey = Array.from(excludeGateways || []).sort().join(',');
+    const dedupeKey = `${String(videoId || '').trim()}:${quality}:${excludeKey}`;
+
+    if (this.inflightStreams.has(dedupeKey)) {
+      return this.inflightStreams.get(dedupeKey);
+    }
+
+    const promise = this._resolveStreamInfo(videoId, quality, { excludeGateways });
+    this.inflightStreams.set(dedupeKey, promise);
+    try {
+      return await promise;
+    } finally {
+      this.inflightStreams.delete(dedupeKey);
+    }
+  }
+
+  async getOfflineStreamCandidates(videoId, quality = 'HIGH', existingCandidates = []) {
+    const rawId = String(videoId ?? '').trim();
+    const baseList = Array.isArray(existingCandidates) ? existingCandidates.filter(Boolean) : [];
+    const hasCorsFriendly = baseList.some((u) => u.includes('local=true') || u.includes('audius'));
+    if (hasCorsFriendly || rawId.startsWith('aud:')) {
+      return baseList;
+    }
+
+    const cleanId = extractVideoId(rawId);
+    if (!cleanId) return baseList;
+
+    const healthyInvidious = this._prioritizePool(this._getInvidiousPool()).slice(0, 5);
+    const invProxiedUrls = healthyInvidious.map(
+      (base) => `${base}/latest_version?id=${encodeURIComponent(cleanId)}&itag=140&local=true`
+    );
+
+    try {
+      const invInfo = await this._tryInvidiousPool(
+        `/api/v1/videos/${encodeURIComponent(cleanId)}`,
+        {
+          validate: (inv, invBase) => ({
+            proxyUrl: `${invBase}/latest_version?id=${encodeURIComponent(cleanId)}&itag=140&local=true`,
+            fallbackUrls: this._buildStreamCandidates(
+              (Array.isArray(inv?.adaptiveFormats) ? inv.adaptiveFormats : [])
+                .filter((f) => String(f.type || '').startsWith('audio/') && f.url)
+                .map((f) => f.url)
+            )
+          })
+        }
+      );
+      return this._buildStreamCandidates([
+        invInfo?.data?.proxyUrl,
+        ...invProxiedUrls,
+        ...baseList,
+        ...(invInfo?.data?.fallbackUrls || [])
+      ]);
+    } catch {
+      return this._buildStreamCandidates([...invProxiedUrls, ...baseList]);
+    }
+  }
+
+  async _resolveStreamInfo(videoId, quality = 'HIGH', { excludeGateways = new Set() } = {}) {
     const rawId = String(videoId ?? '').trim();
     if (rawId.startsWith('aud:')) {
       const audId = rawId.slice(4);
       if (!/^[A-Za-z0-9_-]{3,32}$/.test(audId)) {
         throw new Error('Некорректный идентификатор трека Audius');
       }
-      const pool = this._prioritizePool(await this._getAudiusPool());
+      const pool = this._prioritizePool(this._getAudiusPool());
       const candidates = this._buildStreamCandidates(
         pool.map((base) => `${base}/v1/tracks/${encodeURIComponent(audId)}/stream?app_name=Sonora`)
       );
@@ -984,9 +1179,15 @@ export class SonoraApi {
     const playlistId = extractPlaylistId(rawPlaylistInput);
     if (!playlistId) throw new Error('Некорректная ссылка или ID плейлиста YouTube');
 
+    const cached = this.playlistCache.get(playlistId);
+    if (cached && Date.now() - cached.fetchedAt < PLAYLIST_CACHE_TTL_MS) {
+      return cached.playlist;
+    }
+
+    let playlist = null;
     try {
       const { data } = await this._tryPipedPool(`/playlists/${encodeURIComponent(playlistId)}`);
-      return {
+      playlist = {
         id: playlistId,
         title: data.name || 'Плейлист YouTube',
         author: data.uploader || 'YouTube Music',
@@ -1000,7 +1201,7 @@ export class SonoraApi {
       const { data: inv } = await this._tryInvidiousPool(
         `/api/v1/playlists/${encodeURIComponent(playlistId)}`
       );
-      return {
+      playlist = {
         id: playlistId,
         title: inv.title || 'Плейлист YouTube Music',
         author: inv.author || 'YouTube Music',
@@ -1011,51 +1212,85 @@ export class SonoraApi {
           .filter(Boolean)
       };
     }
+
+    if (playlist && playlist.tracks.length > 0) {
+      this.playlistCache.set(playlistId, { fetchedAt: Date.now(), playlist });
+    }
+    return playlist;
   }
 
-  async fetchLyrics(track) {
-    if (!track?.title) return { synced: [], plain: '', source: '' };
-    const cleanTitle = String(track.title)
-      .replace(/\(official.*?\)|\[official.*?\]|\(lyrics\)|\[lyrics\]|\(audio\)/gi, '')
-      .trim();
-    const cleanArtist = String(track.artist || '')
-      .replace(/ - Topic$/i, '')
-      .trim();
+  async fetchLyrics(track, customQuery = '') {
+    const manual = String(customQuery || '').trim();
+    if (!track?.title && !manual) return { synced: [], plain: '', source: '' };
 
-    try {
-      const params = new URLSearchParams({
-        track_name: cleanTitle,
-        artist_name: cleanArtist
-      });
-      if (track.durationSeconds > 0) {
-        params.set('duration', String(Math.round(track.durationSeconds)));
+    const parsed = parseLyricsTrackQuery(track?.title || '', track?.artist || '');
+    const exactAttempts = [];
+
+    if (!manual) {
+      if (parsed.artist && parsed.title) {
+        exactAttempts.push({ artist: parsed.artist, title: parsed.title });
       }
-      const exact = await this._fetchJson(`https://lrclib.net/api/get?${params.toString()}`, {}, 5500);
-      const synced = parseLrcLines(exact.syncedLyrics || '');
-      if (synced.length > 0 || exact.plainLyrics) {
-        return { synced, plain: exact.plainLyrics || '', source: 'LRCLIB' };
+      if (
+        parsed.fallbackTitle &&
+        (parsed.fallbackTitle !== parsed.title || parsed.fallbackArtist !== parsed.artist)
+      ) {
+        exactAttempts.push({ artist: parsed.fallbackArtist, title: parsed.fallbackTitle });
       }
-    } catch {
-      // Fallback to search endpoint
     }
 
-    try {
-      const q = `${cleanArtist} ${cleanTitle}`.trim();
-      const results = await this._fetchJson(
-        `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`,
-        {},
-        5500
-      );
-      if (Array.isArray(results) && results.length > 0) {
-        const best = results.find((r) => r.syncedLyrics) || results[0];
-        return {
-          synced: parseLrcLines(best.syncedLyrics || ''),
-          plain: best.plainLyrics || '',
-          source: 'LRCLIB'
-        };
+    for (const pair of exactAttempts) {
+      if (!pair.title || !pair.artist) continue;
+      try {
+        const params = new URLSearchParams({
+          track_name: pair.title,
+          artist_name: pair.artist
+        });
+        if (track?.durationSeconds > 0) {
+          params.set('duration', String(Math.round(track.durationSeconds)));
+        }
+        const exact = await this._fetchJson(`https://lrclib.net/api/get?${params.toString()}`, {}, 4500);
+        const synced = parseLrcLines(exact.syncedLyrics || '');
+        if (synced.length > 0 || exact.plainLyrics) {
+          return { synced, plain: exact.plainLyrics || '', source: 'LRCLIB' };
+        }
+      } catch {
+        // Try next pair or search endpoint
       }
-    } catch {
-      // No lyrics found
+    }
+
+    const searchQueries = manual
+      ? [manual]
+      : Array.from(
+          new Set(
+            [
+              `${parsed.artist} ${parsed.title}`.trim(),
+              parsed.title,
+              `${parsed.fallbackArtist} ${parsed.fallbackTitle}`.trim()
+            ].filter(Boolean)
+          )
+        );
+
+    for (const q of searchQueries) {
+      try {
+        const results = await this._fetchJson(
+          `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`,
+          {},
+          4500
+        );
+        if (Array.isArray(results) && results.length > 0) {
+          const best = results.find((r) => r.syncedLyrics) || results[0];
+          const synced = parseLrcLines(best.syncedLyrics || '');
+          if (synced.length > 0 || best.plainLyrics) {
+            return {
+              synced,
+              plain: best.plainLyrics || '',
+              source: 'LRCLIB'
+            };
+          }
+        }
+      } catch {
+        // Try next query
+      }
     }
 
     return { synced: [], plain: '', source: '' };

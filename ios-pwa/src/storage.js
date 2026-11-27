@@ -18,6 +18,8 @@ const KEY_ACCOUNT = 'account_state_v1';
 const KEY_AFFINITIES = 'taste_affinities_v1';
 const KEY_OFFLINE = 'offline_tracks_v1';
 const KEY_DEVICE_KEY = 'device_aes_key_v1';
+const KEY_HOME_CACHE = 'home_swr_cache_v1';
+const KEY_FAST_NODES = 'fast_nodes_v1';
 
 const DEFAULT_SETTINGS = {
   audioQuality: 'HIGH',
@@ -105,6 +107,8 @@ export class SonoraStorage {
     this.activeAccountId = '';
     this.affinities = [];
     this.downloadedTracks = [];
+    this.homeCache = {};
+    this.fastNodes = { piped: '', invidious: '', audius: '' };
   }
 
   get activeAccount() {
@@ -184,15 +188,37 @@ export class SonoraStorage {
       this.db = null;
     }
 
-    const [savedLib, savedSettings, savedPlayback, savedAccountState, savedAffinities, savedOffline] =
-      await Promise.all([
-        this._read(KEY_LIBRARY),
-        this._read(KEY_SETTINGS),
-        this._read(KEY_PLAYBACK),
-        this._read(KEY_ACCOUNT),
-        this._read(KEY_AFFINITIES),
-        this._read(KEY_OFFLINE)
-      ]);
+    const [
+      savedLib,
+      savedSettings,
+      savedPlayback,
+      savedAccountState,
+      savedAffinities,
+      savedOffline,
+      savedHomeCache,
+      savedFastNodes
+    ] = await Promise.all([
+      this._read(KEY_LIBRARY),
+      this._read(KEY_SETTINGS),
+      this._read(KEY_PLAYBACK),
+      this._read(KEY_ACCOUNT),
+      this._read(KEY_AFFINITIES),
+      this._read(KEY_OFFLINE),
+      this._read(KEY_HOME_CACHE),
+      this._read(KEY_FAST_NODES)
+    ]);
+
+    if (savedHomeCache && typeof savedHomeCache === 'object') {
+      this.homeCache = savedHomeCache;
+    }
+
+    if (savedFastNodes && typeof savedFastNodes === 'object') {
+      this.fastNodes = {
+        piped: sanitizeOptionalApiUrl(savedFastNodes.piped),
+        invidious: sanitizeOptionalApiUrl(savedFastNodes.invidious),
+        audius: sanitizeOptionalApiUrl(savedFastNodes.audius)
+      };
+    }
 
     if (savedLib && typeof savedLib === 'object') {
       this.library = {
@@ -360,6 +386,43 @@ export class SonoraStorage {
     await this._saveLibrary();
   }
 
+  async removeSearchHistoryItem(query) {
+    const clean = String(query ?? '').trim().toLowerCase();
+    if (!clean) return;
+    this.library.searchHistory = this.library.searchHistory.filter(
+      (q) => q.toLowerCase() !== clean
+    );
+    await this._saveLibrary();
+  }
+
+  getCachedHomeMood(moodId) {
+    const entry = this.homeCache?.[moodId];
+    if (!entry || !Array.isArray(entry.tracks)) return null;
+    return {
+      updatedAt: Number(entry.updatedAt) || 0,
+      tracks: entry.tracks
+    };
+  }
+
+  async saveCachedHomeMood(moodId, tracks = []) {
+    if (!moodId || !Array.isArray(tracks) || tracks.length === 0) return;
+    const clean = tracks.map(sanitizeTrack).filter(Boolean).slice(0, 60);
+    if (clean.length === 0) return;
+    this.homeCache = {
+      ...this.homeCache,
+      [moodId]: { updatedAt: Date.now(), tracks: clean }
+    };
+    await this._write(KEY_HOME_CACHE, this.homeCache);
+  }
+
+  async saveFastNode(kind, baseUrl) {
+    if (!kind || !['piped', 'invidious', 'audius'].includes(kind)) return;
+    const clean = sanitizeOptionalApiUrl(baseUrl);
+    if (!clean || this.fastNodes[kind] === clean) return;
+    this.fastNodes = { ...this.fastNodes, [kind]: clean };
+    await this._write(KEY_FAST_NODES, this.fastNodes);
+  }
+
   async createPlaylist(name, description = '', tracks = [], youtubePlaylistId = null) {
     const cleanName = String(name ?? '').trim().slice(0, 120);
     if (!cleanName) throw new Error('Введите название плейлиста');
@@ -428,6 +491,52 @@ export class SonoraStorage {
     pl.tracks = pl.tracks.filter((t) => t.id !== trackId);
     pl.updatedAt = Date.now();
     await this._saveLibrary();
+  }
+
+  async moveTrackInPlaylist(playlistId, fromIndex, toIndex) {
+    const pl = this.library.playlists.find((p) => p.id === playlistId);
+    if (!pl || !Array.isArray(pl.tracks)) return false;
+    if (
+      fromIndex < 0 ||
+      toIndex < 0 ||
+      fromIndex >= pl.tracks.length ||
+      toIndex >= pl.tracks.length ||
+      fromIndex === toIndex
+    ) {
+      return false;
+    }
+    const next = [...pl.tracks];
+    const [item] = next.splice(fromIndex, 1);
+    next.splice(toIndex, 0, item);
+    pl.tracks = next;
+    pl.updatedAt = Date.now();
+    await this._saveLibrary();
+    return true;
+  }
+
+  async sortPlaylistTracks(playlistId, mode = 'TITLE') {
+    const pl = this.library.playlists.find((p) => p.id === playlistId);
+    if (!pl || !Array.isArray(pl.tracks) || pl.tracks.length < 2) return false;
+    const copy = [...pl.tracks];
+    if (mode === 'TITLE') {
+      copy.sort((a, b) => (a.title || '').localeCompare(b.title || '', 'ru'));
+    } else if (mode === 'ARTIST') {
+      copy.sort(
+        (a, b) =>
+          (a.artist || '').localeCompare(b.artist || '', 'ru') ||
+          (a.title || '').localeCompare(b.title || '', 'ru')
+      );
+    } else if (mode === 'DURATION') {
+      copy.sort((a, b) => (Number(a.durationSeconds) || 0) - (Number(b.durationSeconds) || 0));
+    } else if (mode === 'REVERSE') {
+      copy.reverse();
+    } else {
+      return false;
+    }
+    pl.tracks = copy;
+    pl.updatedAt = Date.now();
+    await this._saveLibrary();
+    return true;
   }
 
   async renamePlaylist(playlistId, name, description = '') {

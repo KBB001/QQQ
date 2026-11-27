@@ -1,10 +1,12 @@
 import {
   MOOD_CHIPS,
   SonoraApi,
-  extractPlaylistId
+  extractPlaylistId,
+  extractVideoId
 } from './api.js';
 import {
   YOUTUBE_DIRECT_EXPORT_SNIPPET,
+  YOUTUBE_EXPORT_BOOKMARKLET,
   buildAddToPlaylistModalHtml,
   buildAddTracksPickerModalHtml,
   buildCatalogSourcesModalHtml,
@@ -13,6 +15,7 @@ import {
   buildDeletePlaylistModalHtml,
   buildEncryptExportModalHtml,
   buildImportPlaylistModalHtml,
+  buildMixPreviewModalHtml,
   buildQueueModalHtml,
   buildRemotePlaylistModalHtml,
   buildRenamePlaylistModalHtml,
@@ -27,7 +30,8 @@ import {
   BackupCipher,
   escapeHtml,
   parseExternalYouTubeImport,
-  sanitizeHttpsUrl
+  sanitizeHttpsUrl,
+  sanitizeTrack
 } from './security.js';
 import { SonoraStorage } from './storage.js';
 
@@ -51,48 +55,12 @@ const SVG = {
 };
 
 const GENRE_DISCOVERY_CARDS = [
-  {
-    query: 'Lo-Fi радио',
-    title: 'Lo-Fi радио',
-    subtitle: 'Бесконечный поток кассетного уюта',
-    badge: 'ХИТ',
-    variant: 'warm'
-  },
-  {
-    query: 'Акустический инди',
-    title: 'Акустический инди',
-    subtitle: 'Живые гитары и камерный вокал',
-    badge: 'НОВИНКА',
-    variant: 'teal'
-  },
-  {
-    query: 'Джаз пиано',
-    title: 'Джаз пиано',
-    subtitle: 'Ночной джаз-клуб в центре города',
-    badge: 'VIBE',
-    variant: 'violet'
-  },
-  {
-    query: 'Synthwave',
-    title: 'Synthwave',
-    subtitle: 'Ночной неон и глубокий бас',
-    badge: 'LIVE',
-    variant: 'emerald'
-  },
-  {
-    query: 'Hans Zimmer soundtrack',
-    title: 'Hans Zimmer',
-    subtitle: 'Эпические саундтреки и оркестр',
-    badge: 'КИНО',
-    variant: 'amber'
-  },
-  {
-    query: 'Daft Punk',
-    title: 'Daft Punk',
-    subtitle: 'Электронная классика и грув',
-    badge: 'ЭЛЕКТРО',
-    variant: 'cobalt'
-  }
+  { query: 'Lo-Fi радио', title: 'Lo-Fi радио', subtitle: 'Бесконечный поток кассетного уюта', badge: 'ХИТ', variant: 'warm' },
+  { query: 'Акустический инди', title: 'Акустический инди', subtitle: 'Живые гитары и камерный вокал', badge: 'НОВИНКА', variant: 'teal' },
+  { query: 'Джаз пиано', title: 'Джаз пиано', subtitle: 'Ночной джаз-клуб в центре города', badge: 'VIBE', variant: 'violet' },
+  { query: 'Synthwave', title: 'Synthwave', subtitle: 'Ночной неон и глубокий бас', badge: 'LIVE', variant: 'emerald' },
+  { query: 'Hans Zimmer soundtrack', title: 'Hans Zimmer', subtitle: 'Эпические саундтреки и оркестр', badge: 'КИНО', variant: 'amber' },
+  { query: 'Daft Punk', title: 'Daft Punk', subtitle: 'Электронная классика и грув', badge: 'ЭЛЕКТРО', variant: 'cobalt' }
 ];
 
 function formatTime(sec) {
@@ -100,10 +68,9 @@ function formatTime(sec) {
   const h = Math.floor(s / 3600);
   const m = Math.floor((s % 3600) / 60);
   const rem = s % 60;
-  if (h > 0) {
-    return `${h}:${String(m).padStart(2, '0')}:${String(rem).padStart(2, '0')}`;
-  }
-  return `${m}:${String(rem).padStart(2, '0')}`;
+  return h > 0
+    ? `${h}:${String(m).padStart(2, '0')}:${String(rem).padStart(2, '0')}`
+    : `${m}:${String(rem).padStart(2, '0')}`;
 }
 
 function formatTotalDurationRu(tracks = []) {
@@ -123,11 +90,21 @@ function getSafeThumb(trackOrUrl) {
   return sanitizeHttpsUrl(url) || 'icons/icon-192.png';
 }
 
+function sameTrackList(a = [], b = []) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i]?.id !== b[i]?.id) return false;
+  }
+  return true;
+}
+
 class SonoraApp {
   constructor() {
     this.storage = new SonoraStorage();
     this.api = new SonoraApi(() => ({
-      customApiBaseUrl: this.storage.settings.customApiBaseUrl
+      customApiBaseUrl: this.storage.settings.customApiBaseUrl,
+      fastNodes: this.storage.fastNodes,
+      onFastNode: (kind, url) => this.storage.saveFastNode(kind, url)
     }));
     this.offline = new SonoraOfflineManager(this.storage);
     this.recommendations = new SmartRecommendationEngine({
@@ -140,6 +117,7 @@ class SonoraApp {
       activeTab: 'home',
       homeMood: 'ALL',
       homeLoading: false,
+      homeRefreshing: false,
       homeError: '',
       homeTracks: [],
       searchQuery: '',
@@ -153,19 +131,17 @@ class SonoraApp {
       librarySubtab: 'playlists',
       selectedPlaylistId: null,
       playlistFilter: '',
-      pickerState: {
-        playlistId: null,
-        tab: 'search',
-        query: '',
-        results: [],
-        loading: false
-      },
+      playlistEditMode: false,
+      pickerState: { playlistId: null, tab: 'search', query: '', results: [], loading: false },
       ytModalStatusMsg: '',
       catalogDiagnosticsHtml: '',
       playerExpanded: false,
       playerLyricsOpen: false,
+      lyricsManualOpen: false,
+      lyricsManualQuery: '',
       isScrubbing: false,
       scrubValue: 0,
+      batchOfflineState: null,
       installDismissed: localStorage.getItem('sonora_ios_install_dismissed') === '1',
       swUpdateWaiting: null,
       appVersionLabel: 'PWA (GitHub Pages)'
@@ -175,15 +151,25 @@ class SonoraApp {
     this.renderedPlaylists = new Map();
     this.renderedArtists = new Map();
     this.renderedMixes = new Map();
+    this.activeRemotePlaylist = null;
     this.toastTimer = null;
     this.suggestTimer = null;
     this.swRegistration = null;
+    this._homeLoadSeq = 0;
+    this._lyricsTouchLockUntil = 0;
+    this._batchOfflineController = null;
   }
 
   async init() {
     await this.storage.init();
     this.recommendations.tasteTracker.rehydrate();
     this.applyTheme(this.storage.settings.themeMode);
+
+    // Hydrate cached home immediately before rendering so first paint is instant
+    const cachedHome = this.storage.getCachedHomeMood('ALL');
+    if (cachedHome?.tracks?.length > 0) {
+      this.state.homeTracks = cachedHome.tracks;
+    }
 
     this.player = new SonoraPlayer({
       api: this.api,
@@ -198,6 +184,9 @@ class SonoraApp {
     this.registerServiceWorker();
     this.renderBanner();
     this.render();
+
+    // Non-blocking background node discovery + SWR revalidation
+    this.api.warmUpPools().catch(() => {});
     this.loadHomeMood('ALL');
   }
 
@@ -265,6 +254,21 @@ class SonoraApp {
     const slot = document.getElementById('banner-slot');
     if (!slot) return;
 
+    if (this.state.batchOfflineState) {
+      const b = this.state.batchOfflineState;
+      slot.innerHTML = `
+        <div class="ios-banner">
+          <div class="ios-banner-text">
+            <div class="ios-banner-title">Оффлайн-загрузка: ${b.done} из ${b.total}</div>
+            <div class="ios-banner-sub">${escapeHtml(b.currentTitle || 'Подготовка…')} ${b.percent > 0 ? `(${b.percent}%)` : ''}</div>
+            <div class="batch-progress-bar"><div class="batch-progress-fill" style="width:${Math.round((b.done / Math.max(1, b.total)) * 100)}%"></div></div>
+          </div>
+          <button type="button" class="btn-close-sm" data-action="cancel-batch-offline" aria-label="Отменить загрузку">✕</button>
+        </div>
+      `;
+      return;
+    }
+
     if (this.state.swUpdateWaiting) {
       slot.innerHTML = `
         <div class="ios-banner">
@@ -296,22 +300,54 @@ class SonoraApp {
     slot.innerHTML = '';
   }
 
-  async loadHomeMood(moodId) {
+  async loadHomeMood(moodId, { forceFresh = false } = {}) {
+    const seq = ++this._homeLoadSeq;
     this.state.homeMood = moodId;
-    this.state.homeLoading = true;
     this.state.homeError = '';
+
+    const cached = this.storage.getCachedHomeMood(moodId);
+    const hasCache = Boolean(cached?.tracks?.length > 0);
+    if (hasCache && !forceFresh) {
+      this.state.homeTracks = cached.tracks;
+      this.state.homeLoading = false;
+      this.state.homeRefreshing = true;
+    } else {
+      this.state.homeLoading = true;
+      this.state.homeRefreshing = false;
+    }
+
     if (this.state.activeTab === 'home') this.renderMain();
 
     const mood = MOOD_CHIPS.find((m) => m.id === moodId) || MOOD_CHIPS[0];
     try {
-      const items = await this.api.search(mood.query, 'TRACKS', { isMoodTrending: true });
-      this.state.homeTracks = items.filter((i) => i.type === 'track');
+      const items = await this.api.search(mood.query, 'TRACKS', {
+        isMoodTrending: true,
+        forceFresh
+      });
+      if (this._homeLoadSeq !== seq) return;
+      const freshTracks = items.filter((i) => i.type === 'track');
       this.state.homeLoading = false;
+      this.state.homeRefreshing = false;
+
+      if (freshTracks.length > 0) {
+        const changed = !sameTrackList(this.state.homeTracks, freshTracks);
+        this.state.homeTracks = freshTracks;
+        await this.storage.saveCachedHomeMood(moodId, freshTracks);
+        if (this.state.activeTab === 'home' && (changed || !hasCache)) {
+          this.renderMain();
+        }
+      } else if (this.state.activeTab === 'home') {
+        this.renderMain();
+      }
     } catch (err) {
+      if (this._homeLoadSeq !== seq) return;
       this.state.homeLoading = false;
-      this.state.homeError = err?.message || 'Не удалось загрузить подборку';
+      this.state.homeRefreshing = false;
+      if (!hasCache || this.state.homeTracks.length === 0) {
+        this.state.homeError = err?.message || 'Не удалось загрузить подборку';
+      }
+      if (this.state.activeTab === 'home') this.renderMain();
     }
-    if (this.state.activeTab === 'home') this.renderMain();
   }
 
   async runSearch(query, filter = this.state.searchFilter) {
@@ -404,8 +440,11 @@ class SonoraApp {
     if (this.state.playerExpanded) {
       const sheet = document.getElementById('player-sheet');
       const snap = this.player.getSnapshot();
-      const expectedKey = `${snap.currentTrack?.id || ''}:${snap.sourceType || snap.engine}:${snap.isOfflineSource ? 'off' : 'on'}:${this.state.playerLyricsOpen ? 'lyr' : 'art'}`;
-      if (sheet && sheet.dataset.renderKey === expectedKey && !this.state.playerLyricsOpen) {
+      const lyrSig = this.state.playerLyricsOpen
+        ? `lyr:${snap.lyrics.loading ? 'load' : snap.lyrics.synced.length}:${snap.lyrics.plain ? 1 : 0}:${this.state.lyricsManualOpen ? 1 : 0}`
+        : 'art';
+      const expectedKey = `${snap.currentTrack?.id || ''}:${snap.sourceType || snap.engine}:${snap.isOfflineSource ? 'off' : 'on'}:${lyrSig}`;
+      if (sheet && sheet.dataset.renderKey === expectedKey) {
         this.updateFastPlayerProgress(snap);
       } else if (sheet) {
         this.renderPlayerSheet();
@@ -427,11 +466,39 @@ class SonoraApp {
     if (curLabel && !this.state.isScrubbing) curLabel.textContent = formatTime(snap.currentTime);
     if (durLabel) durLabel.textContent = formatTime(snap.duration);
     if (playBtn) {
-      playBtn.innerHTML = snap.isPlaying ? SVG.pause : SVG.play;
+      const wantPlaying = snap.isPlaying ? '1' : '0';
+      if (playBtn.dataset.playing !== wantPlaying) {
+        playBtn.dataset.playing = wantPlaying;
+        playBtn.innerHTML = snap.isPlaying ? SVG.pause : SVG.play;
+        playBtn.setAttribute('aria-label', snap.isPlaying ? 'Пауза' : 'Играть');
+      }
     }
     if (sleepLabel) {
       sleepLabel.textContent =
         snap.sleepRemainingMs > 0 ? `${Math.ceil(snap.sleepRemainingMs / 60000)} м` : 'Таймер';
+    }
+
+    if (this.state.playerLyricsOpen && snap.lyrics?.synced?.length > 0) {
+      const panel = document.getElementById('lyrics-panel');
+      if (panel) {
+        let activeIdx = -1;
+        for (let i = 0; i < snap.lyrics.synced.length; i++) {
+          if (snap.currentTime + 0.35 >= snap.lyrics.synced[i].timeSeconds) activeIdx = i;
+          else break;
+        }
+        const prevIdx = Number(panel.dataset.activeIdx ?? -2);
+        if (activeIdx !== prevIdx) {
+          panel.dataset.activeIdx = String(activeIdx);
+          const lines = panel.querySelectorAll('.lyric-line');
+          if (prevIdx >= 0 && lines[prevIdx]) lines[prevIdx].classList.remove('active');
+          if (activeIdx >= 0 && lines[activeIdx]) {
+            lines[activeIdx].classList.add('active');
+            if (Date.now() > this._lyricsTouchLockUntil) {
+              lines[activeIdx].scrollIntoView?.({ block: 'center', behavior: 'smooth' });
+            }
+          }
+        }
+      }
     }
   }
 
@@ -523,12 +590,41 @@ class SonoraApp {
     return `<img src="${escapeHtml(getSafeThumb(tracks[0]))}" alt="" class="${sizeClass}" loading="lazy" />`;
   }
 
-  _renderTrackRowHtml(track, listKey = 'default', idx = 0, { showIndex = false } = {}) {
+  _renderTrackRowHtml(
+    track,
+    listKey = 'default',
+    idx = 0,
+    { showIndex = false, playlistEditPid = null, totalCount = 0 } = {}
+  ) {
     this._registerTrack(track);
     const active = this.player?.currentTrack?.id === track.id;
     const isFav = this.storage.isFavorite(track.id);
     const isOffline = this.offline.isDownloaded(track.id);
+    const isDownloading = this.offline.isDownloading(track.id);
+    const prog = isDownloading ? this.offline.getProgress(track.id) : null;
     const dur = track.durationSeconds ? formatTime(track.durationSeconds) : '';
+
+    const trailingActions = playlistEditPid
+      ? `
+        ${idx > 0 ? `<button type="button" class="track-more-btn" data-action="pl-move-up" data-playlist-id="${playlistEditPid}" data-index="${idx}" aria-label="Выше">↑</button>` : ''}
+        ${idx + 1 < totalCount ? `<button type="button" class="track-more-btn" data-action="pl-move-down" data-playlist-id="${playlistEditPid}" data-index="${idx}" aria-label="Ниже">↓</button>` : ''}
+        <button type="button" class="track-more-btn danger-text" data-action="pl-remove-track" data-playlist-id="${playlistEditPid}" data-track-id="${escapeHtml(track.id)}" aria-label="Удалить">✕</button>
+      `
+      : `
+        <button type="button" class="track-more-btn ${isFav ? 'fav-active' : ''}" data-action="toggle-favorite" data-track-id="${escapeHtml(track.id)}" aria-label="Нравится">
+          ${isFav ? SVG.heart : SVG.heartOutline}
+        </button>
+        <button type="button" class="track-more-btn" data-action="open-track-menu" data-track-id="${escapeHtml(track.id)}" aria-label="Действия с треком">
+          ${SVG.more}
+        </button>
+      `;
+
+    const badge = isDownloading
+      ? `<span class="dl-pct-badge" data-dl-track="${escapeHtml(track.id)}">${prog?.percent > 0 ? `${prog.percent}%` : '…'}</span>`
+      : isOffline
+        ? `<span class="offline-dot" title="Доступно оффлайн">${SVG.checkCircle}</span>`
+        : '';
+
     return `
       <div class="track-row ${active ? 'active-track' : ''}" data-track-id="${escapeHtml(track.id)}" data-list-key="${escapeHtml(listKey)}" data-index="${idx}">
         ${showIndex ? `<span class="track-index-num">${idx + 1}</span>` : ''}
@@ -536,16 +632,11 @@ class SonoraApp {
         <button type="button" class="track-meta" data-action="play-track" data-track-id="${escapeHtml(track.id)}" data-list-key="${escapeHtml(listKey)}">
           <div class="track-title">
             ${escapeHtml(track.title)}
-            ${isOffline ? `<span class="offline-dot" title="Доступно оффлайн">${SVG.checkCircle}</span>` : ''}
+            ${badge}
           </div>
           <div class="track-sub">${escapeHtml(track.artist)}${dur ? ` • ${escapeHtml(dur)}` : ''}</div>
         </button>
-        <button type="button" class="track-more-btn ${isFav ? 'fav-active' : ''}" data-action="toggle-favorite" data-track-id="${escapeHtml(track.id)}" aria-label="Нравится">
-          ${isFav ? SVG.heart : SVG.heartOutline}
-        </button>
-        <button type="button" class="track-more-btn" data-action="open-track-menu" data-track-id="${escapeHtml(track.id)}" aria-label="Действия с треком">
-          ${SVG.more}
-        </button>
+        ${trailingActions}
       </div>
     `;
   }
@@ -584,7 +675,12 @@ class SonoraApp {
     const { dailyMixTracks, dailyMixSubtitle, madeForYou } =
       this.recommendations.buildPersonalizedMixes(this.state.homeTracks);
     if (dailyMixTracks.length > 0) {
-      this.renderedMixes.set('daily', dailyMixTracks);
+      this.renderedMixes.set('daily', {
+        id: 'daily',
+        title: 'Микс дня',
+        subtitle: dailyMixSubtitle,
+        tracks: dailyMixTracks
+      });
     }
 
     let heroHtml = '';
@@ -612,7 +708,8 @@ class SonoraApp {
             <h2 class="hero-title">Персональный поток</h2>
             <p class="hero-sub">${escapeHtml(dailyMixSubtitle)}</p>
             <div class="hero-actions">
-              <button type="button" class="btn-accent-sm" data-action="play-mix" data-mix-id="daily">Слушать микс</button>
+              <button type="button" class="btn-accent-sm" data-action="play-mix" data-mix-id="daily">Слушать</button>
+              <button type="button" class="icon-pill-btn" data-action="open-mix" data-mix-id="daily">Список</button>
             </div>
           </div>
         </div>`;
@@ -627,9 +724,9 @@ class SonoraApp {
       <div class="h-strip">
         ${madeForYou
           .map((mix) => {
-            this.renderedMixes.set(mix.id, mix.tracks);
+            this.renderedMixes.set(mix.id, mix);
             return `
-            <button type="button" class="square-card" data-action="play-mix" data-mix-id="${escapeHtml(mix.id)}">
+            <button type="button" class="square-card" data-action="open-mix" data-mix-id="${escapeHtml(mix.id)}">
               ${this._renderCollageHtml(mix.tracks, 'square-thumb')}
               <div class="square-title">${escapeHtml(mix.title)}</div>
               <div class="square-sub">${escapeHtml(mix.subtitle)}</div>
@@ -705,7 +802,7 @@ class SonoraApp {
 
     let feedHtml = '';
     if (this.state.homeLoading && feedTracks.length === 0) {
-      feedHtml = `<div class="state-card"><h3>Загрузка музыки…</h3><p>Подбираем треки для вас (${escapeHtml(this.api.activeSourceLabel)})</p></div>`;
+      feedHtml = `<div class="state-card"><h3>Загрузка музыки…</h3><p>Подбираем треки (${escapeHtml(this.api.activeSourceLabel)})</p></div>`;
     } else if (this.state.homeError && feedTracks.length === 0) {
       feedHtml = `
         <div class="state-card">
@@ -732,12 +829,111 @@ class SonoraApp {
       <div class="section-header">
         <div>
           <h2 class="section-title">Подборка дня</h2>
-          <div class="section-sub-badge">${escapeHtml(this.api.activeSourceLabel)}</div>
+          <div class="section-sub-badge">${escapeHtml(this.api.activeSourceLabel)}${this.state.homeRefreshing ? ' • обновление…' : ''}</div>
         </div>
         ${feedTracks.length > 0 ? `<button type="button" class="section-action" data-action="play-all-home">Включить всё</button>` : ''}
       </div>
       ${feedHtml}
     `;
+  }
+
+  renderSearchSuggestionsHtml() {
+    if (this.state.searchSuggestions.length === 0 || this.state.searchLoading) return '';
+    return `<div class="chips-row">${this.state.searchSuggestions
+      .map(
+        (s) =>
+          `<button type="button" class="chip-btn" data-action="run-saved-query" data-query="${escapeHtml(s)}">${escapeHtml(s)}</button>`
+      )
+      .join('')}</div>`;
+  }
+
+  renderSearchBodyHtml() {
+    if (this.state.searchLoading) {
+      return `<div class="state-card"><h3>Поиск…</h3><p>Ищем треки и плейлисты</p></div>`;
+    }
+    if (this.state.searchError) {
+      return `
+        <div class="state-card">
+          <h3>Ошибка поиска</h3>
+          <p>${escapeHtml(this.state.searchError)}</p>
+          <div class="action-pills-row">
+            <button type="button" class="btn-accent-sm" data-action="retry-search">Повторить</button>
+            <button type="button" class="icon-pill-btn" data-action="open-routing-modal">Источники каталога</button>
+          </div>
+        </div>`;
+    }
+    if (!this.state.searchQuery && this.state.searchFilter !== 'LOCAL') {
+      const hist = this.storage.library.searchHistory;
+      const recentHtml =
+        hist.length > 0
+          ? `
+        <div class="section-header">
+          <h2 class="section-title">Недавние запросы</h2>
+          <button type="button" class="section-action" data-action="clear-search-history">Очистить</button>
+        </div>
+        <div class="chips-row">
+          ${hist
+            .map(
+              (q) => `
+              <div class="chip-pill-group">
+                <button type="button" class="chip-pill-main" data-action="run-saved-query" data-query="${escapeHtml(q)}">${escapeHtml(q)}</button>
+                <button type="button" class="chip-pill-del" data-action="delete-search-query" data-query="${escapeHtml(q)}" aria-label="Удалить запрос">✕</button>
+              </div>`
+            )
+            .join('')}
+        </div>`
+          : '';
+
+      const genresHtml = `
+        <div class="section-header">
+          <h2 class="section-title">Жанры и подборки</h2>
+        </div>
+        <div class="genre-grid">
+          ${GENRE_DISCOVERY_CARDS.map(
+            (card) => `
+            <button type="button" class="genre-card variant-${card.variant}" data-action="run-saved-query" data-query="${escapeHtml(card.query)}">
+              <span class="genre-badge">${escapeHtml(card.badge)}</span>
+              <div class="genre-title">${escapeHtml(card.title)}</div>
+              <div class="genre-sub">${escapeHtml(card.subtitle)}</div>
+            </button>`
+          ).join('')}
+        </div>`;
+
+      return `${recentHtml}${genresHtml}`;
+    }
+
+    if (this.state.searchResults.length === 0) {
+      return `<div class="state-card"><h3>Ничего не найдено</h3><p>Попробуйте изменить запрос или фильтр.</p></div>`;
+    }
+
+    const rows = this.state.searchResults
+      .map((item, idx) => {
+        if (item.type === 'playlist') {
+          this.renderedPlaylists.set(item.id, item);
+          return `
+            <button type="button" class="track-row" data-action="open-remote-playlist" data-remote-id="${escapeHtml(item.id)}">
+              <img src="${escapeHtml(getSafeThumb(item))}" alt="" class="track-thumb" loading="lazy" />
+              <div class="track-meta">
+                <div class="track-title">${escapeHtml(item.title)}</div>
+                <div class="track-sub">${escapeHtml(item.artist)}${item.trackCount ? ` • ${item.trackCount} треков` : ''}</div>
+              </div>
+            </button>`;
+        }
+        if (item.type === 'artist') {
+          this.renderedArtists.set(item.id, item);
+          return `
+            <button type="button" class="track-row" data-action="open-artist" data-artist-id="${escapeHtml(item.id)}">
+              <img src="${escapeHtml(getSafeThumb(item))}" alt="" class="track-thumb round" loading="lazy" />
+              <div class="track-meta">
+                <div class="track-title">${escapeHtml(item.title)}</div>
+                <div class="track-sub">${escapeHtml(item.artist)}</div>
+              </div>
+            </button>`;
+        }
+        return this._renderTrackRowHtml(item, 'search', idx);
+      })
+      .join('');
+    return `<div class="grouped-card">${rows}</div>`;
   }
 
   renderSearchHtml() {
@@ -786,97 +982,6 @@ class SonoraApp {
           .join('')}
       </div>`;
 
-    const suggestionsHtml =
-      this.state.searchSuggestions.length > 0 && !this.state.searchLoading
-        ? `<div class="chips-row">${this.state.searchSuggestions
-            .map(
-              (s) =>
-                `<button type="button" class="chip-btn" data-action="run-saved-query" data-query="${escapeHtml(s)}">${escapeHtml(s)}</button>`
-            )
-            .join('')}</div>`
-        : '';
-
-    let bodyHtml = '';
-    if (this.state.searchLoading) {
-      bodyHtml = `<div class="state-card"><h3>Поиск…</h3><p>Ищем треки и плейлисты</p></div>`;
-    } else if (this.state.searchError) {
-      bodyHtml = `
-        <div class="state-card">
-          <h3>Ошибка поиска</h3>
-          <p>${escapeHtml(this.state.searchError)}</p>
-          <div class="action-pills-row">
-            <button type="button" class="btn-accent-sm" data-action="retry-search">Повторить</button>
-            <button type="button" class="icon-pill-btn" data-action="open-routing-modal">Источники каталога</button>
-          </div>
-        </div>`;
-    } else if (!this.state.searchQuery && this.state.searchFilter !== 'LOCAL') {
-      const hist = this.storage.library.searchHistory;
-      const recentHtml =
-        hist.length > 0
-          ? `
-        <div class="section-header">
-          <h2 class="section-title">Недавние запросы</h2>
-          <button type="button" class="section-action" data-action="clear-search-history">Очистить</button>
-        </div>
-        <div class="chips-row">
-          ${hist
-            .map(
-              (q) =>
-                `<button type="button" class="chip-btn" data-action="run-saved-query" data-query="${escapeHtml(q)}">${escapeHtml(q)}</button>`
-            )
-            .join('')}
-        </div>`
-          : '';
-
-      const genresHtml = `
-        <div class="section-header">
-          <h2 class="section-title">Жанры и подборки</h2>
-        </div>
-        <div class="genre-grid">
-          ${GENRE_DISCOVERY_CARDS.map(
-            (card) => `
-            <button type="button" class="genre-card variant-${card.variant}" data-action="run-saved-query" data-query="${escapeHtml(card.query)}">
-              <span class="genre-badge">${escapeHtml(card.badge)}</span>
-              <div class="genre-title">${escapeHtml(card.title)}</div>
-              <div class="genre-sub">${escapeHtml(card.subtitle)}</div>
-            </button>`
-          ).join('')}
-        </div>`;
-
-      bodyHtml = `${recentHtml}${genresHtml}`;
-    } else if (this.state.searchResults.length === 0) {
-      bodyHtml = `<div class="state-card"><h3>Ничего не найдено</h3><p>Попробуйте изменить запрос или фильтр.</p></div>`;
-    } else {
-      const rows = this.state.searchResults
-        .map((item, idx) => {
-          if (item.type === 'playlist') {
-            this.renderedPlaylists.set(item.id, item);
-            return `
-              <button type="button" class="track-row" data-action="open-remote-playlist" data-remote-id="${escapeHtml(item.id)}">
-                <img src="${escapeHtml(getSafeThumb(item))}" alt="" class="track-thumb" loading="lazy" />
-                <div class="track-meta">
-                  <div class="track-title">${escapeHtml(item.title)}</div>
-                  <div class="track-sub">${escapeHtml(item.artist)}${item.trackCount ? ` • ${item.trackCount} треков` : ''}</div>
-                </div>
-              </button>`;
-          }
-          if (item.type === 'artist') {
-            this.renderedArtists.set(item.id, item);
-            return `
-              <button type="button" class="track-row" data-action="open-artist" data-artist-id="${escapeHtml(item.id)}">
-                <img src="${escapeHtml(getSafeThumb(item))}" alt="" class="track-thumb round" loading="lazy" />
-                <div class="track-meta">
-                  <div class="track-title">${escapeHtml(item.title)}</div>
-                  <div class="track-sub">${escapeHtml(item.artist)}</div>
-                </div>
-              </button>`;
-          }
-          return this._renderTrackRowHtml(item, 'search', idx);
-        })
-        .join('');
-      bodyHtml = `<div class="grouped-card">${rows}</div>`;
-    }
-
     return `
       <form id="search-form" class="search-bar-wrap">
         <div class="search-input-box">
@@ -890,10 +995,36 @@ class SonoraApp {
         </div>
         <button type="submit" class="btn-accent-sm">Найти</button>
       </form>
-      ${suggestionsHtml}
+      <div id="search-suggestions-container">${this.renderSearchSuggestionsHtml()}</div>
       ${filterHtml}
-      ${bodyHtml}
+      <div id="search-results-container">${this.renderSearchBodyHtml()}</div>
     `;
+  }
+
+  renderPlaylistTracksHtml(pl) {
+    const filterQ = this.state.playlistFilter.trim().toLowerCase();
+    const filteredTracks = filterQ
+      ? pl.tracks.filter(
+          (t) =>
+            t.title.toLowerCase().includes(filterQ) ||
+            t.artist.toLowerCase().includes(filterQ)
+        )
+      : pl.tracks;
+
+    if (filteredTracks.length === 0) {
+      return `<div class="state-card no-border"><p>По запросу «${escapeHtml(this.state.playlistFilter)}» ничего не найдено.</p></div>`;
+    }
+
+    const canEdit = this.state.playlistEditMode && !filterQ;
+    return filteredTracks
+      .map((t, idx) =>
+        this._renderTrackRowHtml(t, `playlist:${pl.id}`, idx, {
+          showIndex: true,
+          playlistEditPid: canEdit ? pl.id : null,
+          totalCount: filteredTracks.length
+        })
+      )
+      .join('');
   }
 
   renderLibraryHtml() {
@@ -902,14 +1033,6 @@ class SonoraApp {
       if (!pl) {
         this.state.selectedPlaylistId = null;
       } else {
-        const filterQ = this.state.playlistFilter.trim().toLowerCase();
-        const filteredTracks = filterQ
-          ? pl.tracks.filter(
-              (t) =>
-                t.title.toLowerCase().includes(filterQ) ||
-                t.artist.toLowerCase().includes(filterQ)
-            )
-          : pl.tracks;
         const durLabel = formatTotalDurationRu(pl.tracks);
         const offlineCount = pl.tracks.filter((t) => this.offline.isDownloaded(t.id)).length;
         const statsParts = [`${pl.tracks.length} треков`];
@@ -944,9 +1067,24 @@ class SonoraApp {
                   : ''
               }
               <button type="button" class="icon-pill-btn" data-action="open-add-tracks-picker" data-playlist-id="${pl.id}">+ Добавить</button>
+              ${
+                pl.tracks.length > 1
+                  ? `<button type="button" class="icon-pill-btn ${this.state.playlistEditMode ? 'active-pill' : ''}" data-action="toggle-playlist-edit">Порядок</button>`
+                  : ''
+              }
               <button type="button" class="icon-pill-btn" data-action="open-rename-playlist" data-playlist-id="${pl.id}">Изменить</button>
               <button type="button" class="icon-pill-btn danger-text" data-action="confirm-delete-playlist" data-playlist-id="${pl.id}">Удалить</button>
             </div>
+            ${
+              pl.tracks.length > 1
+                ? `<div class="chips-row mt-12">
+                     <button type="button" class="chip-btn" data-action="sort-playlist" data-playlist-id="${pl.id}" data-sort="TITLE">Сорт: А–Я</button>
+                     <button type="button" class="chip-btn" data-action="sort-playlist" data-playlist-id="${pl.id}" data-sort="ARTIST">Артист</button>
+                     <button type="button" class="chip-btn" data-action="sort-playlist" data-playlist-id="${pl.id}" data-sort="DURATION">Длительность</button>
+                     <button type="button" class="chip-btn" data-action="sort-playlist" data-playlist-id="${pl.id}" data-sort="REVERSE">Перевернуть</button>
+                   </div>`
+                : ''
+            }
           </div>
           ${
             pl.tracks.length > 0
@@ -954,12 +1092,8 @@ class SonoraApp {
                    ${SVG.search}
                    <input id="playlist-filter-input" class="search-input" type="search" placeholder="Поиск в плейлисте…" autocomplete="off" />
                  </div>
-                 <div class="grouped-card mt-12">
-                   ${
-                     filteredTracks.length > 0
-                       ? filteredTracks.map((t, idx) => this._renderTrackRowHtml(t, `playlist:${pl.id}`, idx, { showIndex: true })).join('')
-                       : `<div class="state-card no-border"><p>По запросу «${escapeHtml(this.state.playlistFilter)}» ничего не найдено.</p></div>`
-                   }
+                 <div id="playlist-tracks-container" class="grouped-card mt-12">
+                   ${this.renderPlaylistTracksHtml(pl)}
                  </div>`
               : `<div class="state-card"><p>В этом плейлисте пока нет треков. Нажмите «+ Добавить» или используйте меню «⋯» у любого трека.</p></div>`
           }
@@ -1005,11 +1139,11 @@ class SonoraApp {
                 })
                 .join('')}
             </div>`
-          : `<div class="state-card"><h3>Нет плейлистов</h3><p>Создайте свой плейлист или импортируйте готовый по ссылке из YouTube Music.</p></div>`;
+          : `<div class="state-card"><h3>Нет плейлистов</h3><p>Создайте свой плейлист или импортируйте готовый по ссылкам из YouTube Music.</p></div>`;
 
       return `
         ${subtabHtml}
-        <button type="button" class="btn-secondary-full" data-action="open-import-yt-playlist">Импортировать плейлист YouTube Music</button>
+        <button type="button" class="btn-secondary-full" data-action="open-import-yt-playlist">Импорт по ссылкам YouTube Music</button>
         <div class="spacer-12"></div>
         ${listHtml}
       `;
@@ -1115,7 +1249,7 @@ class SonoraApp {
               <div class="setting-sub">${
                 acc
                   ? `${acc.handle || acc.email ? `${escapeHtml(acc.handle || acc.email)} • ` : ''}♥ ${acc.syncedLikedCount}, ${acc.syncedPlaylistsCount} плейлистов`
-                  : 'Экспорт с music.youtube.com, Google Takeout или копия Android'
+                  : 'Ссылки, закладка iPhone Safari, Google Takeout или копия Android'
               }</div>
             </div>
           </div>
@@ -1230,11 +1364,39 @@ class SonoraApp {
     const track = snap.currentTrack;
     if (!track) {
       mini.classList.add('hidden');
+      mini.dataset.trackId = '';
       return;
     }
 
     mini.classList.remove('hidden');
     const pct = snap.duration > 0 ? Math.min(100, (snap.currentTime / snap.duration) * 100) : 0;
+    const subText = snap.isBuffering ? 'Буферизация…' : track.artist;
+
+    if (mini.dataset.trackId === track.id && mini.firstElementChild) {
+      const fill = mini.querySelector('.mini-progress-fill');
+      if (fill) fill.style.width = `${pct.toFixed(1)}%`;
+
+      if (mini.dataset.subText !== subText) {
+        mini.dataset.subText = subText;
+        const subEl = mini.querySelector('.mini-body .track-sub');
+        if (subEl) subEl.textContent = subText;
+      }
+
+      const playStr = snap.isPlaying ? '1' : '0';
+      if (mini.dataset.playing !== playStr) {
+        mini.dataset.playing = playStr;
+        const playBtn = mini.querySelector('[data-action="toggle-play"]');
+        if (playBtn) {
+          playBtn.innerHTML = snap.isPlaying ? SVG.pause : SVG.play;
+          playBtn.setAttribute('aria-label', snap.isPlaying ? 'Пауза' : 'Воспроизвести');
+        }
+      }
+      return;
+    }
+
+    mini.dataset.trackId = track.id;
+    mini.dataset.subText = subText;
+    mini.dataset.playing = snap.isPlaying ? '1' : '0';
     mini.innerHTML = `
       <div class="mini-progress-track"><div class="mini-progress-fill" style="width:${pct.toFixed(1)}%"></div></div>
       <div class="mini-body">
@@ -1242,7 +1404,7 @@ class SonoraApp {
           <img src="${escapeHtml(getSafeThumb(track))}" alt="" class="mini-thumb" />
           <div class="track-meta">
             <div class="track-title">${escapeHtml(track.title)}</div>
-            <div class="track-sub">${snap.isBuffering ? 'Буферизация…' : escapeHtml(track.artist)}</div>
+            <div class="track-sub">${escapeHtml(subText)}</div>
           </div>
         </button>
         <div class="mini-controls">
@@ -1270,9 +1432,15 @@ class SonoraApp {
     }
 
     sheet.classList.remove('hidden');
-    sheet.dataset.renderKey = `${track.id}:${snap.sourceType || snap.engine}:${snap.isOfflineSource ? 'off' : 'on'}:${this.state.playerLyricsOpen ? 'lyr' : 'art'}`;
+    const lyrSig = this.state.playerLyricsOpen
+      ? `lyr:${snap.lyrics.loading ? 'load' : snap.lyrics.synced.length}:${snap.lyrics.plain ? 1 : 0}:${this.state.lyricsManualOpen ? 1 : 0}`
+      : 'art';
+    sheet.dataset.renderKey = `${track.id}:${snap.sourceType || snap.engine}:${snap.isOfflineSource ? 'off' : 'on'}:${lyrSig}`;
+
     const isFav = this.storage.isFavorite(track.id);
     const isOffline = this.offline.isDownloaded(track.id);
+    const isDownloading = this.offline.isDownloading(track.id);
+    const dlProg = isDownloading ? this.offline.getProgress(track.id) : null;
     const repeatIcon = snap.repeatMode === 'ONE' ? SVG.repeatOne : SVG.repeat;
     const sourceLabels = {
       offline: 'Оффлайн-кэш',
@@ -1287,30 +1455,48 @@ class SonoraApp {
     let stageHtml = '';
     if (this.state.playerLyricsOpen) {
       const lyr = snap.lyrics;
+      const manualFormHtml = this.state.lyricsManualOpen
+        ? `<form id="manual-lyrics-form" class="search-bar-wrap mt-8">
+             <div class="search-input-box lyrics-search-box">
+               <input id="manual-lyrics-input" class="search-input" type="search" placeholder="Исполнитель и название песни…" value="${escapeHtml(this.state.lyricsManualQuery || `${track.artist} ${track.title}`)}" />
+             </div>
+             <button type="submit" class="btn-accent-sm">Найти</button>
+           </form>`
+        : '';
+      const headerRow = `
+        <div class="lyrics-tools-bar">
+          <span class="lyrics-source-tag">${lyr.source ? `Источник: ${escapeHtml(lyr.source)}` : 'Текст песни'}</span>
+          <button type="button" class="icon-pill-btn player-pill-sm" data-action="toggle-manual-lyrics">Уточнить</button>
+        </div>
+        ${manualFormHtml}`;
+
+      let contentHtml = '';
       if (lyr.loading) {
-        stageHtml = `<div class="lyrics-panel"><p class="lyrics-muted">Загрузка текста песни…</p></div>`;
+        contentHtml = `<p class="lyrics-muted">Поиск текста песни…</p>`;
       } else if (lyr.synced.length > 0) {
         let activeIdx = -1;
         for (let i = 0; i < lyr.synced.length; i++) {
           if (snap.currentTime + 0.35 >= lyr.synced[i].timeSeconds) activeIdx = i;
           else break;
         }
-        stageHtml = `
-          <div class="lyrics-panel">
-            ${lyr.synced
-              .map(
-                (line, idx) => `
-              <button type="button" class="lyric-line ${idx === activeIdx ? 'active' : ''}" data-action="seek-lyric" data-time="${line.timeSeconds}">
-                ${escapeHtml(line.text)}
-              </button>`
-              )
-              .join('')}
-          </div>`;
+        contentHtml = lyr.synced
+          .map(
+            (line, idx) => `
+          <button type="button" class="lyric-line ${idx === activeIdx ? 'active' : ''}" data-action="seek-lyric" data-time="${line.timeSeconds}">
+            ${escapeHtml(line.text)}
+          </button>`
+          )
+          .join('');
       } else if (lyr.plain) {
-        stageHtml = `<div class="lyrics-panel"><pre class="lyrics-plain">${escapeHtml(lyr.plain)}</pre></div>`;
+        contentHtml = `<pre class="lyrics-plain">${escapeHtml(lyr.plain)}</pre>`;
       } else {
-        stageHtml = `<div class="lyrics-panel"><p class="lyrics-muted">Текст песни для этого трека не найден.</p></div>`;
+        contentHtml = `
+          <div class="lyrics-empty-wrap">
+            <p class="lyrics-muted">Текст не найден автоматически.</p>
+            <button type="button" class="btn-accent-sm" data-action="open-manual-lyrics">Найти текст вручную</button>
+          </div>`;
       }
+      stageHtml = `<div class="lyrics-panel" id="lyrics-panel" data-active-idx="-2">${headerRow}${contentHtml}</div>`;
     } else {
       stageHtml = `
         <div class="player-artwork-stage" id="player-artwork-stage">
@@ -1339,8 +1525,8 @@ class SonoraApp {
           <div class="player-track-artist">${escapeHtml(track.artist)}</div>
         </div>
         <div class="player-meta-actions">
-          <button type="button" class="player-ctrl-btn ${isOffline ? 'is-active' : ''}" data-action="toggle-offline-track" data-track-id="${escapeHtml(track.id)}" aria-label="Скачать оффлайн">
-            ${isOffline ? SVG.checkCircle : SVG.download}
+          <button type="button" class="player-ctrl-btn ${isOffline ? 'is-active' : ''}" data-action="${isDownloading ? 'cancel-offline-track' : 'toggle-offline-track'}" data-track-id="${escapeHtml(track.id)}" aria-label="Скачать оффлайн">
+            ${isDownloading ? `<span class="dl-pct-badge">${dlProg?.percent > 0 ? `${dlProg.percent}%` : '…'}</span>` : isOffline ? SVG.checkCircle : SVG.download}
           </button>
           <button type="button" class="player-ctrl-btn ${isFav ? 'is-active' : ''}" data-action="toggle-favorite" data-track-id="${escapeHtml(track.id)}" aria-label="Нравится">
             ${isFav ? SVG.heart : SVG.heartOutline}
@@ -1359,7 +1545,7 @@ class SonoraApp {
       <div class="player-controls">
         <button type="button" class="player-ctrl-btn ${snap.shuffleEnabled ? 'is-active' : ''}" data-action="toggle-shuffle" aria-label="Перемешать">${SVG.shuffle}</button>
         <button type="button" class="player-ctrl-btn" data-action="prev-track" aria-label="Назад">${SVG.prev}</button>
-        <button type="button" id="full-play-btn" class="player-play-btn" data-action="toggle-play" aria-label="${snap.isPlaying ? 'Пауза' : 'Играть'}">
+        <button type="button" id="full-play-btn" data-playing="${snap.isPlaying ? '1' : '0'}" class="player-play-btn" data-action="toggle-play" aria-label="${snap.isPlaying ? 'Пауза' : 'Играть'}">
           ${snap.isPlaying ? SVG.pause : SVG.play}
         </button>
         <button type="button" class="player-ctrl-btn" data-action="next-track" aria-label="Вперёд">${SVG.next}</button>
@@ -1393,6 +1579,15 @@ class SonoraApp {
         this.state.isScrubbing = false;
         this.player.seekTo(targetSec);
       });
+    }
+
+    const lyricsPanel = document.getElementById('lyrics-panel');
+    if (lyricsPanel) {
+      const pauseAutoScroll = () => {
+        this._lyricsTouchLockUntil = Date.now() + 3500;
+      };
+      lyricsPanel.addEventListener('touchstart', pauseAutoScroll, { passive: true });
+      lyricsPanel.addEventListener('wheel', pauseAutoScroll, { passive: true });
     }
 
     const stage = document.getElementById('player-artwork-stage');
@@ -1472,10 +1667,26 @@ class SonoraApp {
   }
 
   bindGlobalEvents() {
+    // Graceful image fallback for broken third-party cover thumbnails
+    document.addEventListener(
+      'error',
+      (e) => {
+        const target = e.target;
+        if (target?.tagName === 'IMG' && !target.dataset.fallbackApplied) {
+          target.dataset.fallbackApplied = '1';
+          target.src = 'icons/icon-192.png';
+        }
+      },
+      true
+    );
+
     document.querySelectorAll('.tab-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         this.state.activeTab = btn.dataset.tab;
-        if (this.state.activeTab !== 'library') this.state.selectedPlaylistId = null;
+        if (this.state.activeTab !== 'library') {
+          this.state.selectedPlaylistId = null;
+          this.state.playlistEditMode = false;
+        }
         if (this.state.activeTab !== 'search') this.state.selectedArtist = null;
         this.renderHeader();
         this.renderTabBar();
@@ -1491,11 +1702,10 @@ class SonoraApp {
       if (e.target.id === 'playlist-filter-input') {
         const val = e.target.value;
         this.state.playlistFilter = val;
-        this.renderMain();
-        const inp = document.getElementById('playlist-filter-input');
-        if (inp) {
-          inp.focus();
-          inp.setSelectionRange(val.length, val.length);
+        const container = document.getElementById('playlist-tracks-container');
+        const pl = this.storage.library.playlists.find((p) => p.id === this.state.selectedPlaylistId);
+        if (container && pl) {
+          container.innerHTML = this.renderPlaylistTracksHtml(pl);
         }
         return;
       }
@@ -1506,11 +1716,9 @@ class SonoraApp {
 
       if (this.state.searchFilter === 'LOCAL') {
         this.state.searchResults = this.searchLocalLibrary(val);
-        this.renderMain();
-        const inp = document.getElementById('search-query-input');
-        if (inp) {
-          inp.focus();
-          inp.setSelectionRange(val.length, val.length);
+        const container = document.getElementById('search-results-container');
+        if (container) {
+          container.innerHTML = this.renderSearchBodyHtml();
         }
         return;
       }
@@ -1518,6 +1726,8 @@ class SonoraApp {
       clearTimeout(this.suggestTimer);
       if (val.trim().length < 2) {
         this.state.searchSuggestions = [];
+        const sugBox = document.getElementById('search-suggestions-container');
+        if (sugBox) sugBox.innerHTML = '';
         return;
       }
       this.suggestTimer = setTimeout(async () => {
@@ -1528,17 +1738,10 @@ class SonoraApp {
           !this.state.searchLoading
         ) {
           this.state.searchSuggestions = suggestions;
-          const activeEl = document.activeElement?.id === 'search-query-input';
-          this.renderMain();
-          if (activeEl) {
-            const inp = document.getElementById('search-query-input');
-            if (inp) {
-              inp.focus();
-              inp.setSelectionRange(val.length, val.length);
-            }
-          }
+          const sugBox = document.getElementById('search-suggestions-container');
+          if (sugBox) sugBox.innerHTML = this.renderSearchSuggestionsHtml();
         }
-      }, 320);
+      }, 280);
     });
 
     document.addEventListener('submit', (e) => {
@@ -1550,6 +1753,16 @@ class SonoraApp {
         e.preventDefault();
         const q = document.getElementById('picker-search-input')?.value || '';
         this.runPickerSearch(Number(e.target.dataset.playlistId), q);
+      } else if (e.target.id === 'manual-lyrics-form') {
+        e.preventDefault();
+        const q = document.getElementById('manual-lyrics-input')?.value?.trim() || '';
+        if (!q || !this.player.currentTrack) return;
+        this.state.lyricsManualQuery = q;
+        this.state.lyricsManualOpen = false;
+        this.player.loadLyricsForCurrentTrack(this.player.currentTrack, {
+          force: true,
+          customQuery: q
+        });
       } else if (e.target.id === 'create-playlist-form') {
         e.preventDefault();
         const name = document.getElementById('new-playlist-name')?.value || '';
@@ -1562,6 +1775,7 @@ class SonoraApp {
             this.state.librarySubtab = 'playlists';
             this.state.selectedPlaylistId = pl.id;
             this.state.playlistFilter = '';
+            this.state.playlistEditMode = false;
             this.render();
             this.showToast(`Плейлист «${pl.name}» создан`);
           })
@@ -1581,27 +1795,8 @@ class SonoraApp {
           .catch((err) => this.showToast(err.message));
       } else if (e.target.id === 'import-yt-playlist-form') {
         e.preventDefault();
-        const urlInput = document.getElementById('yt-playlist-url')?.value || '';
-        if (!extractPlaylistId(urlInput)) {
-          this.showToast('Введите корректную ссылку или ID плейлиста YouTube');
-          return;
-        }
-        this.showToast('Импорт плейлиста…');
-        this.api
-          .getPlaylist(urlInput)
-          .then((remote) =>
-            this.storage.mergePlaylist(remote.title, remote.description, remote.tracks, remote.id)
-          )
-          .then(({ playlist, addedCount }) => {
-            this.closeModal();
-            this.state.activeTab = 'library';
-            this.state.librarySubtab = 'playlists';
-            this.state.selectedPlaylistId = playlist.id;
-            this.state.playlistFilter = '';
-            this.render();
-            this.showToast(`Импортировано треков: ${addedCount}`);
-          })
-          .catch((err) => this.showToast(err.message));
+        const rawText = document.getElementById('yt-playlist-url')?.value || '';
+        this.handleBatchLinksImport(rawText);
       } else if (e.target.id === 'yt-import-form') {
         e.preventDefault();
         const rawText = document.getElementById('yt-import-json')?.value || '';
@@ -1619,7 +1814,7 @@ class SonoraApp {
             this.api.activeInstance = null;
             this.closeModal();
             this.renderMain();
-            this.loadHomeMood(this.state.homeMood);
+            this.loadHomeMood(this.state.homeMood, { forceFresh: true });
             this.showToast('Источники каталога обновлены');
           });
       }
@@ -1674,15 +1869,27 @@ class SonoraApp {
       } else if (action === 'select-mood') {
         this.loadHomeMood(btn.dataset.mood);
       } else if (action === 'retry-home') {
-        this.loadHomeMood(this.state.homeMood);
+        this.loadHomeMood(this.state.homeMood, { forceFresh: true });
       } else if (action === 'play-all-home') {
         if (this.state.homeTracks.length > 0) {
           this.player.playTrack(this.state.homeTracks[0], this.state.homeTracks);
         }
       } else if (action === 'play-mix') {
-        const mixTracks = this.renderedMixes.get(btn.dataset.mixId) || [];
+        const mix = this.renderedMixes.get(btn.dataset.mixId);
+        const mixTracks = mix?.tracks || [];
         if (mixTracks.length > 0) {
           this.player.playTrack(mixTracks[0], mixTracks);
+        }
+      } else if (action === 'open-mix') {
+        const mix = this.renderedMixes.get(btn.dataset.mixId);
+        if (mix) this.openMixPreviewModal(mix);
+      } else if (action === 'play-mix-track') {
+        const mix = this.renderedMixes.get(btn.dataset.mixId);
+        const idx = Number(btn.dataset.mixIdx) || 0;
+        const tracks = mix?.tracks || [];
+        if (tracks[idx]) {
+          this.player.playTrack(tracks[idx], tracks);
+          this.closeModal();
         }
       } else if (action === 'goto-history') {
         this.state.activeTab = 'library';
@@ -1706,11 +1913,20 @@ class SonoraApp {
         this.runSearch(this.state.searchQuery, this.state.searchFilter);
       } else if (action === 'run-saved-query') {
         this.runSearch(btn.dataset.query, 'TRACKS');
+      } else if (action === 'delete-search-query') {
+        this.storage.removeSearchHistoryItem(btn.dataset.query).then(() => this.renderMain());
       } else if (action === 'clear-search-history') {
         this.storage.clearSearchHistory().then(() => this.renderMain());
       } else if (action === 'open-remote-playlist') {
         const item = this.renderedPlaylists.get(btn.dataset.remoteId);
         if (item) this.openRemotePlaylistModal(item);
+      } else if (action === 'play-remote-track') {
+        const idx = Number(btn.dataset.remoteIdx) || 0;
+        const tracks = this.activeRemotePlaylist?.tracks || [];
+        if (tracks[idx]) {
+          this.player.playTrack(tracks[idx], tracks);
+          this.closeModal();
+        }
       } else if (action === 'open-artist') {
         const item = this.renderedArtists.get(btn.dataset.artistId);
         if (item) this.openArtistView(item);
@@ -1738,13 +1954,41 @@ class SonoraApp {
       } else if (action === 'open-playlist') {
         this.state.selectedPlaylistId = Number(btn.dataset.playlistId);
         this.state.playlistFilter = '';
+        this.state.playlistEditMode = false;
         this.renderHeader();
         this.renderMain();
       } else if (action === 'close-playlist') {
         this.state.selectedPlaylistId = null;
         this.state.playlistFilter = '';
+        this.state.playlistEditMode = false;
         this.renderHeader();
         this.renderMain();
+      } else if (action === 'toggle-playlist-edit') {
+        this.state.playlistEditMode = !this.state.playlistEditMode;
+        this.renderMain();
+      } else if (action === 'sort-playlist') {
+        const pid = Number(btn.dataset.playlistId);
+        const mode = btn.dataset.sort;
+        this.storage.sortPlaylistTracks(pid, mode).then((ok) => {
+          if (ok) {
+            this.renderMain();
+            this.showToast('Плейлист отсортирован');
+          }
+        });
+      } else if (action === 'pl-move-up' || action === 'pl-move-down') {
+        const pid = Number(btn.dataset.playlistId);
+        const idx = Number(btn.dataset.index);
+        const targetIdx = action === 'pl-move-up' ? idx - 1 : idx + 1;
+        this.storage.moveTrackInPlaylist(pid, idx, targetIdx).then((ok) => {
+          if (ok) this.renderMain();
+        });
+      } else if (action === 'pl-remove-track') {
+        const pid = Number(btn.dataset.playlistId);
+        const tid = btn.dataset.trackId;
+        this.storage.removeTrackFromPlaylist(pid, tid).then(() => {
+          this.renderMain();
+          this.showToast('Трек удалён из плейлиста');
+        });
       } else if (action === 'play-playlist') {
         const pl = this.storage.library.playlists.find((p) => p.id === Number(btn.dataset.playlistId));
         if (pl && pl.tracks.length > 0) this.player.playTrack(pl.tracks[0], pl.tracks);
@@ -1764,11 +2008,25 @@ class SonoraApp {
       } else if (action === 'share-playlist') {
         const pl = this.storage.library.playlists.find((p) => p.id === Number(btn.dataset.playlistId));
         if (pl) this.sharePlaylist(pl);
+      } else if (action === 'share-track') {
+        const track = this.renderedTracks.get(btn.dataset.trackId) || this.player.currentTrack;
+        if (track) this.shareTrack(track);
       } else if (action === 'download-playlist-offline') {
         const pl = this.storage.library.playlists.find((p) => p.id === Number(btn.dataset.playlistId));
         if (pl) this.downloadTracksBatchOffline(pl.tracks);
       } else if (action === 'download-favorites-offline') {
         this.downloadTracksBatchOffline(this.storage.library.favorites);
+      } else if (action === 'cancel-batch-offline') {
+        this._batchOfflineController?.abort();
+        this.state.batchOfflineState = null;
+        this.renderBanner();
+        this.showToast('Пакетная загрузка остановлена');
+      } else if (action === 'cancel-offline-track') {
+        this.offline.cancelDownload(btn.dataset.trackId);
+        this.closeModal();
+        if (this.state.playerExpanded) this.renderPlayerSheet();
+        this.renderMain();
+        this.showToast('Загрузка отменена');
       } else if (action === 'open-add-tracks-picker') {
         const pid = Number(btn.dataset.playlistId);
         this.openAddTracksPickerModal(pid);
@@ -1852,7 +2110,12 @@ class SonoraApp {
         this.player.cycleRepeat();
       } else if (action === 'toggle-lyrics') {
         this.state.playerLyricsOpen = !this.state.playerLyricsOpen;
+        this.state.lyricsManualOpen = false;
         this.renderPlayerSheet();
+      } else if (action === 'toggle-manual-lyrics' || action === 'open-manual-lyrics') {
+        this.state.lyricsManualOpen = action === 'open-manual-lyrics' ? true : !this.state.lyricsManualOpen;
+        this.renderPlayerSheet();
+        document.getElementById('manual-lyrics-input')?.focus();
       } else if (action === 'seek-lyric') {
         this.player.seekTo(Number(btn.dataset.time) || 0);
       } else if (action === 'cycle-speed') {
@@ -1867,19 +2130,29 @@ class SonoraApp {
         this.closeModal();
         this.showToast(mins > 0 ? `Таймер сна на ${mins} мин.` : 'Таймер сна выключен');
       } else if (action === 'open-queue') {
-        this.openModal(
-          buildQueueModalHtml({
-            queue: this.player.queue,
-            currentIndex: this.player.currentIndex,
-            getSafeThumb
-          })
-        );
+        this.openQueueModal();
       } else if (action === 'jump-queue') {
         const idx = Number(btn.dataset.qindex);
         if (idx >= 0 && idx < this.player.queue.length) {
           this.player.playTrack(this.player.queue[idx], this.player.queue);
         }
         this.closeModal();
+      } else if (action === 'queue-move-next') {
+        const idx = Number(btn.dataset.qindex);
+        const cur = Math.max(0, this.player.currentIndex);
+        const target = idx > cur ? cur + 1 : cur;
+        this.player.moveQueueTrack(idx, target).then(() => this.openQueueModal());
+      } else if (action === 'queue-remove') {
+        const idx = Number(btn.dataset.qindex);
+        this.player.removeFromQueue(idx).then(() => {
+          if (this.player.queue.length === 0) this.closeModal();
+          else this.openQueueModal();
+        });
+      } else if (action === 'clear-queue') {
+        this.player.clearQueue().then(() => {
+          this.closeModal();
+          this.showToast('Очередь очищена');
+        });
       } else if (action === 'toggle-favorite') {
         const track = this.renderedTracks.get(btn.dataset.trackId) || this.player.currentTrack;
         if (track) {
@@ -1982,6 +2255,10 @@ class SonoraApp {
           this.render();
           this.showToast('Профиль удалён');
         });
+      } else if (action === 'copy-yt-bookmarklet') {
+        navigator.clipboard?.writeText(YOUTUBE_EXPORT_BOOKMARKLET).then(() => {
+          this.showToast('Закладка скопирована! Создайте закладку в Safari и вставьте код в URL.');
+        });
       } else if (action === 'copy-yt-export-snippet') {
         navigator.clipboard?.writeText(YOUTUBE_DIRECT_EXPORT_SNIPPET).then(() => {
           this.showToast('Скрипт скопирован! Выполните его на вкладке music.youtube.com');
@@ -1998,6 +2275,155 @@ class SonoraApp {
     });
   }
 
+  openQueueModal() {
+    this.openModal(
+      buildQueueModalHtml({
+        queue: this.player.queue,
+        currentIndex: this.player.currentIndex,
+        getSafeThumb
+      })
+    );
+  }
+
+  openMixPreviewModal(mix) {
+    this.openModal(buildMixPreviewModalHtml(mix, getSafeThumb));
+    const tracks = mix.tracks || [];
+    document.getElementById('mix-modal-play')?.addEventListener('click', () => {
+      if (tracks.length > 0) this.player.playTrack(tracks[0], tracks);
+      this.closeModal();
+    });
+    document.getElementById('mix-modal-shuffle')?.addEventListener('click', () => {
+      if (tracks.length > 0) {
+        this.player.shuffleEnabled = true;
+        this.player.playTrack(tracks[Math.floor(Math.random() * tracks.length)], tracks);
+      }
+      this.closeModal();
+    });
+    document.getElementById('mix-modal-queue')?.addEventListener('click', async () => {
+      const added = await this.player.addTracksToQueue(tracks);
+      this.closeModal();
+      this.showToast(added > 0 ? `Добавлено в очередь: ${added}` : 'Треки уже в очереди');
+    });
+    document.getElementById('mix-modal-save')?.addEventListener('click', async () => {
+      await this.storage.createPlaylist(mix.title || 'Персональный микс', mix.subtitle || '', tracks);
+      this.closeModal();
+      this.showToast('Микс сохранён в Медиатеку');
+    });
+  }
+
+  async handleBatchLinksImport(rawText) {
+    const lines = String(rawText || '')
+      .split(/[\r\n]+/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const playlistIds = [];
+    const videoIds = [];
+    const seenPls = new Set();
+    const seenVids = new Set();
+
+    for (const line of lines) {
+      const pid = extractPlaylistId(line);
+      if (pid && !seenPls.has(pid)) {
+        seenPls.add(pid);
+        playlistIds.push(pid);
+        continue;
+      }
+      const vid = extractVideoId(line);
+      if (vid && !seenVids.has(vid)) {
+        seenVids.add(vid);
+        videoIds.push(vid);
+      }
+    }
+
+    if (playlistIds.length === 0 && videoIds.length === 0) {
+      this.showToast('Не найдено корректных ссылок или ID YouTube Music');
+      return;
+    }
+
+    this.showToast(`Импортируем (${playlistIds.length + videoIds.length})…`);
+    let playlistsImported = 0;
+    let totalTracks = 0;
+    let lastPlaylistId = null;
+
+    for (const pid of playlistIds) {
+      try {
+        const remote = await this.api.getPlaylist(pid);
+        const { playlist, addedCount } = await this.storage.mergePlaylist(
+          remote.title,
+          remote.description,
+          remote.tracks,
+          remote.id
+        );
+        playlistsImported++;
+        totalTracks += addedCount;
+        lastPlaylistId = playlist.id;
+      } catch {
+        // Continue remaining playlist links
+      }
+    }
+
+    if (videoIds.length > 0) {
+      const importedTracks = [];
+      for (const vid of videoIds.slice(0, 30)) {
+        try {
+          const info = await this.api.getStreamInfo(vid, 'HIGH');
+          const clean = sanitizeTrack({
+            id: vid,
+            title: info?.title || `YouTube трек (${vid})`,
+            artist: info?.artist || 'YouTube Music',
+            durationSeconds: info?.durationSeconds || 0,
+            thumbnailUrl: info?.thumbnailUrl || `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`
+          });
+          if (clean) importedTracks.push(clean);
+        } catch {
+          importedTracks.push({
+            id: vid,
+            title: `YouTube трек (${vid})`,
+            artist: 'YouTube Music',
+            durationSeconds: 0,
+            thumbnailUrl: `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`
+          });
+        }
+      }
+      if (importedTracks.length > 0) {
+        const { playlist, addedCount } = await this.storage.mergePlaylist(
+          'Импорт по ссылкам',
+          'Добавлено вручную по ссылкам YouTube Music',
+          importedTracks,
+          null
+        );
+        playlistsImported++;
+        totalTracks += addedCount;
+        lastPlaylistId = playlist.id;
+      }
+    }
+
+    this.closeModal();
+    if (lastPlaylistId) {
+      this.state.activeTab = 'library';
+      this.state.librarySubtab = 'playlists';
+      this.state.selectedPlaylistId = lastPlaylistId;
+      this.state.playlistFilter = '';
+    }
+    this.render();
+    this.showToast(
+      playlistsImported > 0
+        ? `Импортировано плейлистов: ${playlistsImported}, треков: ${totalTracks}`
+        : 'Не удалось загрузить данные по этим ссылкам'
+    );
+  }
+
+  _updateInlineDownloadProgress(trackId, percent) {
+    document.querySelectorAll(`[data-dl-track="${CSS.escape ? CSS.escape(trackId) : trackId}"]`).forEach((el) => {
+      el.textContent = percent > 0 ? `${percent}%` : '…';
+    });
+    if (this.state.playerExpanded && this.player.currentTrack?.id === trackId) {
+      const badge = document.querySelector('#player-sheet .player-meta-actions .dl-pct-badge');
+      if (badge) badge.textContent = percent > 0 ? `${percent}%` : '…';
+    }
+  }
+
   async toggleOfflineTrack(track) {
     if (this.offline.isDownloaded(track.id)) {
       await this.offline.removeTrack(track.id);
@@ -2010,17 +2436,34 @@ class SonoraApp {
     try {
       this.showToast(`Скачиваем «${track.title}»…`);
       const info = await this.api.getStreamInfo(track.id, this.storage.settings.audioQuality);
-      const candidates =
+      const initialCandidates =
         Array.isArray(info.streamCandidates) && info.streamCandidates.length > 0
           ? info.streamCandidates
           : [info.proxyCacheUrl || info.streamUrl].filter(Boolean);
-      const bytes = await this.offline.downloadTrackWithCandidates(track, candidates);
+      const corsSafeCandidates = await this.api.getOfflineStreamCandidates(
+        track.id,
+        this.storage.settings.audioQuality,
+        initialCandidates
+      );
+
+      this.offline.downloadingIds.add(track.id);
+      if (this.state.playerExpanded) this.renderPlayerSheet();
+      this.renderMain();
+
+      const bytes = await this.offline.downloadTrackWithCandidates(track, corsSafeCandidates, {
+        onProgress: ({ trackId, percent }) => this._updateInlineDownloadProgress(trackId, percent)
+      });
+
       this.recommendations.tasteTracker.recordSignal(track, ImplicitSignalType.DOWNLOADED);
       if (this.state.playerExpanded) this.renderPlayerSheet();
       this.renderMain();
       this.showToast(`Сохранено оффлайн (${formatBytesRu(bytes)})`);
     } catch (err) {
-      this.showToast(err?.message || 'Ошибка оффлайн-загрузки');
+      if (this.state.playerExpanded) this.renderPlayerSheet();
+      this.renderMain();
+      if (err?.name !== 'AbortError') {
+        this.showToast(err?.message || 'Ошибка оффлайн-загрузки');
+      }
     }
   }
 
@@ -2030,24 +2473,66 @@ class SonoraApp {
       this.showToast('Все треки уже доступны оффлайн');
       return;
     }
-    this.showToast(`Начинаем загрузку ${missing.length} треков оффлайн…`);
+
+    this._batchOfflineController?.abort();
+    this._batchOfflineController = new AbortController();
+    const signal = this._batchOfflineController.signal;
+
+    this.state.batchOfflineState = {
+      done: 0,
+      total: missing.length,
+      currentTitle: missing[0]?.title || '',
+      percent: 0
+    };
+    this.renderBanner();
+
     let okCount = 0;
-    for (const track of missing) {
+    for (let i = 0; i < missing.length; i++) {
+      if (signal.aborted) break;
+      const track = missing[i];
+      this.state.batchOfflineState = {
+        done: i,
+        total: missing.length,
+        currentTitle: track.title,
+        percent: 0
+      };
+      this.renderBanner();
+
       try {
         const info = await this.api.getStreamInfo(track.id, this.storage.settings.audioQuality);
-        const candidates =
+        const initialCandidates =
           Array.isArray(info.streamCandidates) && info.streamCandidates.length > 0
             ? info.streamCandidates
             : [info.proxyCacheUrl || info.streamUrl].filter(Boolean);
+        const candidates = await this.api.getOfflineStreamCandidates(
+          track.id,
+          this.storage.settings.audioQuality,
+          initialCandidates
+        );
         if (candidates.length === 0) continue;
-        await this.offline.downloadTrackWithCandidates(track, candidates);
+        await this.offline.downloadTrackWithCandidates(track, candidates, {
+          signal,
+          onProgress: ({ percent }) => {
+            if (this.state.batchOfflineState) {
+              this.state.batchOfflineState.percent = percent;
+              this.renderBanner();
+            }
+          }
+        });
         okCount++;
-      } catch {
-        // Continue remaining tracks
+      } catch (err) {
+        if (signal.aborted || err?.name === 'AbortError') break;
       }
     }
+
+    const aborted = signal.aborted;
+    this.state.batchOfflineState = null;
+    this._batchOfflineController = null;
+    this.renderBanner();
     this.renderMain();
-    this.showToast(`Сохранено оффлайн: ${okCount} из ${missing.length}`);
+    if (!aborted) {
+      this.showToast(`Сохранено оффлайн: ${okCount} из ${missing.length}`);
+    }
   }
 
   async sharePlaylist(playlist) {
@@ -2068,6 +2553,24 @@ class SonoraApp {
       }
     } catch {
       // User cancelled share sheet
+    }
+  }
+
+  async shareTrack(track) {
+    const ytLink = !String(track.id).startsWith('aud:')
+      ? `https://music.youtube.com/watch?v=${track.id}`
+      : '';
+    const text = ytLink ? `${track.artist} — ${track.title}\n${ytLink}` : `${track.artist} — ${track.title}`;
+    try {
+      if (navigator.share) {
+        await navigator.share({ title: track.title, text, url: ytLink || undefined });
+      } else if (navigator.clipboard) {
+        await navigator.clipboard.writeText(text);
+        this.closeModal();
+        this.showToast('Ссылка на трек скопирована');
+      }
+    } catch {
+      // Cancelled
     }
   }
 
@@ -2129,9 +2632,10 @@ class SonoraApp {
     const isFav = this.storage.isFavorite(track.id);
     const isOffline = this.offline.isDownloaded(track.id);
     const isDownloading = this.offline.isDownloading(track.id);
+    const progressPct = isDownloading ? (this.offline.getProgress(track.id)?.percent || 0) : 0;
     const canRemoveFromPl = this.state.activeTab === 'library' && Boolean(this.state.selectedPlaylistId);
     this.openModal(
-      buildTrackMenuHtml(track, { isFav, isOffline, isDownloading, canRemoveFromPl })
+      buildTrackMenuHtml(track, { isFav, isOffline, isDownloading, progressPct, canRemoveFromPl })
     );
   }
 
@@ -2140,6 +2644,7 @@ class SonoraApp {
     try {
       const remote = item.tracks ? item : await this.api.getPlaylist(item.id);
       const tracks = remote.tracks || [];
+      this.activeRemotePlaylist = { remote, tracks };
       this.openModal(buildRemotePlaylistModalHtml(remote, item, tracks, getSafeThumb));
       document.getElementById('remote-pl-play')?.addEventListener('click', () => {
         if (tracks.length > 0) this.player.playTrack(tracks[0], tracks);
@@ -2154,6 +2659,10 @@ class SonoraApp {
         await this.storage.mergePlaylist(remote.title || item.title, remote.description || '', tracks, item.id);
         this.closeModal();
         this.showToast('Плейлист сохранён в Медиатеку');
+      });
+      document.getElementById('remote-pl-offline')?.addEventListener('click', () => {
+        this.closeModal();
+        this.downloadTracksBatchOffline(tracks);
       });
     } catch (err) {
       this.closeModal();

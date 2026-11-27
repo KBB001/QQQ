@@ -13,6 +13,7 @@ import {
   extractPlaylistId,
   extractVideoId,
   parseLrcLines,
+  parseLyricsTrackQuery,
   selectBestIosAudioStream,
   SonoraApi
 } from '../src/api.js';
@@ -498,5 +499,240 @@ test('SonoraPlayer primes iOS AudioSession playback, prefetches next track, omit
     if (origNavDescriptor) {
       Object.defineProperty(globalThis, 'navigator', origNavDescriptor);
     }
+  }
+});
+
+test('SonoraStorage supports SWR home cache, fast nodes, search item deletion, and playlist sort/reorder', async () => {
+  const storage = new SonoraStorage();
+  await storage.init();
+
+  await storage.saveCachedHomeMood('ALL', [
+    { id: 'dQw4w9WgXcQ', title: 'Track A', artist: 'Artist Z', durationSeconds: 210 },
+    { id: '1N8hOpMqvYs', title: 'Track B', artist: 'Artist A', durationSeconds: 120 }
+  ]);
+  const cached = storage.getCachedHomeMood('ALL');
+  assert.equal(cached?.tracks?.length, 2);
+  assert.ok(cached.updatedAt > 0);
+
+  await storage.saveFastNode('piped', 'https://fast-piped.example.com/');
+  assert.equal(storage.fastNodes.piped, 'https://fast-piped.example.com');
+
+  await storage.recordSearchQuery('Chill Mix');
+  await storage.recordSearchQuery('Synthwave');
+  await storage.removeSearchHistoryItem('chill mix');
+  assert.deepEqual(storage.library.searchHistory, ['Synthwave']);
+
+  const pl = await storage.createPlaylist('Sort Test', '', [
+    { id: 'trk00000001', title: 'Beta', artist: 'Zed', durationSeconds: 300 },
+    { id: 'trk00000002', title: 'Alpha', artist: 'Amy', durationSeconds: 150 },
+    { id: 'trk00000003', title: 'Gamma', artist: 'Mid', durationSeconds: 220 }
+  ]);
+
+  assert.equal(await storage.sortPlaylistTracks(pl.id, 'TITLE'), true);
+  assert.deepEqual(
+    storage.library.playlists[0].tracks.map((t) => t.title),
+    ['Alpha', 'Beta', 'Gamma']
+  );
+
+  assert.equal(await storage.sortPlaylistTracks(pl.id, 'DURATION'), true);
+  assert.deepEqual(
+    storage.library.playlists[0].tracks.map((t) => t.durationSeconds),
+    [150, 220, 300]
+  );
+
+  assert.equal(await storage.moveTrackInPlaylist(pl.id, 2, 0), true);
+  assert.equal(storage.library.playlists[0].tracks[0].title, 'Beta');
+});
+
+test('SonoraApi coalesces concurrent streams, parses lyrics queries, falls back to Invidious channels, and resolves offline CORS candidates', async () => {
+  const parsedDash = parseLyricsTrackQuery('Kavinsky - Nightcall (Official Audio) [HD]', 'Kavinsky - Topic');
+  assert.equal(parsedDash.artist, 'Kavinsky');
+  assert.equal(parsedDash.title, 'Nightcall');
+
+  const originalFetch = globalThis.fetch;
+  let streamHits = 0;
+  try {
+    globalThis.fetch = async (url) => {
+      const s = String(url);
+      if (s.startsWith('https://priority-piped.example.com/streams/dQw4w9WgXcQ')) {
+        streamHits++;
+        await new Promise((r) => setTimeout(r, 25));
+        return new Response(
+          JSON.stringify({
+            title: 'Song',
+            uploader: 'Artist',
+            duration: 180,
+            audioStreams: [
+              { url: 'https://rr1.googlevideo.com/audio.m4a', bitrate: 128000, mimeType: 'audio/mp4', codec: 'mp4a.40.2' }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      if (s.startsWith('https://invidious.nerdvpn.de/api/v1/channels/UCtest123')) {
+        return new Response(
+          JSON.stringify({
+            author: 'Fallback Artist',
+            subCount: 150000,
+            authorThumbnails: [{ url: 'https://yt3.googleusercontent.com/avatar.jpg' }],
+            latestVideos: [{ videoId: '1N8hOpMqvYs', title: 'Channel Hit', author: 'Fallback Artist', lengthSeconds: 195 }]
+          }),
+          { status: 200 }
+        );
+      }
+      if (s.startsWith('https://invidious.nerdvpn.de/api/v1/videos/dQw4w9WgXcQ')) {
+        return new Response(
+          JSON.stringify({
+            adaptiveFormats: [{ url: 'https://rr5.googlevideo.com/raw.m4a', type: 'audio/mp4', bitrate: '128000' }]
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('err', { status: 502 });
+    };
+
+    const api = new SonoraApi(() => ({
+      fastNodes: { piped: 'https://priority-piped.example.com' }
+    }));
+
+    // Concurrent calls for the same stream should coalesce into a single fetch
+    const [r1, r2] = await Promise.all([
+      api.getStreamInfo('dQw4w9WgXcQ', 'HIGH'),
+      api.getStreamInfo('dQw4w9WgXcQ', 'HIGH')
+    ]);
+    assert.equal(streamHits, 1);
+    assert.equal(r1.streamUrl, r2.streamUrl);
+
+    // Artist page falls back cleanly to Invidious /api/v1/channels/ when Piped fails
+    const artist = await api.getArtistDetails({
+      id: '/channel/UCtest123',
+      channelUrl: '/channel/UCtest123',
+      title: 'Fallback Artist',
+      artist: ''
+    });
+    assert.equal(artist.tracks.length, 1);
+    assert.equal(artist.tracks[0].id, '1N8hOpMqvYs');
+
+    // Offline candidates elevate Invidious local=true CORS-safe route over raw googlevideo
+    const offlineCandidates = await api.getOfflineStreamCandidates('dQw4w9WgXcQ', 'HIGH', [
+      'https://rr1.googlevideo.com/audio.m4a'
+    ]);
+    assert.ok(offlineCandidates.some((u) => u.includes('local=true')));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('SonoraPlayer keeps deterministic shuffle prefetch and supports queue reordering/removal/clear', async () => {
+  const { SonoraPlayer } = await import('../src/player.js');
+  const storage = new SonoraStorage();
+  await storage.init();
+
+  const mockAudio = {
+    src: '',
+    paused: true,
+    currentTime: 0,
+    duration: 180,
+    playbackRate: 1,
+    volume: 1,
+    muted: false,
+    setAttribute() {},
+    removeAttribute() {},
+    addEventListener() {},
+    async play() { this.paused = false; },
+    pause() { this.paused = true; },
+    load() {}
+  };
+
+  const fakeApi = {
+    async getStreamInfo(id) {
+      return {
+        engine: 'audio',
+        sourceType: 'piped',
+        sourceKey: 'gw1',
+        streamUrl: `https://cdn.example/${id}.m4a`,
+        streamCandidates: [`https://cdn.example/${id}.m4a`],
+        mimeType: 'audio/mp4'
+      };
+    },
+    async fetchLyrics() {
+      return { synced: [], plain: '', source: '' };
+    }
+  };
+
+  const player = new SonoraPlayer({
+    api: fakeApi,
+    storage,
+    offline: null,
+    recommendations: null,
+    audioElement: mockAudio
+  });
+
+  const tracks = [
+    { id: 't0000000001', title: 'Track 1', artist: 'A', durationSeconds: 180 },
+    { id: 't0000000002', title: 'Track 2', artist: 'A', durationSeconds: 180 },
+    { id: 't0000000003', title: 'Track 3', artist: 'A', durationSeconds: 180 }
+  ];
+
+  player.shuffleEnabled = true;
+  await player.playTrack(tracks[0], tracks);
+  const predictedNext = player.getUpcomingTrack();
+  assert.ok(predictedNext && predictedNext.id !== tracks[0].id);
+
+  await player.next(true);
+  assert.equal(player.currentTrack.id, predictedNext.id);
+
+  // Move and remove queue items
+  player.shuffleEnabled = false;
+  await player.playTrack(tracks[0], tracks);
+  await player.moveQueueTrack(2, 1);
+  assert.equal(player.queue[1].id, 't0000000003');
+  await player.removeFromQueue(1);
+  assert.equal(player.queue.length, 2);
+
+  await player.clearQueue();
+  assert.equal(player.queue.length, 0);
+  assert.equal(player.currentIndex, -1);
+});
+
+test('SonoraOfflineManager reuses cached ObjectURLs across repeated playback lookups', async () => {
+  const storage = new SonoraStorage();
+  await storage.init();
+  const mgr = new SonoraOfflineManager(storage);
+
+  const origCaches = globalThis.caches;
+  const origCreateObjectURL = URL.createObjectURL;
+  let blobReads = 0;
+  let urlCreates = 0;
+
+  try {
+    globalThis.caches = {
+      async open() {
+        return {
+          async match() {
+            blobReads++;
+            return {
+              async blob() {
+                return new Blob([new Uint8Array(2048)], { type: 'audio/mp4' });
+              }
+            };
+          }
+        };
+      }
+    };
+    URL.createObjectURL = () => {
+      urlCreates++;
+      return `blob:offline-${urlCreates}`;
+    };
+
+    const u1 = await mgr.getOfflinePlaybackUrl('dQw4w9WgXcQ');
+    const u2 = await mgr.getOfflinePlaybackUrl('dQw4w9WgXcQ');
+    assert.equal(u1, 'blob:offline-1');
+    assert.equal(u2, 'blob:offline-1');
+    assert.equal(blobReads, 1);
+    assert.equal(urlCreates, 1);
+  } finally {
+    globalThis.caches = origCaches;
+    URL.createObjectURL = origCreateObjectURL;
   }
 });

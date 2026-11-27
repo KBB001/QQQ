@@ -111,6 +111,10 @@ export const YOUTUBE_DIRECT_EXPORT_SNIPPET = `(async () => {
   alert('Готово! Файл sonora-yt-library.json скачан (и скопирован в буфер). Откройте Sonora и загрузите его.');
 })();`;
 
+export const YOUTUBE_EXPORT_BOOKMARKLET = `javascript:${encodeURIComponent(
+  YOUTUBE_DIRECT_EXPORT_SNIPPET.replace(/\s*\n\s*/g, ' ').trim()
+)}`;
+
 export function buildCreatePlaylistModalHtml() {
   return `
     <h3 class="modal-title">Новый плейлист</h3>
@@ -125,10 +129,10 @@ export function buildCreatePlaylistModalHtml() {
 
 export function buildImportPlaylistModalHtml() {
   return `
-    <h3 class="modal-title">Импорт плейлиста YouTube Music</h3>
-    <p class="modal-desc">Вставьте ссылку или ID публичного плейлиста (PL... или OLAK5uy_...)</p>
+    <h3 class="modal-title">Импорт по ссылкам YouTube Music</h3>
+    <p class="modal-desc">Вставьте одну или сразу несколько ссылок/ID (по одной на строке) на плейлисты или треки YouTube / YouTube Music.</p>
     <form id="import-yt-playlist-form">
-      <input id="yt-playlist-url" class="ios-field" type="text" placeholder="https://music.youtube.com/playlist?list=..." required />
+      <textarea id="yt-playlist-url" class="ios-field ios-textarea" placeholder="https://music.youtube.com/playlist?list=PL...\nhttps://music.youtube.com/watch?v=..." required></textarea>
       <button type="submit" class="btn-primary-full">Импортировать</button>
       <button type="button" class="btn-secondary-full" data-action="close-modal">Отмена</button>
     </form>
@@ -156,21 +160,27 @@ export function buildDeletePlaylistModalHtml(playlist) {
   `;
 }
 
-export function buildTrackMenuHtml(track, { isFav, isOffline, isDownloading, canRemoveFromPl }) {
+export function buildTrackMenuHtml(track, { isFav, isOffline, isDownloading, progressPct = 0, canRemoveFromPl }) {
   const safeId = escapeHtml(track.id);
+  const dlText = isDownloading
+    ? `Отменить загрузку (${progressPct > 0 ? `${progressPct}%` : 'подготовка…'})`
+    : isOffline
+      ? 'Удалить из оффлайн-кэша'
+      : 'Скачать оффлайн (без интернета)';
   return `
     <h3 class="modal-title">${escapeHtml(track.title)}</h3>
     <p class="modal-sub-title">${escapeHtml(track.artist)}</p>
     <button type="button" class="btn-secondary-full" data-action="toggle-favorite" data-track-id="${safeId}">
       ${isFav ? 'Убрать из Избранного' : 'Добавить в Избранное'}
     </button>
-    <button type="button" class="btn-secondary-full" data-action="toggle-offline-track" data-track-id="${safeId}">
-      ${isDownloading ? 'Загружается оффлайн…' : isOffline ? 'Удалить из оффлайн-кэша' : 'Скачать оффлайн (без интернета)'}
+    <button type="button" class="btn-secondary-full" data-action="${isDownloading ? 'cancel-offline-track' : 'toggle-offline-track'}" data-track-id="${safeId}">
+      ${dlText}
     </button>
     <button type="button" class="btn-secondary-full" data-action="menu-play-next" data-track-id="${safeId}">Играть следующим</button>
     <button type="button" class="btn-secondary-full" data-action="menu-add-queue" data-track-id="${safeId}">Добавить в очередь</button>
     <button type="button" class="btn-secondary-full" data-action="menu-start-radio" data-track-id="${safeId}">Запустить радио по треку</button>
     <button type="button" class="btn-secondary-full" data-action="menu-add-playlist" data-track-id="${safeId}">Добавить в плейлист</button>
+    <button type="button" class="btn-secondary-full" data-action="share-track" data-track-id="${safeId}">Поделиться треком</button>
     ${
       canRemoveFromPl
         ? `<button type="button" class="btn-danger-full" data-action="remove-from-active-playlist" data-track-id="${safeId}">Удалить из плейлиста</button>`
@@ -278,21 +288,34 @@ export function buildSleepTimerModalHtml() {
 
 export function buildQueueModalHtml({ queue, currentIndex, getSafeThumb }) {
   return `
-    <h3 class="modal-title">Очередь (${queue.length})</h3>
+    <div class="modal-header-row">
+      <h3 class="modal-title">Очередь (${queue.length})</h3>
+      ${
+        queue.length > 0
+          ? `<button type="button" class="section-action danger-text" data-action="clear-queue">Очистить</button>`
+          : ''
+      }
+    </div>
     ${
       queue.length > 0
         ? `<div class="grouped-card">
             ${queue
               .map(
                 (t, i) => `
-              <button type="button" class="track-row ${i === currentIndex ? 'active-track' : ''}" data-action="jump-queue" data-qindex="${i}">
-                <span class="track-index-num">${i + 1}</span>
+              <div class="track-row ${i === currentIndex ? 'active-track' : ''}">
+                <span class="track-index-num">${i === currentIndex ? '▶' : i + 1}</span>
                 <img src="${escapeHtml(getSafeThumb(t))}" alt="" class="track-thumb" loading="lazy" />
-                <div class="track-meta">
+                <button type="button" class="track-meta" data-action="jump-queue" data-qindex="${i}">
                   <div class="track-title">${escapeHtml(t.title)}</div>
                   <div class="track-sub">${escapeHtml(t.artist)}</div>
-                </div>
-              </button>`
+                </button>
+                ${
+                  i !== currentIndex && i !== currentIndex + 1
+                    ? `<button type="button" class="track-more-btn" data-action="queue-move-next" data-qindex="${i}" title="Играть следующим" aria-label="Играть следующим">↑</button>`
+                    : ''
+                }
+                <button type="button" class="track-more-btn" data-action="queue-remove" data-qindex="${i}" title="Удалить из очереди" aria-label="Удалить из очереди">✕</button>
+              </div>`
               )
               .join('')}
           </div>`
@@ -303,18 +326,19 @@ export function buildQueueModalHtml({ queue, currentIndex, getSafeThumb }) {
 }
 
 export function buildRemotePlaylistModalHtml(remote, item, tracks, getSafeThumb) {
+  const previewLimit = 25;
   const previewRows = tracks
-    .slice(0, 10)
+    .slice(0, previewLimit)
     .map(
       (t, i) => `
-      <div class="track-row">
+      <button type="button" class="track-row" data-action="play-remote-track" data-remote-idx="${i}">
         <span class="track-index-num">${i + 1}</span>
         <img src="${escapeHtml(getSafeThumb(t))}" alt="" class="track-thumb" loading="lazy" />
         <div class="track-meta">
           <div class="track-title">${escapeHtml(t.title)}</div>
           <div class="track-sub">${escapeHtml(t.artist)}</div>
         </div>
-      </div>`
+      </button>`
     )
     .join('');
 
@@ -324,7 +348,43 @@ export function buildRemotePlaylistModalHtml(remote, item, tracks, getSafeThumb)
     <button type="button" class="btn-primary-full" id="remote-pl-play">Включить всё</button>
     <button type="button" class="btn-secondary-full" id="remote-pl-queue">Добавить в очередь</button>
     <button type="button" class="btn-secondary-full" id="remote-pl-save">Сохранить в Медиатеку</button>
-    ${previewRows ? `<div class="grouped-card modal-preview-list">${previewRows}</div>` : ''}
+    <button type="button" class="btn-secondary-full" id="remote-pl-offline">Скачать оффлайн</button>
+    ${
+      previewRows
+        ? `<div class="grouped-card modal-preview-list">${previewRows}</div>
+           ${tracks.length > previewLimit ? `<p class="modal-desc mt-8">Показаны первые ${previewLimit} из ${tracks.length} треков.</p>` : ''}`
+        : ''
+    }
+    <button type="button" class="btn-secondary-full" data-action="close-modal">Закрыть</button>
+  `;
+}
+
+export function buildMixPreviewModalHtml(mix, getSafeThumb) {
+  const tracks = Array.isArray(mix?.tracks) ? mix.tracks : [];
+  const rows = tracks
+    .map(
+      (t, i) => `
+      <button type="button" class="track-row" data-action="play-mix-track" data-mix-id="${escapeHtml(mix.id)}" data-mix-idx="${i}">
+        <span class="track-index-num">${i + 1}</span>
+        <img src="${escapeHtml(getSafeThumb(t))}" alt="" class="track-thumb" loading="lazy" />
+        <div class="track-meta">
+          <div class="track-title">${escapeHtml(t.title)}</div>
+          <div class="track-sub">${escapeHtml(t.artist)}</div>
+        </div>
+      </button>`
+    )
+    .join('');
+
+  return `
+    <h3 class="modal-title">${escapeHtml(mix.title || 'Персональный микс')}</h3>
+    <p class="modal-sub-title">${escapeHtml(mix.subtitle || `${tracks.length} треков`)}</p>
+    <button type="button" class="btn-primary-full" id="mix-modal-play">Слушать всё</button>
+    <div class="action-pills-row">
+      <button type="button" class="btn-secondary-full" id="mix-modal-shuffle">Перемешать</button>
+      <button type="button" class="btn-secondary-full" id="mix-modal-queue">В очередь</button>
+      <button type="button" class="btn-secondary-full" id="mix-modal-save">Сохранить в Медиатеку</button>
+    </div>
+    ${rows ? `<div class="grouped-card modal-preview-list">${rows}</div>` : ''}
     <button type="button" class="btn-secondary-full" data-action="close-modal">Закрыть</button>
   `;
 }
@@ -338,7 +398,7 @@ export function buildYouTubeImportModalHtml({
   return `
     <h3 class="modal-title">Синхронизация YouTube Music</h3>
     <p class="modal-desc">
-      Полностью без серверов и передачи Cookie: перенесите лайки, историю и плейлисты прямо на устройство через экспорт из вкладки YouTube Music, Google Takeout или копию Android Sonora.
+      Полностью без серверов и передачи паролей: загрузите свои плейлисты по ссылкам, через закладку для Safari/Chrome на телефоне, Google Takeout или копию Android Sonora.
     </p>
     ${
       accounts.length > 0
@@ -357,21 +417,22 @@ export function buildYouTubeImportModalHtml({
     ${statusMessage ? `<div class="modal-status-msg">${escapeHtml(statusMessage)}</div>` : ''}
 
     <div class="helper-box">
-      <div class="helper-title">1. Прямой экспорт с music.youtube.com (без серверов)</div>
+      <div class="helper-title">1. Быстрый мобильный импорт (без консоли браузера)</div>
       <p class="modal-desc">
-        Откройте <b>music.youtube.com</b> в браузере под своим аккаунтом и запустите скрипт — он сохранит файл <code>sonora-yt-library.json</code> локально без отправки ваших Cookie.
+        Вставьте одну или сразу несколько ссылок на плейлисты/треки YouTube Music либо сохраните <b>Закладку-экспорт</b> для Safari на iPhone.
       </p>
-      <button type="button" class="btn-secondary-full" data-action="copy-yt-export-snippet">Скопировать скрипт экспорта</button>
+      <button type="button" class="btn-primary-full" data-action="open-import-yt-playlist">Импорт по ссылкам (пакетно)</button>
+      <button type="button" class="btn-secondary-full" data-action="copy-yt-bookmarklet">Скопировать закладку (Bookmarklet) для iPhone</button>
+      <button type="button" class="btn-secondary-full" data-action="copy-yt-export-snippet">Скопировать скрипт для консоли (ПК)</button>
     </div>
 
     <form id="yt-import-form">
-      <label class="field-label" for="yt-import-json">2. Вставьте JSON экспорта или загрузите файл (JSON / CSV Takeout)</label>
+      <label class="field-label" for="yt-import-json">2. Вставьте JSON или выберите файл (JSON / CSV Takeout / .sonoraenc)</label>
       <textarea id="yt-import-json" class="ios-field ios-textarea" placeholder="Вставьте содержимое sonora-yt-library.json, watch-history.json или CSV из Google Takeout..."></textarea>
       <button type="submit" class="btn-primary-full">Импортировать вставленный текст</button>
     </form>
 
     <button type="button" class="btn-secondary-full" data-action="choose-yt-import-file">Выбрать файл (.json, .csv Takeout, .sonoraenc)</button>
-    <button type="button" class="btn-secondary-full" data-action="open-import-yt-playlist">Импортировать плейлист по ссылке</button>
     ${acc.id ? `<button type="button" class="btn-danger-full" data-action="remove-current-account" data-account-id="${escapeHtml(acc.id)}">Удалить профиль «${escapeHtml(acc.name)}»</button>` : ''}
     <button type="button" class="btn-secondary-full" data-action="close-modal">Закрыть</button>
   `;

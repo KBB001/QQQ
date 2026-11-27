@@ -64,6 +64,7 @@ export class SonoraPlayer {
     this._primingSilentAudio = false;
     this._prefetchedOfflineUrls = new Map();
     this._prefetchSeq = 0;
+    this._nextShuffleIndex = -1;
 
     this.audio.playbackRate = this.playbackSpeed;
     this._ensurePlaybackAudioSession();
@@ -77,6 +78,7 @@ export class SonoraPlayer {
         Math.max(0, Number(storage.playback.currentIndex) || 0),
         this.queue.length - 1
       );
+      this._computeNextShuffleIndex();
       const restored = this.currentTrack;
       if (restored) {
         this.duration = restored.durationSeconds || 0;
@@ -91,8 +93,31 @@ export class SonoraPlayer {
     return this.queue[this.currentIndex];
   }
 
+  _computeNextShuffleIndex() {
+    if (!this.shuffleEnabled || this.queue.length <= 1) {
+      this._nextShuffleIndex = -1;
+      return -1;
+    }
+    let idx;
+    do {
+      idx = Math.floor(Math.random() * this.queue.length);
+    } while (idx === this.currentIndex);
+    this._nextShuffleIndex = idx;
+    return idx;
+  }
+
   getUpcomingTrack() {
     if (this.queue.length === 0) return null;
+    if (this.shuffleEnabled && this.queue.length > 1) {
+      if (
+        this._nextShuffleIndex < 0 ||
+        this._nextShuffleIndex >= this.queue.length ||
+        this._nextShuffleIndex === this.currentIndex
+      ) {
+        this._computeNextShuffleIndex();
+      }
+      return this.queue[this._nextShuffleIndex] || null;
+    }
     if (this.currentIndex + 1 < this.queue.length) {
       return this.queue[this.currentIndex + 1];
     }
@@ -528,6 +553,7 @@ export class SonoraPlayer {
       }
     }
 
+    this._computeNextShuffleIndex();
     this._resetFailoverState();
     await this._loadAndPlayTrack(this.currentTrack, 0, true);
   }
@@ -621,18 +647,20 @@ export class SonoraPlayer {
     }
   }
 
-  async loadLyricsForCurrentTrack(track = this.currentTrack) {
+  async loadLyricsForCurrentTrack(track = this.currentTrack, { force = false, customQuery = '' } = {}) {
     if (!track) return;
-    const cached = this.lyricsCache.get(track.id);
-    if (cached) {
-      this.activeLyrics = { ...cached, loading: false };
-      this._emit();
-      return;
+    if (!force && !customQuery) {
+      const cached = this.lyricsCache.get(track.id);
+      if (cached) {
+        this.activeLyrics = { ...cached, loading: false };
+        this._emit();
+        return;
+      }
     }
 
     this.activeLyrics = { synced: [], plain: '', source: '', loading: true };
     this._emit();
-    const res = await this.api.fetchLyrics(track);
+    const res = await this.api.fetchLyrics(track, customQuery);
     this.lyricsCache.set(track.id, res);
     if (this.currentTrack?.id === track.id) {
       this.activeLyrics = { ...res, loading: false };
@@ -721,9 +749,12 @@ export class SonoraPlayer {
 
     let nextIdx = -1;
     if (this.shuffleEnabled && this.queue.length > 1) {
-      do {
-        nextIdx = Math.floor(Math.random() * this.queue.length);
-      } while (nextIdx === this.currentIndex);
+      nextIdx =
+        this._nextShuffleIndex >= 0 &&
+        this._nextShuffleIndex < this.queue.length &&
+        this._nextShuffleIndex !== this.currentIndex
+          ? this._nextShuffleIndex
+          : this._computeNextShuffleIndex();
     } else if (this.currentIndex + 1 < this.queue.length) {
       nextIdx = this.currentIndex + 1;
     } else if (this.repeatMode === 'ALL') {
@@ -732,6 +763,7 @@ export class SonoraPlayer {
 
     if (nextIdx >= 0) {
       this.currentIndex = nextIdx;
+      this._computeNextShuffleIndex();
       this._resetFailoverState();
       await this._loadAndPlayTrack(this.currentTrack, 0, true);
       return;
@@ -754,6 +786,7 @@ export class SonoraPlayer {
         if (additions.length > 0) {
           this.queue = [...this.queue, ...additions];
           this.currentIndex += 1;
+          this._computeNextShuffleIndex();
           this._resetFailoverState();
           await this._loadAndPlayTrack(this.currentTrack, 0, true);
           return;
@@ -783,6 +816,7 @@ export class SonoraPlayer {
       this.seekTo(0);
       return;
     }
+    this._computeNextShuffleIndex();
     this._resetFailoverState();
     await this._loadAndPlayTrack(this.currentTrack, 0, true);
   }
@@ -801,6 +835,7 @@ export class SonoraPlayer {
       if (existingIdx < this.currentIndex) this.currentIndex -= 1;
     }
     this.queue.splice(this.currentIndex + 1, 0, clean);
+    this._computeNextShuffleIndex();
     await this._persistPlayback(true);
     this._prefetchNextTrack();
     this._emit();
@@ -817,10 +852,79 @@ export class SonoraPlayer {
     const additions = cleanList.filter((t) => !existing.has(t.id));
     if (additions.length === 0) return 0;
     this.queue = [...this.queue, ...additions];
+    this._computeNextShuffleIndex();
     await this._persistPlayback(true);
     this._prefetchNextTrack();
     this._emit();
     return additions.length;
+  }
+
+  async removeFromQueue(index) {
+    if (index < 0 || index >= this.queue.length) return;
+    if (this.queue.length === 1) {
+      await this.clearQueue();
+      return;
+    }
+    const removingCurrent = index === this.currentIndex;
+    this.queue.splice(index, 1);
+    if (index < this.currentIndex) {
+      this.currentIndex -= 1;
+    } else if (removingCurrent) {
+      this.currentIndex = Math.min(index, this.queue.length - 1);
+    }
+    this._computeNextShuffleIndex();
+    if (removingCurrent && this.currentTrack) {
+      this._resetFailoverState();
+      await this._loadAndPlayTrack(this.currentTrack, 0, this.isPlaying);
+      return;
+    }
+    await this._persistPlayback(true);
+    this._prefetchNextTrack();
+    this._emit();
+  }
+
+  async moveQueueTrack(fromIndex, toIndex) {
+    if (
+      fromIndex < 0 ||
+      toIndex < 0 ||
+      fromIndex >= this.queue.length ||
+      toIndex >= this.queue.length ||
+      fromIndex === toIndex
+    ) {
+      return;
+    }
+    const currentId = this.currentTrack?.id;
+    const [moved] = this.queue.splice(fromIndex, 1);
+    this.queue.splice(toIndex, 0, moved);
+    if (currentId) {
+      this.currentIndex = this.queue.findIndex((t) => t.id === currentId);
+    }
+    this._computeNextShuffleIndex();
+    await this._persistPlayback(true);
+    this._prefetchNextTrack();
+    this._emit();
+  }
+
+  async clearQueue() {
+    this._trackLoadSeq += 1;
+    this._primingSilentAudio = false;
+    try {
+      this.audio.pause();
+      this.audio.removeAttribute?.('src');
+      this.audio.src = '';
+    } catch {
+      // Ignore
+    }
+    this.queue = [];
+    this.currentIndex = -1;
+    this._nextShuffleIndex = -1;
+    this.isPlaying = false;
+    this.isBuffering = false;
+    this.currentTime = 0;
+    this.duration = 0;
+    this._setMediaPlaybackState('none');
+    await this._persistPlayback(true);
+    this._emit();
   }
 
   async startRadio(track) {
@@ -832,6 +936,7 @@ export class SonoraPlayer {
       if (unique.length > 0) {
         this.queue = [this.currentTrack, ...unique];
         this.currentIndex = 0;
+        this._computeNextShuffleIndex();
         await this._persistPlayback(true);
         this._prefetchNextTrack();
         this._emit();
@@ -843,7 +948,9 @@ export class SonoraPlayer {
 
   toggleShuffle() {
     this.shuffleEnabled = !this.shuffleEnabled;
+    this._computeNextShuffleIndex();
     this._persistPlayback(true);
+    this._prefetchNextTrack();
     this._emit();
   }
 

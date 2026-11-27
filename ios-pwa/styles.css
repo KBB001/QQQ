@@ -1516,3 +1516,138 @@ button {
 .spacer-12 { height: 12px; }
 .no-border { border: none; margin-top: 0; }
 
+/* New Optimization & Control Styles */
+.batch-progress-bar {
+  margin-top: 6px;
+  height: 4px;
+  border-radius: 999px;
+  background: var(--bg-subtle);
+  overflow: hidden;
+  width: 100%;
+}
+
+.batch-progress-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent);
+  transition: width 0.2s ease;
+}
+
+.dl-pct-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  background: var(--accent-soft);
+  color: var(--accent);
+  vertical-align: middle;
+}
+
+.player-ctrl-btn .dl-pct-badge {
+  margin-left: 0;
+  padding: 3px 7px;
+  background: rgba(30, 215, 96, 0.22);
+  color: #1ed760;
+}
+
+.modal-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.modal-header-row .modal-title {
+  margin: 0;
+}
+
+.chip-pill-group {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  min-height: 38px;
+  border-radius: 999px;
+  background: var(--bg-grouped);
+  border: 0.5px solid var(--separator);
+  overflow: hidden;
+}
+
+.chip-pill-main {
+  min-height: 38px;
+  padding: 0 10px 0 14px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.chip-pill-del {
+  min-width: 32px;
+  min-height: 38px;
+  padding-right: 6px;
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.icon-pill-btn.active-pill {
+  background: var(--accent);
+  color: var(--accent-contrast);
+}
+
+.action-pills-row .btn-secondary-full {
+  width: auto;
+  flex: 1 1 110px;
+  margin-top: 0;
+  padding: 0 12px;
+}
+
+button.track-meta {
+  text-align: left;
+}
+
+.lyrics-tools-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.lyrics-source-tag {
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.65);
+}
+
+.player-pill-sm {
+  min-height: 32px;
+  height: 32px;
+  padding: 0 12px;
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.14);
+  color: #ffffff;
+}
+
+.lyrics-search-box {
+  background: rgba(255, 255, 255, 0.14);
+  color: #ffffff;
+}
+
+.lyrics-search-box .search-input::placeholder {
+  color: rgba(255, 255, 255, 0.55);
+}
+
+.lyrics-empty-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 0;
+}
