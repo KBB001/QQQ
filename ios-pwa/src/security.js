@@ -271,3 +271,150 @@ export async function decryptLocalSecret(payload, aesKey) {
   const plain = await subtle.decrypt({ name: 'AES-GCM', iv }, aesKey, data);
   return new TextDecoder().decode(plain);
 }
+
+function splitCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === ',' && !inQuotes) {
+      out.push(cur.trim());
+      cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur.trim());
+  return out;
+}
+
+export function parseExternalYouTubeImport(rawText, defaultPlaylistName = 'Импорт YouTube Music') {
+  const text = String(rawText ?? '').trim();
+  if (!text) throw new Error('Вставьте данные или выберите файл для импорта');
+
+  if (text.startsWith('{') || text.startsWith('[')) {
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error('Некорректный JSON-формат данных');
+    }
+
+    if (parsed?.format === 'sonora-yt-sync:v1') {
+      return {
+        kind: 'yt_sync',
+        account: {
+          id: String(parsed.account?.id || parsed.account?.name || 'yt_local').trim(),
+          name: String(parsed.account?.name || 'YouTube Music').trim(),
+          handle: String(parsed.account?.handle || '').trim(),
+          email: String(parsed.account?.email || '').trim(),
+          avatarUrl: sanitizeHttpsUrl(parsed.account?.avatarUrl) || ''
+        },
+        likedTracks: Array.isArray(parsed.likedTracks) ? parsed.likedTracks.map(sanitizeTrack).filter(Boolean) : [],
+        historyTracks: Array.isArray(parsed.historyTracks) ? parsed.historyTracks.map(sanitizeTrack).filter(Boolean) : [],
+        playlists: Array.isArray(parsed.playlists)
+          ? parsed.playlists
+              .map((pl) => ({
+                id: pl?.id ? String(pl.id).trim() : null,
+                name: String(pl?.name || 'Плейлист YouTube Music').trim(),
+                description: String(pl?.description || '').trim(),
+                tracks: Array.isArray(pl?.tracks) ? pl.tracks.map(sanitizeTrack).filter(Boolean) : []
+              }))
+              .filter((p) => p.name)
+          : []
+      };
+    }
+
+    // Google Takeout watch-history.json / array format
+    if (Array.isArray(parsed)) {
+      const tracks = [];
+      const seen = new Set();
+      for (const item of parsed) {
+        const urlStr = String(item?.titleUrl || '');
+        const match = urlStr.match(/[?&]v=([A-Za-z0-9_-]{11})/);
+        if (!match) continue;
+        const id = match[1];
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const rawTitle = String(item?.title || '').replace(/^(Watched|Просмотрено|Listened to)\s+/i, '').trim();
+        const artist = String(item?.subtitles?.[0]?.name || 'YouTube Music').replace(/ - Topic$/i, '').trim();
+        const clean = sanitizeTrack({
+          id,
+          title: rawTitle || `Трек ${id}`,
+          artist,
+          durationSeconds: 0,
+          thumbnailUrl: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`
+        });
+        if (clean) tracks.push(clean);
+      }
+      if (tracks.length === 0) throw new Error('В JSON Google Takeout не найдено треков YouTube');
+      return {
+        kind: 'yt_sync',
+        account: null,
+        likedTracks: [],
+        historyTracks: tracks,
+        playlists: []
+      };
+    }
+
+    // Standard Sonora backup JSON
+    const norm = normalizeBackupPayload(parsed);
+    return { kind: 'sonora_backup', backup: norm };
+  }
+
+  // Google Takeout CSV playlist / liked-videos.csv format
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  if (lines.length === 0) throw new Error('Файл пуст');
+
+  const firstCols = splitCsvLine(lines[0]).map((c) => c.toLowerCase());
+  const vidColIdx = firstCols.findIndex(
+    (c) => c.includes('video id') || c.includes('видео') || c === 'id'
+  );
+  const titleColIdx = firstCols.findIndex((c) => c.includes('title') || c.includes('название'));
+  const artistColIdx = firstCols.findIndex((c) => c.includes('artist') || c.includes('channel') || c.includes('автор'));
+  const hasHeader = vidColIdx >= 0;
+  const startRow = hasHeader ? 1 : 0;
+
+  const tracks = [];
+  const seen = new Set();
+  for (let i = startRow; i < lines.length; i++) {
+    const cols = splitCsvLine(lines[i]);
+    const rawVid = hasHeader ? cols[vidColIdx] : cols.find((c) => /^[A-Za-z0-9_-]{11}$/.test(c));
+    const vidMatch = String(rawVid || '').match(/([A-Za-z0-9_-]{11})/);
+    if (!vidMatch) continue;
+    const id = vidMatch[1];
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const title = (titleColIdx >= 0 ? cols[titleColIdx] : '') || `YouTube Music (${id})`;
+    const artist = (artistColIdx >= 0 ? cols[artistColIdx] : '') || 'YouTube Music';
+    const clean = sanitizeTrack({
+      id,
+      title,
+      artist,
+      durationSeconds: 0,
+      thumbnailUrl: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`
+    });
+    if (clean) tracks.push(clean);
+  }
+
+  if (tracks.length === 0) {
+    throw new Error('Не удалось распознать треки. Поддерживаются JSON, CSV Google Takeout и копии Sonora.');
+  }
+
+  return {
+    kind: 'yt_sync',
+    account: null,
+    likedTracks: [],
+    historyTracks: [],
+    playlists: [{ id: null, name: defaultPlaylistName, description: 'Импорт Google Takeout', tracks }]
+  };
+}
+

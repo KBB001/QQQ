@@ -6,6 +6,7 @@ import {
   buildBackupPayload,
   escapeHtml,
   normalizeBackupPayload,
+  parseExternalYouTubeImport,
   sanitizeHttpsUrl
 } from '../src/security.js';
 import {
@@ -15,7 +16,7 @@ import {
   selectBestIosAudioStream,
   SonoraApi
 } from '../src/api.js';
-import { formatBytesRu } from '../src/offline.js';
+import { SonoraOfflineManager, formatBytesRu } from '../src/offline.js';
 import {
   ImplicitSignalType,
   MoodCategory,
@@ -114,6 +115,39 @@ test('normalizeBackupPayload and SonoraStorage import/export round-trip Android 
   assert.equal(exported.playlists[0].name, 'Roadtrip');
 });
 
+test('parseExternalYouTubeImport parses sonora-yt-sync:v1, Takeout watch-history.json, and Takeout CSV', () => {
+  const syncJson = JSON.stringify({
+    format: 'sonora-yt-sync:v1',
+    account: { id: '@test', name: 'Test User', avatarUrl: 'https://lh3.googleusercontent.com/a.jpg' },
+    likedTracks: [{ id: 'dQw4w9WgXcQ', title: 'Liked Song', artist: 'Artist' }],
+    historyTracks: [{ id: '1N8hOpMqvYs', title: 'Recent Song', artist: 'Artist 2' }],
+    playlists: [{ id: 'PL12345678', name: 'Workout', tracks: [{ id: 'dQw4w9WgXcQ', title: 'Liked Song', artist: 'Artist' }] }]
+  });
+  const syncParsed = parseExternalYouTubeImport(syncJson);
+  assert.equal(syncParsed.kind, 'yt_sync');
+  assert.equal(syncParsed.account.name, 'Test User');
+  assert.equal(syncParsed.likedTracks.length, 1);
+  assert.equal(syncParsed.playlists[0].name, 'Workout');
+
+  const takeoutJson = JSON.stringify([
+    { title: 'Watched Midnight City', titleUrl: 'https://www.youtube.com/watch?v=dQw4w9WgXcQ', subtitles: [{ name: 'M83 - Topic' }] }
+  ]);
+  const takeoutParsed = parseExternalYouTubeImport(takeoutJson);
+  assert.equal(takeoutParsed.historyTracks.length, 1);
+  assert.equal(takeoutParsed.historyTracks[0].title, 'Midnight City');
+  assert.equal(takeoutParsed.historyTracks[0].artist, 'M83');
+
+  const csvText = [
+    'Video ID,Playlist Video Creation Timestamp,Title,Channel',
+    'dQw4w9WgXcQ,2026-01-01T00:00:00Z,"Song, Quoted",Artist X',
+    '1N8hOpMqvYs,2026-01-02T00:00:00Z,Another Song,Artist Y'
+  ].join('\n');
+  const csvParsed = parseExternalYouTubeImport(csvText, 'My Takeout Mix');
+  assert.equal(csvParsed.playlists[0].name, 'My Takeout Mix');
+  assert.equal(csvParsed.playlists[0].tracks.length, 2);
+  assert.equal(csvParsed.playlists[0].tracks[0].title, 'Song, Quoted');
+});
+
 test('extractVideoId and extractPlaylistId parse YouTube, YouTube Music, and relative Piped URLs', () => {
   assert.equal(extractVideoId('https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=RDAMVM'), 'dQw4w9WgXcQ');
   assert.equal(extractVideoId('https://youtu.be/dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
@@ -134,7 +168,7 @@ test('extractVideoId and extractPlaylistId parse YouTube, YouTube Music, and rel
   assert.equal(extractPlaylistId('PLabcdefgh123456'), 'PLabcdefgh123456');
 });
 
-test('SonoraStorage supports creating/renaming playlists and multi-account switching', async () => {
+test('SonoraStorage supports creating/renaming playlists and local profile switching without cookies', async () => {
   const storage = new SonoraStorage();
   await storage.init();
   const pl = await storage.createPlaylist('Favorites Mix', 'Chill');
@@ -143,8 +177,8 @@ test('SonoraStorage supports creating/renaming playlists and multi-account switc
   assert.equal(updated.name, 'Night Drive');
   assert.equal(updated.description, 'Late night vibes');
 
-  await storage.upsertAccount({ id: 'acc1', name: 'Main YT', cookieHeader: 'SAPISID=aaa' });
-  await storage.upsertAccount({ id: 'acc2', name: 'Brand YT', cookieHeader: 'SAPISID=bbb' });
+  await storage.upsertAccount({ id: 'acc1', name: 'Main YT' });
+  await storage.upsertAccount({ id: 'acc2', name: 'Brand YT' });
   assert.equal(storage.accounts.length, 2);
   assert.equal(storage.activeAccount.id, 'acc2');
 
@@ -215,23 +249,254 @@ test('SmartRecommendationEngine builds personalized mixes and demotes quick-skip
   assert.ok(mixes.madeForYou.length >= 1);
 });
 
-test('SonoraApi orders personal Cloudflare Worker #1 and Render server #2 when configured', () => {
-  const api = new SonoraApi(() => ({
-    workerCatalogUrl: 'https://sonora-worker.example.workers.dev/',
-    serverUrl: 'https://sonora-server.onrender.com/',
-    customApiBaseUrl: 'https://custom-piped.example.com'
-  }));
-  api.setServerToken('https://sonora-server.onrender.com', 'mem-jwt-token');
-
-  const gateways = api._getCatalogGateways();
-  assert.equal(gateways[0].kind, 'worker');
-  assert.equal(gateways[0].base, 'https://sonora-worker.example.workers.dev');
-  assert.equal(gateways[1].kind, 'server');
-  assert.equal(gateways[1].prefix, '/api/catalog');
-  assert.equal(gateways[2].kind, 'piped');
-  assert.equal(gateways[2].base, 'https://custom-piped.example.com');
-
+test('SonoraOfflineManager.downloadTrackWithCandidates prioritizes CORS-friendly URLs without a server', async () => {
+  const storage = new SonoraStorage();
+  await storage.init();
+  const mgr = new SonoraOfflineManager(storage);
+  const triedUrls = [];
+  mgr.downloadTrack = async (_track, url) => {
+    triedUrls.push(url);
+    return 4096;
+  };
+  const bytes = await mgr.downloadTrackWithCandidates(
+    { id: 'dQw4w9WgXcQ', title: 'Track', artist: 'Artist' },
+    [
+      'https://rr1.googlevideo.com/videoplayback',
+      'https://invidious.nerdvpn.de/latest_version?id=dQw4w9WgXcQ&itag=140&local=true'
+    ]
+  );
+  assert.equal(bytes, 4096);
+  assert.ok(triedUrls[0].includes('local=true'));
   assert.equal(formatBytesRu(0), '0 КБ');
   assert.equal(formatBytesRu(5242880), '5.0 МБ');
 });
 
+test('SonoraApi uses zero-server parallel Piped/Invidious/Audius pools and never falls back to youtube_iframe', async () => {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url) => {
+      const s = String(url);
+      if (s.includes('piped-instances.kavin.rocks') || s.includes('api.invidious.io')) {
+        throw new Error('directory timeout');
+      }
+      if (s.startsWith('https://custom-piped.example.com/streams/')) {
+        return new Response(
+          JSON.stringify({
+            title: 'Ad-Free Piped Song',
+            uploader: 'Artist',
+            duration: 180,
+            audioStreams: [
+              {
+                url: 'https://rr1.googlevideo.com/audio.m4a',
+                bitrate: 128000,
+                mimeType: 'audio/mp4',
+                codec: 'mp4a.40.2'
+              }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      if (s.startsWith('https://invidious.nerdvpn.de/api/v1/videos/')) {
+        return new Response(
+          JSON.stringify({
+            title: 'Invidious Song',
+            author: 'Inv Artist',
+            lengthSeconds: 200,
+            adaptiveFormats: [
+              {
+                url: 'https://rr2---sn.googlevideo.com/videoplayback?mime=audio/mp4',
+                bitrate: '130000',
+                type: 'audio/mp4; codecs="mp4a.40.2"',
+                encoding: 'aac'
+              }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      if (s.includes('/suggestions?query=music') || s.includes('/api/v1/stats') || s.includes('/v1/tracks/trending')) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ error: 'unavailable' }), { status: 502 });
+    };
+
+    const api = new SonoraApi(() => ({
+      customApiBaseUrl: 'https://custom-piped.example.com'
+    }));
+
+    const pipedInfo = await api.getStreamInfo('dQw4w9WgXcQ', 'HIGH');
+    assert.equal(pipedInfo.engine, 'audio');
+    assert.equal(pipedInfo.sourceType, 'piped');
+    assert.equal(pipedInfo.sourceKey, 'https://custom-piped.example.com');
+    assert.ok(pipedInfo.streamCandidates.includes('https://rr1.googlevideo.com/audio.m4a'));
+
+    // Exclude Piped pool -> uses parallel Invidious fallback including local=true M4A route
+    const excludePiped = new Set([
+      'https://custom-piped.example.com',
+      'https://api.piped.private.coffee',
+      'https://pipedapi.ducks.party',
+      'https://pipedapi.adminforge.de',
+      'https://pipedapi.kavin.rocks',
+      'https://api.piped.projectsegfau.lt',
+      'https://pipedapi.in.projectsegfau.lt',
+      'https://pipedapi.r4fo.com',
+      'https://pipedapi.moomoo.me',
+      'https://pipedapi.ngn.tf'
+    ]);
+    const invInfo = await api.getStreamInfo('dQw4w9WgXcQ', 'HIGH', { excludeGateways: excludePiped });
+    assert.equal(invInfo.engine, 'audio');
+    assert.equal(invInfo.sourceType, 'invidious');
+    assert.ok(
+      invInfo.streamCandidates.some((u) => u.includes('/latest_version?id=dQw4w9WgXcQ&itag=140&local=true'))
+    );
+
+    const health = await api.testCatalogHealth();
+    assert.equal(health.piped.ok, true);
+    assert.equal(health.invidious.ok, true);
+    assert.equal(health.audius.ok, true);
+
+    // If all extractors fail, reject instead of falling back to ad-serving YouTube IFrame
+    globalThis.fetch = async () => new Response('fail', { status: 502 });
+    await assert.rejects(() => api.getStreamInfo('dQw4w9WgXcQ', 'HIGH'));
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('SonoraPlayer primes iOS AudioSession playback, prefetches next track, omits seek skip buttons, and rotates failovers', async () => {
+  const { SonoraPlayer } = await import('../src/player.js');
+  const storage = new SonoraStorage();
+  await storage.init();
+
+  const origNavDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'navigator');
+  const registeredActions = [];
+  const fakeAudioSession = { type: 'auto' };
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: {
+      audioSession: fakeAudioSession,
+      mediaSession: {
+        metadata: null,
+        playbackState: 'none',
+        setActionHandler(action) {
+          registeredActions.push(action);
+        },
+        setPositionState() {}
+      }
+    }
+  });
+
+  try {
+    const listeners = new Map();
+    const mockAudio = {
+      src: '',
+      paused: true,
+      currentTime: 0,
+      duration: 180,
+      playbackRate: 1,
+      volume: 1,
+      muted: false,
+      setAttribute() {},
+      addEventListener(type, fn) {
+        if (!listeners.has(type)) listeners.set(type, []);
+        listeners.get(type).push(fn);
+      },
+      async emit(type) {
+        for (const fn of listeners.get(type) || []) {
+          await fn();
+        }
+      },
+      async play() {
+        this.paused = false;
+      },
+      pause() {
+        this.paused = true;
+      },
+      load() {}
+    };
+
+    const calls = [];
+    const prefetchCalls = [];
+    const fakeApi = {
+      async getStreamInfo(id, _q, { excludeGateways = new Set() } = {}) {
+        if (id === 'trackNext002') {
+          prefetchCalls.push(id);
+          return {
+            engine: 'audio',
+            sourceType: 'piped',
+            sourceKey: 'gw1',
+            streamUrl: 'https://cdn.example/next.m4a',
+            streamCandidates: ['https://cdn.example/next.m4a'],
+            mimeType: 'audio/mp4'
+          };
+        }
+        calls.push(Array.from(excludeGateways));
+        if (!excludeGateways.has('gw1')) {
+          return {
+            engine: 'audio',
+            sourceType: 'piped',
+            sourceKey: 'gw1',
+            streamUrl: 'https://cdn.example/c1.m4a',
+            streamCandidates: ['https://cdn.example/c1.m4a', 'https://cdn.example/c2.m4a'],
+            mimeType: 'audio/mp4'
+          };
+        }
+        return {
+          engine: 'audio',
+          sourceType: 'invidious',
+          sourceKey: 'gw2',
+          streamUrl: 'https://inv.example/backup.m4a',
+          streamCandidates: ['https://inv.example/backup.m4a'],
+          mimeType: 'audio/mp4'
+        };
+      },
+      async fetchLyrics() {
+        return { synced: [], plain: '', source: '' };
+      }
+    };
+
+    const player = new SonoraPlayer({
+      api: fakeApi,
+      storage,
+      offline: null,
+      recommendations: null,
+      audioElement: mockAudio
+    });
+
+    assert.equal(fakeAudioSession.type, 'playback');
+    assert.ok(registeredActions.includes('previoustrack'));
+    assert.ok(registeredActions.includes('nexttrack'));
+    assert.equal(registeredActions.includes('seekbackward'), false);
+    assert.equal(registeredActions.includes('seekforward'), false);
+
+    const t1 = { id: 'dQw4w9WgXcQ', title: 'Track 1', artist: 'Artist', durationSeconds: 180 };
+    const t2 = { id: 'trackNext002', title: 'Track 2', artist: 'Artist', durationSeconds: 200 };
+    await player.playTrack(t1, [t1, t2]);
+    assert.equal(mockAudio.src, 'https://cdn.example/c1.m4a');
+    assert.ok(player._silentWavUrl.startsWith('blob:'));
+    assert.ok(prefetchCalls.includes('trackNext002'));
+
+    // First audio error advances to second candidate of gw1
+    await mockAudio.emit('error');
+    assert.equal(mockAudio.src, 'https://cdn.example/c2.m4a');
+
+    // Second audio error excludes gw1 and loads gw2 cleanly on <audio>
+    await mockAudio.emit('error');
+    assert.equal(mockAudio.src, 'https://inv.example/backup.m4a');
+    assert.equal(player.getSnapshot().engine, 'audio');
+    assert.equal(player.getSnapshot().sourceType, 'invidious');
+    assert.deepEqual(calls[1], ['gw1']);
+
+    // Track ends on Lock Screen -> switches immediately using prefetched streamCache without refetching
+    const countBeforeEnd = prefetchCalls.length;
+    await mockAudio.emit('ended');
+    assert.equal(player.currentTrack.id, 'trackNext002');
+    assert.equal(mockAudio.src, 'https://cdn.example/next.m4a');
+    assert.equal(prefetchCalls.length, countBeforeEnd);
+  } finally {
+    if (origNavDescriptor) {
+      Object.defineProperty(globalThis, 'navigator', origNavDescriptor);
+    }
+  }
+});

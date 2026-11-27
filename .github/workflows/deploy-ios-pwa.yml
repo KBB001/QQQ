@@ -5,8 +5,6 @@ on:
     branches: ["main", "master"]
     paths:
       - "ios-pwa/**"
-      - "server/**"
-      - "cloudflare-worker/**"
       - ".github/workflows/deploy-ios-pwa.yml"
   workflow_dispatch:
 
@@ -32,10 +30,8 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Run iOS PWA & Server Unit Tests
-        run: |
-          node --test ios-pwa/tests/pwa.test.mjs
-          node --test server/tests/server.test.mjs
+      - name: Run iOS PWA Unit Tests
+        run: node --test ios-pwa/tests/pwa.test.mjs
 
       - name: Validate PWA Assets & Manifest
         run: |

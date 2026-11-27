@@ -1,15 +1,114 @@
 import { escapeHtml } from './security.js';
 
-export const YOUTUBE_COOKIE_SNIPPET = `(() => {
-  const c = document.cookie || '';
-  if (!c.includes('SAPISID') && !c.includes('__Secure-3PAPISID')) {
-    alert('Откройте music.youtube.com под своим аккаунтом и повторите запуск.');
+export const YOUTUBE_DIRECT_EXPORT_SNIPPET = `(async () => {
+  if (!location.hostname.includes('youtube.com')) {
+    alert('Откройте music.youtube.com под своим аккаунтом и запустите скрипт там.');
     return;
   }
-  navigator.clipboard?.writeText(c).then(
-    () => alert('Cookie скопированы! Вставьте их в Sonora.'),
-    () => prompt('Скопируйте Cookie вручную:', c)
+  const cookieMap = Object.fromEntries(
+    document.cookie.split(';').map((p) => {
+      const i = p.indexOf('=');
+      return i > 0 ? [p.slice(0, i).trim(), p.slice(i + 1).trim()] : ['', ''];
+    })
   );
+  const sapisid = cookieMap['__Secure-3PAPISID'] || cookieMap['SAPISID'] || '';
+  if (!sapisid) {
+    alert('Войдите в свой аккаунт на music.youtube.com и повторите запуск.');
+    return;
+  }
+  const origin = 'https://music.youtube.com';
+  const ts = Math.floor(Date.now() / 1000);
+  const msg = ts + ' ' + sapisid + ' ' + origin;
+  const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(msg));
+  const hash = Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
+  const auth = 'SAPISIDHASH ' + ts + '_' + hash;
+  const ytPost = async (ep, body) => {
+    const r = await fetch(origin + '/youtubei/v1/' + ep + '?prettyPrint=false', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': auth,
+        'X-Origin': origin,
+        'X-Goog-AuthUser': '0'
+      },
+      body: JSON.stringify({
+        context: { client: { clientName: 'WEB_REMIX', clientVersion: '1.20250201.01.00', hl: 'ru', gl: 'RU' } },
+        ...body
+      })
+    });
+    return r.json();
+  };
+  const txt = (obj) => (obj?.runs || []).map((x) => x.text).join('') || obj?.simpleText || '';
+  const walk = (root, fn) => {
+    if (!root || typeof root !== 'object') return;
+    fn(root);
+    if (Array.isArray(root)) root.forEach((x) => walk(x, fn));
+    else Object.values(root).forEach((v) => walk(v, fn));
+  };
+  const extractTracks = (json) => {
+    const map = new Map();
+    walk(json, (node) => {
+      const m = node.musicResponsiveListItemRenderer || node.playlistVideoRenderer;
+      if (!m) return;
+      const vid = m.playlistItemData?.videoId || m.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId || m.videoId;
+      if (!vid || map.has(vid)) return;
+      const cols = m.flexColumns || [];
+      const title = txt(cols[0]?.musicResponsiveListItemFlexColumnRenderer?.text) || txt(m.title) || ('Track ' + vid);
+      const artist = txt(cols[1]?.musicResponsiveListItemFlexColumnRenderer?.text)?.split('•')[0]?.trim() || 'YouTube Music';
+      const thumbs = m.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || m.thumbnail?.thumbnails || [];
+      const thumbnailUrl = thumbs[thumbs.length - 1]?.url || ('https://i.ytimg.com/vi/' + vid + '/hqdefault.jpg');
+      map.set(vid, { id: vid, title, artist, durationSeconds: 0, thumbnailUrl });
+    });
+    return Array.from(map.values());
+  };
+  const [accJson, likedJson, histJson, plsJson] = await Promise.all([
+    ytPost('account/account_menu', {}).catch(() => ({})),
+    ytPost('browse', { browseId: 'FEmusic_liked_videos' }).catch(() => ({})),
+    ytPost('browse', { browseId: 'FEmusic_history' }).catch(() => ({})),
+    ytPost('browse', { browseId: 'FEmusic_liked_playlists' }).catch(() => ({}))
+  ]);
+  let account = { id: 'yt_export', name: 'YouTube Music', handle: '', email: '', avatarUrl: '' };
+  walk(accJson, (n) => {
+    if (n.activeAccountHeaderRenderer) {
+      const h = n.activeAccountHeaderRenderer;
+      account = {
+        id: txt(h.channelHandle) || txt(h.accountName) || 'yt_export',
+        name: txt(h.accountName) || 'YouTube Music',
+        handle: txt(h.channelHandle) || '',
+        email: txt(h.email) || '',
+        avatarUrl: h.accountPhoto?.thumbnails?.[0]?.url || ''
+      };
+    }
+  });
+  const plItems = [];
+  walk(plsJson, (n) => {
+    const r = n.musicTwoRowItemRenderer;
+    const bid = r?.navigationEndpoint?.browseEndpoint?.browseId;
+    if (bid && (bid.startsWith('VL') || bid.startsWith('MPRE')) && !plItems.some((p) => p.browseId === bid)) {
+      plItems.push({ browseId: bid, id: bid.replace(/^VL/, ''), name: txt(r.title) || 'Плейлист' });
+    }
+  });
+  const playlists = [];
+  for (const pl of plItems.slice(0, 15)) {
+    const d = await ytPost('browse', { browseId: pl.browseId }).catch(() => ({}));
+    playlists.push({ id: pl.id, name: pl.name, description: 'YouTube Music', tracks: extractTracks(d) });
+  }
+  const payload = JSON.stringify({
+    format: 'sonora-yt-sync:v1',
+    exportedAt: Date.now(),
+    account,
+    likedTracks: extractTracks(likedJson),
+    historyTracks: extractTracks(histJson),
+    playlists
+  }, null, 2);
+  const blob = new Blob([payload], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'sonora-yt-library.json';
+  a.click();
+  try { await navigator.clipboard.writeText(payload); } catch {}
+  alert('Готово! Файл sonora-yt-library.json скачан (и скопирован в буфер). Откройте Sonora и загрузите его.');
 })();`;
 
 export function buildCreatePlaylistModalHtml() {
@@ -27,9 +126,9 @@ export function buildCreatePlaylistModalHtml() {
 export function buildImportPlaylistModalHtml() {
   return `
     <h3 class="modal-title">Импорт плейлиста YouTube Music</h3>
-    <p class="modal-desc">Вставьте ссылку или ID плейлиста (PL... или OLAK5uy_...)</p>
+    <p class="modal-desc">Вставьте ссылку или ID публичного плейлиста (PL... или OLAK5uy_...)</p>
     <form id="import-yt-playlist-form">
-      <input id="yt-playlist-url" class="ios-field" type="url" placeholder="https://music.youtube.com/playlist?list=..." required />
+      <input id="yt-playlist-url" class="ios-field" type="text" placeholder="https://music.youtube.com/playlist?list=..." required />
       <button type="submit" class="btn-primary-full">Импортировать</button>
       <button type="button" class="btn-secondary-full" data-action="close-modal">Отмена</button>
     </form>
@@ -230,49 +329,16 @@ export function buildRemotePlaylistModalHtml(remote, item, tracks, getSafeThumb)
   `;
 }
 
-export function buildYouTubeAccountModalHtml({
-  serverUrl,
-  hasToken,
-  authStatus,
+export function buildYouTubeImportModalHtml({
   activeAccount,
   accounts,
   statusMessage
 }) {
   const acc = activeAccount || {};
-  const needsClaim = authStatus?.needsClaim === true;
-  const requiresLogin = serverUrl && !hasToken;
-
-  let serverAuthBlock = '';
-  if (serverUrl) {
-    if (hasToken) {
-      serverAuthBlock = `<div class="status-pill ok">Сессия Node/Render активна</div>`;
-    } else if (needsClaim) {
-      serverAuthBlock = `
-        <div class="helper-box">
-          <div class="helper-title">Первичная настройка кода доступа сервера</div>
-          <p class="modal-desc">Придумайте личный код доступа (от 6 символов), чтобы защитить ваш Render-сервер.</p>
-          <div class="inline-auth-row">
-            <input id="server-passcode-input" class="ios-field" type="password" minlength="6" placeholder="Новый код доступа (мин. 6)" />
-            <button type="button" class="btn-accent-sm" data-action="server-claim-passcode">Задать</button>
-          </div>
-        </div>`;
-    } else if (requiresLogin) {
-      serverAuthBlock = `
-        <div class="helper-box">
-          <div class="helper-title">Вход на Node/Render сервер</div>
-          <p class="modal-desc">Введите код доступа сервера (токен хранится только в оперативной памяти вкладки).</p>
-          <div class="inline-auth-row">
-            <input id="server-passcode-input" class="ios-field" type="password" placeholder="Код доступа сервера" />
-            <button type="button" class="btn-accent-sm" data-action="server-login-passcode">Войти</button>
-          </div>
-        </div>`;
-    }
-  }
-
   return `
-    <h3 class="modal-title">Аккаунт YouTube Music</h3>
+    <h3 class="modal-title">Синхронизация YouTube Music</h3>
     <p class="modal-desc">
-      Подключите ваш сервер Node/Render для входа по сессии YouTube Music, синхронизации лайков, истории и плейлистов, а также прямых потоков без рекламы.
+      Полностью без серверов и передачи Cookie: перенесите лайки, историю и плейлисты прямо на устройство через экспорт из вкладки YouTube Music, Google Takeout или копию Android Sonora.
     </p>
     ${
       accounts.length > 0
@@ -288,54 +354,46 @@ export function buildYouTubeAccountModalHtml({
           </div>`
         : ''
     }
-    <div class="inline-auth-row">
-      <input id="yt-server-url" class="ios-field" type="url" placeholder="https://sonora-server.onrender.com" value="${escapeHtml(serverUrl || acc.proxyUrl || '')}" />
-      <button type="button" class="btn-accent-sm" data-action="check-server-status">Проверить</button>
-    </div>
     ${statusMessage ? `<div class="modal-status-msg">${escapeHtml(statusMessage)}</div>` : ''}
-    ${serverAuthBlock}
+
     <div class="helper-box">
-      <div class="helper-title">Как получить Cookie YouTube Music</div>
-      <p class="modal-desc">Откройте <b>music.youtube.com</b> в браузере, войдите в Google-аккаунт и скопируйте Cookie (или экспортируйте <code>cookies.txt</code>).</p>
-      <button type="button" class="btn-secondary-full" data-action="copy-cookie-snippet">Скопировать скрипт для получения Cookie</button>
+      <div class="helper-title">1. Прямой экспорт с music.youtube.com (без серверов)</div>
+      <p class="modal-desc">
+        Откройте <b>music.youtube.com</b> в браузере под своим аккаунтом и запустите скрипт — он сохранит файл <code>sonora-yt-library.json</code> локально без отправки ваших Cookie.
+      </p>
+      <button type="button" class="btn-secondary-full" data-action="copy-yt-export-snippet">Скопировать скрипт экспорта</button>
     </div>
-    <form id="yt-account-form">
-      <textarea id="yt-cookie-header" class="ios-field ios-textarea" placeholder="Вставьте строку Cookie или содержимое cookies.txt (шифруется локально AES-GCM)" required>${escapeHtml(acc.cookieHeader || '')}</textarea>
-      <div class="inline-auth-row">
-        <input id="yt-authuser-idx" class="ios-field" type="number" min="0" max="9" placeholder="AuthUser (0)" value="${Number(acc.authUserIndex) || 0}" />
-        <input id="yt-datasync-id" class="ios-field" type="text" placeholder="dataSyncId (необяз.)" value="${escapeHtml(acc.dataSyncId || '')}" />
-      </div>
-      <button type="submit" class="btn-primary-full">Подключить и синхронизировать</button>
-      ${acc.id ? `<button type="button" class="btn-danger-full" data-action="remove-current-account" data-account-id="${escapeHtml(acc.id)}">Удалить этот аккаунт</button>` : ''}
-      <button type="button" class="btn-secondary-full" data-action="close-modal">Закрыть</button>
+
+    <form id="yt-import-form">
+      <label class="field-label" for="yt-import-json">2. Вставьте JSON экспорта или загрузите файл (JSON / CSV Takeout)</label>
+      <textarea id="yt-import-json" class="ios-field ios-textarea" placeholder="Вставьте содержимое sonora-yt-library.json, watch-history.json или CSV из Google Takeout..."></textarea>
+      <button type="submit" class="btn-primary-full">Импортировать вставленный текст</button>
     </form>
+
+    <button type="button" class="btn-secondary-full" data-action="choose-yt-import-file">Выбрать файл (.json, .csv Takeout, .sonoraenc)</button>
+    <button type="button" class="btn-secondary-full" data-action="open-import-yt-playlist">Импортировать плейлист по ссылке</button>
+    ${acc.id ? `<button type="button" class="btn-danger-full" data-action="remove-current-account" data-account-id="${escapeHtml(acc.id)}">Удалить профиль «${escapeHtml(acc.name)}»</button>` : ''}
+    <button type="button" class="btn-secondary-full" data-action="close-modal">Закрыть</button>
   `;
 }
 
-export function buildRoutingModalHtml({
-  workerCatalogUrl,
-  serverUrl,
+export function buildCatalogSourcesModalHtml({
   customApiBaseUrl,
   activeSourceLabel,
   diagnosticsHtml
 }) {
   return `
-    <h3 class="modal-title">Маршрутизация каталога и прокси</h3>
+    <h3 class="modal-title">Источники каталога (без серверов)</h3>
     <p class="modal-desc">
-      Приоритет загрузки: <b>1. Личный Cloudflare Worker</b> → <b>2. Node/Render сервер</b> → <b>3. Piped / Invidious / Audius</b>.
+      Sonora работает напрямую в браузере и параллельно опрашивает пул публичных узлов <b>Piped</b>, <b>Invidious</b> и <b>Audius</b> без рекламы.
       Сейчас активен: <b>${escapeHtml(activeSourceLabel)}</b>.
     </p>
-    <button type="button" class="btn-secondary-full" data-action="copy-worker-script">Скопировать код Cloudflare Worker</button>
-    <form id="routing-config-form" class="routing-form">
-      <label class="field-label" for="worker-catalog-url">Личный Cloudflare Worker (HTTPS)</label>
-      <input id="worker-catalog-url" class="ios-field" type="url" placeholder="https://sonora-worker.yourname.workers.dev" value="${escapeHtml(workerCatalogUrl)}" />
-      <label class="field-label" for="routing-server-url">Node/Render сервер (HTTPS)</label>
-      <input id="routing-server-url" class="ios-field" type="url" placeholder="https://sonora-server.onrender.com" value="${escapeHtml(serverUrl)}" />
-      <label class="field-label" for="custom-api-url">Запасной Piped API (HTTPS, необязательно)</label>
+    <form id="catalog-sources-form" class="routing-form">
+      <label class="field-label" for="custom-api-url">Приоритетный Piped API узел (HTTPS, необязательно)</label>
       <input id="custom-api-url" class="ios-field" type="url" placeholder="https://pipedapi.example.com" value="${escapeHtml(customApiBaseUrl)}" />
-      <button type="button" class="btn-secondary-full" data-action="test-routing-endpoints">Проверить связь (Worker и Сервер)</button>
+      <button type="button" class="btn-secondary-full" data-action="test-catalog-health">Проверить доступность источников</button>
       ${diagnosticsHtml ? `<div class="helper-box">${diagnosticsHtml}</div>` : ''}
-      <button type="submit" class="btn-primary-full">Сохранить маршрутизацию</button>
+      <button type="submit" class="btn-primary-full">Сохранить</button>
       <button type="button" class="btn-secondary-full" data-action="close-modal">Отмена</button>
     </form>
   `;

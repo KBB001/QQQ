@@ -24,11 +24,7 @@ const DEFAULT_SETTINGS = {
   themeMode: 'SYSTEM',
   autoplayEnabled: true,
   encryptBackupsEnabled: true,
-  workerCatalogUrl: '',
-  serverUrl: '',
-  customApiBaseUrl: '',
-  autoSyncEnabled: true,
-  writeThroughSyncEnabled: true
+  customApiBaseUrl: ''
 };
 
 const DEFAULT_LIBRARY = {
@@ -86,21 +82,9 @@ async function idbDelete(db, key) {
   });
 }
 
-function sanitizeServerOrWorkerUrl(raw) {
+function sanitizeOptionalApiUrl(raw) {
   const safe = sanitizeHttpsUrl(raw);
-  if (safe) return safe.replace(/\/+$/, '');
-  // Allow http://localhost or http://127.0.0.1 for local developer server testing
-  if (typeof raw === 'string') {
-    try {
-      const u = new URL(raw.trim());
-      if (u.protocol === 'http:' && (u.hostname === 'localhost' || u.hostname === '127.0.0.1')) {
-        return u.origin + u.pathname.replace(/\/+$/, '');
-      }
-    } catch {
-      return '';
-    }
-  }
-  return '';
+  return safe ? safe.replace(/\/+$/, '') : '';
 }
 
 export class SonoraStorage {
@@ -141,10 +125,6 @@ export class SonoraStorage {
       handle: '',
       email: '',
       avatarUrl: '',
-      proxyUrl: this.settings.serverUrl || '',
-      cookieHeader: '',
-      dataSyncId: '',
-      authUserIndex: 0,
       lastSyncTimestamp: 0,
       syncedLikedCount: 0,
       syncedPlaylistsCount: 0
@@ -260,10 +240,6 @@ export class SonoraStorage {
             handle: String(item.handle || ''),
             email: String(item.email || ''),
             avatarUrl: sanitizeHttpsUrl(item.avatarUrl) || '',
-            proxyUrl: sanitizeServerOrWorkerUrl(item.proxyUrl) || this.settings.serverUrl || '',
-            cookieHeader: decryptedCookie,
-            dataSyncId: String(item.dataSyncId || ''),
-            authUserIndex: Number(item.authUserIndex) || 0,
             lastSyncTimestamp: Number(item.lastSyncTimestamp) || 0,
             syncedLikedCount: Number(item.syncedLikedCount) || 0,
             syncedPlaylistsCount: Number(item.syncedPlaylistsCount) || 0
@@ -275,9 +251,6 @@ export class SonoraStorage {
         savedAccountState.activeAccountId ||
         hydratedAccounts[0]?.id ||
         '';
-      if (!this.settings.serverUrl && hydratedAccounts[0]?.proxyUrl) {
-        this.settings.serverUrl = hydratedAccounts[0].proxyUrl;
-      }
     }
   }
 
@@ -290,28 +263,16 @@ export class SonoraStorage {
       await this._remove(KEY_ACCOUNT);
       return;
     }
-    const key = await this._getOrCreateDeviceKey();
-    const serialized = [];
-    for (const acc of this.accounts) {
-      const encryptedCookie =
-        acc.cookieHeader && key
-          ? await encryptLocalSecret(acc.cookieHeader, key)
-          : '';
-      serialized.push({
-        id: acc.id,
-        name: acc.name,
-        handle: acc.handle || '',
-        email: acc.email || '',
-        avatarUrl: acc.avatarUrl || '',
-        proxyUrl: acc.proxyUrl || '',
-        encryptedCookie,
-        dataSyncId: acc.dataSyncId || '',
-        authUserIndex: Number(acc.authUserIndex) || 0,
-        lastSyncTimestamp: Number(acc.lastSyncTimestamp) || 0,
-        syncedLikedCount: Number(acc.syncedLikedCount) || 0,
-        syncedPlaylistsCount: Number(acc.syncedPlaylistsCount) || 0
-      });
-    }
+    const serialized = this.accounts.map((acc) => ({
+      id: acc.id,
+      name: acc.name,
+      handle: acc.handle || '',
+      email: acc.email || '',
+      avatarUrl: acc.avatarUrl || '',
+      lastSyncTimestamp: Number(acc.lastSyncTimestamp) || 0,
+      syncedLikedCount: Number(acc.syncedLikedCount) || 0,
+      syncedPlaylistsCount: Number(acc.syncedPlaylistsCount) || 0
+    }));
     await this._write(KEY_ACCOUNT, {
       activeAccountId: this.activeAccountId,
       accounts: serialized
@@ -489,17 +450,9 @@ export class SonoraStorage {
     this.settings = {
       ...this.settings,
       ...patch,
-      workerCatalogUrl:
-        patch.workerCatalogUrl !== undefined
-          ? sanitizeServerOrWorkerUrl(patch.workerCatalogUrl)
-          : this.settings.workerCatalogUrl,
-      serverUrl:
-        patch.serverUrl !== undefined
-          ? sanitizeServerOrWorkerUrl(patch.serverUrl)
-          : this.settings.serverUrl,
       customApiBaseUrl:
         patch.customApiBaseUrl !== undefined
-          ? sanitizeServerOrWorkerUrl(patch.customApiBaseUrl)
+          ? sanitizeOptionalApiUrl(patch.customApiBaseUrl)
           : this.settings.customApiBaseUrl
     };
     await this._write(KEY_SETTINGS, this.settings);
@@ -525,10 +478,6 @@ export class SonoraStorage {
       handle: String(config.handle || '').trim(),
       email: String(config.email || '').trim(),
       avatarUrl: sanitizeHttpsUrl(config.avatarUrl) || '',
-      proxyUrl: sanitizeServerOrWorkerUrl(config.proxyUrl || this.settings.serverUrl) || '',
-      cookieHeader: String(config.cookieHeader ?? '').trim(),
-      dataSyncId: String(config.dataSyncId || '').trim(),
-      authUserIndex: Math.max(0, Number(config.authUserIndex) || 0),
       lastSyncTimestamp: Number(config.lastSyncTimestamp) || Date.now(),
       syncedLikedCount: Number(config.syncedLikedCount) || 0,
       syncedPlaylistsCount: Number(config.syncedPlaylistsCount) || 0
@@ -541,9 +490,6 @@ export class SonoraStorage {
       this.accounts = [...this.accounts, record];
     }
     this.activeAccountId = id;
-    if (record.proxyUrl && !this.settings.serverUrl) {
-      await this.updateSettings({ serverUrl: record.proxyUrl });
-    }
     await this._saveAccounts();
     return record;
   }

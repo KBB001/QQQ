@@ -90,35 +90,28 @@ git push origin v1.0.1
 
 ---
 
-## Версия для iPhone (iOS PWA с автообновлением через GitHub)
+## Версия для iPhone (iOS PWA, полностью без серверов)
 
-В каталоге `ios-pwa/` находится веб-приложение **Sonora** для iPhone в нативном стиле iOS (адаптивная светлая/тёмная тема, мини-плеер и полноэкранный плеер, синхронизированные тексты `LRCLIB`, управление с экрана блокировки `MediaSession`, импорт плейлистов YouTube Music и совместимые с Android зашифрованные резервные копии `.sonoraenc`).
+В каталоге `ios-pwa/` находится автономное веб-приложение **Sonora** для iPhone в нативном стиле iOS (адаптивная светлая/тёмная тема, фоновое аудио при заблокированном экране, управление с экрана блокировки `MediaSession`, мини-плеер и полноэкранный плеер, синхронизированные тексты `LRCLIB`, оффлайн-кэш, импорт медиатеки YouTube Music / Google Takeout и совместимые с Android зашифрованные резервные копии `.sonoraenc`).
+
+Приложение **не требует Cloudflare Worker, Node/Render-сервера или баз данных** — весь поиск, потоки без рекламы (через параллельную федерацию `Piped`, `Invidious` и `Audius`), рекомендации и хранение данных работают прямо на устройстве.
 
 ### Включение публикации на GitHub Pages
 
 1. Убедитесь, что репозиторий **публичный (Public)** (на бесплатном тарифе GitHub Pages не поддерживается для приватных репозиториев).
-2. При необходимости откройте в репозитории **Settings → Pages** и выберите **Build and deployment → Source: GitHub Actions** (при пуше workflow также пытается включить Pages автоматически).
-3. Workflow `.github/workflows/deploy-ios-pwa.yml` автоматически протестирует PWA, обновит версию Service Worker и опубликует сайт по HTTPS. Также его можно запустить вручную во вкладке **Actions → Build & Deploy iOS PWA (GitHub Pages) → Run workflow**.
+2. Откройте в репозитории **Settings → Pages** и выберите **Build and deployment → Source: GitHub Actions**.
+3. Workflow `.github/workflows/deploy-ios-pwa.yml` автоматически протестирует PWA, обновит версию Service Worker и опубликует сайт по HTTPS.
 
 ### Установка на iPhone
 
 1. Откройте опубликованный URL вида `https://<OWNER>.github.io/<REPO>/` в **Safari** на iPhone.
 2. Нажмите кнопку **«Поделиться»** внизу экрана и выберите **«На экран «Домой»»**.
-3. Запускайте **Sonora** с домашнего экрана как обычное приложение — обновления будут загружаться автоматически при каждом пуше в GitHub.
+3. Запускайте **Sonora** с домашнего экрана как обычное приложение — обновления загружаются автоматически при каждом пуше в GitHub.
 
-### Личный Cloudflare Worker (ускорение Главной, Поиска и потоков без сбоев)
+### Перенос библиотеки из YouTube Music (без серверов)
 
-1. Создайте бесплатный Worker на [Cloudflare Workers](https://dash.cloudflare.com/) (или задеплойте из каталога `cloudflare-worker/` командой `npx wrangler deploy`).
-2. Вставьте код из `cloudflare-worker/worker.js` (при желании задайте переменную `ALLOWED_ORIGINS` = ваш URL GitHub Pages).
-3. В приложении Sonora откройте **Настройки → Маршрутизация и ускорение каталога** и укажите URL вашего Worker (`https://sonora-worker.<subdomain>.workers.dev`).
+1. В приложении откройте **Настройки → Импорт YouTube Music** и скопируйте локальный скрипт экспорта или используйте экспорт из **Google Takeout** (`.json` / `.csv`) или резервную копию **Android Sonora** (`.sonoraenc`).
+2. Импортируйте полученный файл в Sonora — лайки, история и плейлисты объединятся локально без отправки Cookie или паролей на сторонние серверы.
 
-### Сервер входа в YouTube Music (Node.js / Render)
-
-1. В каталоге `server/` находится автономный Node.js-сервер с конфигом `server/render.yaml` и `server/Dockerfile`.
-2. На **Render** создайте новый Web Service (Blueprint из `server/render.yaml` или Web Service с `Root Directory: server`, `Start Command: npm start`).
-3. Задайте переменные окружения:
-   - `CORS_ALLOWED_ORIGINS` — например `https://<OWNER>.github.io`
-   - `SONORA_SERVER_PASSCODE` — ваш личный код доступа к серверу (или задайте его прямо в приложении при первом подключении)
-4. Откройте **Настройки → Аккаунты YouTube Music** в приложении, укажите адрес Render-сервера, войдите по коду доступа и вставьте Cookie с `music.youtube.com` для синхронизации лайков, истории, плейлистов и прямых потоков без рекламы.
 
 

@@ -92,6 +92,29 @@ export class SonoraOfflineManager {
     }
   }
 
+  async downloadTrackWithCandidates(track, candidates = []) {
+    const list = Array.isArray(candidates) ? candidates.filter(Boolean) : [];
+    if (list.length === 0) {
+      throw new Error('Нет доступного потока для оффлайн-сохранения');
+    }
+    // Prefer CORS-friendly proxied routes (Invidious local=true or Audius) before raw CDN links
+    const prioritized = [...list].sort((a, b) => {
+      const aScore = a.includes('local=true') || a.includes('audius') ? 0 : 1;
+      const bScore = b.includes('local=true') || b.includes('audius') ? 0 : 1;
+      return aScore - bScore;
+    });
+
+    let lastErr = null;
+    for (const url of prioritized) {
+      try {
+        return await this.downloadTrack(track, url);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr || new Error('Браузер заблокировал скачивание потока (нет CORS)');
+  }
+
   async removeTrack(trackId) {
     if (!trackId) return;
     const prevUrl = this.activeObjectUrls.get(trackId);

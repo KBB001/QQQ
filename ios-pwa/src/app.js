@@ -1,13 +1,13 @@
 import {
-  CLOUDFLARE_WORKER_TEMPLATE,
   MOOD_CHIPS,
   SonoraApi,
   extractPlaylistId
 } from './api.js';
 import {
-  YOUTUBE_COOKIE_SNIPPET,
+  YOUTUBE_DIRECT_EXPORT_SNIPPET,
   buildAddToPlaylistModalHtml,
   buildAddTracksPickerModalHtml,
+  buildCatalogSourcesModalHtml,
   buildCreatePlaylistModalHtml,
   buildDecryptImportModalHtml,
   buildDeletePlaylistModalHtml,
@@ -16,15 +16,19 @@ import {
   buildQueueModalHtml,
   buildRemotePlaylistModalHtml,
   buildRenamePlaylistModalHtml,
-  buildRoutingModalHtml,
   buildSleepTimerModalHtml,
   buildTrackMenuHtml,
-  buildYouTubeAccountModalHtml
+  buildYouTubeImportModalHtml
 } from './modals.js';
 import { SonoraOfflineManager, formatBytesRu } from './offline.js';
 import { SonoraPlayer } from './player.js';
 import { ImplicitSignalType, SmartRecommendationEngine } from './recommendations.js';
-import { BackupCipher, escapeHtml, sanitizeHttpsUrl } from './security.js';
+import {
+  BackupCipher,
+  escapeHtml,
+  parseExternalYouTubeImport,
+  sanitizeHttpsUrl
+} from './security.js';
 import { SonoraStorage } from './storage.js';
 
 const SVG = {
@@ -123,10 +127,7 @@ class SonoraApp {
   constructor() {
     this.storage = new SonoraStorage();
     this.api = new SonoraApi(() => ({
-      workerCatalogUrl: this.storage.settings.workerCatalogUrl,
-      serverUrl: this.storage.settings.serverUrl,
-      customApiBaseUrl: this.storage.settings.customApiBaseUrl,
-      activeAccount: this.storage.activeAccount
+      customApiBaseUrl: this.storage.settings.customApiBaseUrl
     }));
     this.offline = new SonoraOfflineManager(this.storage);
     this.recommendations = new SmartRecommendationEngine({
@@ -159,9 +160,8 @@ class SonoraApp {
         results: [],
         loading: false
       },
-      ytModalAuthStatus: null,
       ytModalStatusMsg: '',
-      routingDiagnosticsHtml: '',
+      catalogDiagnosticsHtml: '',
       playerExpanded: false,
       playerLyricsOpen: false,
       isScrubbing: false,
@@ -404,46 +404,13 @@ class SonoraApp {
     if (this.state.playerExpanded) {
       const sheet = document.getElementById('player-sheet');
       const snap = this.player.getSnapshot();
-      const expectedKey = `${snap.currentTrack?.id || ''}:${snap.engine}:${snap.isOfflineSource ? 'off' : 'on'}:${this.state.playerLyricsOpen ? 'lyr' : 'art'}`;
+      const expectedKey = `${snap.currentTrack?.id || ''}:${snap.sourceType || snap.engine}:${snap.isOfflineSource ? 'off' : 'on'}:${this.state.playerLyricsOpen ? 'lyr' : 'art'}`;
       if (sheet && sheet.dataset.renderKey === expectedKey && !this.state.playerLyricsOpen) {
         this.updateFastPlayerProgress(snap);
       } else if (sheet) {
         this.renderPlayerSheet();
       }
-    } else {
-      this.syncYoutubeWrapperPosition();
     }
-  }
-
-  syncYoutubeWrapperPosition() {
-    const wrapper = document.getElementById('yt-player-wrapper');
-    if (!wrapper || !this.player) return;
-    const snap = this.player.getSnapshot();
-    const shouldShowStage =
-      this.state.playerExpanded &&
-      !this.state.playerLyricsOpen &&
-      snap.engine === 'youtube_iframe' &&
-      Boolean(snap.currentTrack);
-
-    if (!shouldShowStage) {
-      wrapper.className = 'yt-player-wrapper docked-hidden';
-      wrapper.style.left = '';
-      wrapper.style.top = '';
-      wrapper.style.width = '';
-      wrapper.style.height = '';
-      return;
-    }
-
-    const anchor = document.getElementById('player-yt-anchor');
-    if (!anchor) return;
-    const rect = anchor.getBoundingClientRect();
-    wrapper.className = 'yt-player-wrapper docked-stage';
-    wrapper.style.position = 'fixed';
-    wrapper.style.zIndex = '85';
-    wrapper.style.left = `${rect.left}px`;
-    wrapper.style.top = `${rect.top}px`;
-    wrapper.style.width = `${rect.width}px`;
-    wrapper.style.height = `${rect.height}px`;
   }
 
   updateFastPlayerProgress(snap) {
@@ -746,7 +713,7 @@ class SonoraApp {
           <p>${escapeHtml(this.state.homeError)}</p>
           <div class="action-pills-row">
             <button type="button" class="btn-accent-sm" data-action="retry-home">Повторить</button>
-            <button type="button" class="icon-pill-btn" data-action="open-routing-modal">Настроить Worker / прокси</button>
+            <button type="button" class="icon-pill-btn" data-action="open-routing-modal">Источники каталога</button>
           </div>
         </div>`;
     } else if (feedTracks.length > 0) {
@@ -839,7 +806,7 @@ class SonoraApp {
           <p>${escapeHtml(this.state.searchError)}</p>
           <div class="action-pills-row">
             <button type="button" class="btn-accent-sm" data-action="retry-search">Повторить</button>
-            <button type="button" class="icon-pill-btn" data-action="open-routing-modal">Прокси / Worker</button>
+            <button type="button" class="icon-pill-btn" data-action="open-routing-modal">Источники каталога</button>
           </div>
         </div>`;
     } else if (!this.state.searchQuery && this.state.searchFilter !== 'LOCAL') {
@@ -1112,14 +1079,13 @@ class SonoraApp {
     const s = this.storage.settings;
     const acc = this.storage.activeAccount;
     const accounts = this.storage.accounts;
-    const hasToken = Boolean(s.serverUrl && this.api.getServerToken(s.serverUrl));
     const offlineStats = this.offline.getStats();
 
     const themeNames = { SYSTEM: 'Системная', LIGHT: 'Светлая', DARK: 'Тёмная' };
     const qualityNames = { HIGH: 'Высокое', MEDIUM: 'Среднее', LOW: 'Экономия' };
 
     return `
-      <div class="settings-group-title">Аккаунты YouTube Music</div>
+      <div class="settings-group-title">Импорт YouTube Music (без серверов)</div>
       <div class="grouped-card">
         ${
           accounts.length > 1
@@ -1145,73 +1111,30 @@ class SonoraApp {
                 : ''
             }
             <div>
-              <div class="setting-label">${acc ? escapeHtml(acc.name) : 'Войти в YouTube Music'}</div>
+              <div class="setting-label">${acc ? escapeHtml(acc.name) : 'Перенести библиотеку YouTube Music'}</div>
               <div class="setting-sub">${
                 acc
                   ? `${acc.handle || acc.email ? `${escapeHtml(acc.handle || acc.email)} • ` : ''}♥ ${acc.syncedLikedCount}, ${acc.syncedPlaylistsCount} плейлистов`
-                  : 'Вход через Node/Render, синхронизация и потоки без рекламы'
+                  : 'Экспорт с music.youtube.com, Google Takeout или копия Android'
               }</div>
-              ${
-                s.serverUrl
-                  ? `<div class="status-inline ${hasToken ? 'ok' : 'warn'}">${
-                      hasToken ? 'Сессия сервера активна' : 'Нажмите для входа на сервер'
-                    }</div>`
-                  : ''
-              }
             </div>
           </div>
-          <span class="setting-value">${acc ? 'Настроить ›' : 'Войти ›'}</span>
+          <span class="setting-value">${acc ? 'Обновить ›' : 'Импорт ›'}</span>
         </button>
-        ${
-          acc
-            ? `<button type="button" class="setting-row" data-action="sync-active-account">
-                 <div>
-                   <div class="setting-label">Синхронизировать библиотеку сейчас</div>
-                   <div class="setting-sub">Объединит лайки, историю и плейлисты YouTube Music</div>
-                 </div>
-                 <span class="setting-value">Обновить ›</span>
-               </button>
-               ${
-                 accounts.length > 1
-                   ? `<button type="button" class="setting-row" data-action="unify-all-accounts">
-                        <div>
-                          <div class="setting-label">Синхронизировать все аккаунты (${accounts.length})</div>
-                          <div class="setting-sub">Объединить треки из всех подключённых профилей</div>
-                        </div>
-                        <span class="setting-value">Объединить ›</span>
-                      </button>`
-                   : ''
-               }
-               <button type="button" class="setting-row" data-action="toggle-auto-sync">
-                 <div>
-                   <div class="setting-label">Автосинхронизация аккаунта</div>
-                   <div class="setting-sub">Обновлять медиатеку при открытии настроек и входа</div>
-                 </div>
-                 <span class="ios-switch ${s.autoSyncEnabled ? 'on' : ''}" aria-hidden="true"><span class="ios-switch-thumb"></span></span>
-               </button>
-               <button type="button" class="setting-row" data-action="toggle-write-through">
-                 <div>
-                   <div class="setting-label">Запись лайков и плейлистов в YouTube</div>
-                   <div class="setting-sub">Мгновенно сохранять действия обратно в аккаунт YouTube Music</div>
-                 </div>
-                 <span class="ios-switch ${s.writeThroughSyncEnabled ? 'on' : ''}" aria-hidden="true"><span class="ios-switch-thumb"></span></span>
-               </button>`
-            : ''
-        }
       </div>
 
-      <div class="settings-group-title">Маршрутизация и ускорение каталога</div>
+      <div class="settings-group-title">Источники каталога</div>
       <div class="grouped-card">
         <button type="button" class="setting-row" data-action="open-routing-modal">
           <div>
-            <div class="setting-label">Личный Cloudflare Worker и серверы</div>
+            <div class="setting-label">Публичные источники и диагностика</div>
             <div class="setting-sub">${escapeHtml(
-              s.workerCatalogUrl
-                ? `Worker: ${s.workerCatalogUrl}`
-                : `Активный узел: ${this.api.activeSourceLabel}`
+              s.customApiBaseUrl
+                ? `Приоритетный узел: ${s.customApiBaseUrl}`
+                : `Активный источник: ${this.api.activeSourceLabel}`
             )}</div>
           </div>
-          <span class="setting-value">Настроить ›</span>
+          <span class="setting-value">Проверить ›</span>
         </button>
       </div>
 
@@ -1343,20 +1266,23 @@ class SonoraApp {
     if (!this.state.playerExpanded || !track) {
       sheet.classList.add('hidden');
       sheet.dataset.renderKey = '';
-      this.syncYoutubeWrapperPosition();
       return;
     }
 
     sheet.classList.remove('hidden');
-    sheet.dataset.renderKey = `${track.id}:${snap.engine}:${snap.isOfflineSource ? 'off' : 'on'}:${this.state.playerLyricsOpen ? 'lyr' : 'art'}`;
+    sheet.dataset.renderKey = `${track.id}:${snap.sourceType || snap.engine}:${snap.isOfflineSource ? 'off' : 'on'}:${this.state.playerLyricsOpen ? 'lyr' : 'art'}`;
     const isFav = this.storage.isFavorite(track.id);
     const isOffline = this.offline.isDownloaded(track.id);
     const repeatIcon = snap.repeatMode === 'ONE' ? SVG.repeatOne : SVG.repeat;
+    const sourceLabels = {
+      offline: 'Оффлайн-кэш',
+      piped: 'Прямое аудио (без рекламы)',
+      invidious: 'Прямое аудио (без рекламы)',
+      audius: 'Audius Audio (без рекламы)'
+    };
     const engineLabel = snap.isOfflineSource
       ? 'Оффлайн-кэш'
-      : snap.engine === 'youtube_iframe'
-        ? 'YouTube Плеер'
-        : 'Фоновое аудио';
+      : sourceLabels[snap.sourceType] || 'Прямое аудио (без рекламы)';
 
     let stageHtml = '';
     if (this.state.playerLyricsOpen) {
@@ -1385,8 +1311,6 @@ class SonoraApp {
       } else {
         stageHtml = `<div class="lyrics-panel"><p class="lyrics-muted">Текст песни для этого трека не найден.</p></div>`;
       }
-    } else if (snap.engine === 'youtube_iframe') {
-      stageHtml = `<div class="player-artwork-stage" id="player-yt-anchor"></div>`;
     } else {
       stageHtml = `
         <div class="player-artwork-stage" id="player-artwork-stage">
@@ -1453,8 +1377,6 @@ class SonoraApp {
     `;
 
     this._bindPlayerInteractions();
-    requestAnimationFrame(() => this.syncYoutubeWrapperPosition());
-    setTimeout(() => this.syncYoutubeWrapperPosition(), 310);
   }
 
   _bindPlayerInteractions() {
@@ -1550,10 +1472,6 @@ class SonoraApp {
   }
 
   bindGlobalEvents() {
-    window.addEventListener('resize', () => {
-      if (this.state.playerExpanded) this.syncYoutubeWrapperPosition();
-    });
-
     document.querySelectorAll('.tab-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
         this.state.activeTab = btn.dataset.tab;
@@ -1646,12 +1564,6 @@ class SonoraApp {
             this.state.playlistFilter = '';
             this.render();
             this.showToast(`Плейлист «${pl.name}» создан`);
-            if (this.storage.settings.writeThroughSyncEnabled) {
-              this.api
-                .ytCreatePlaylist(pl.name, pl.description)
-                .then((ytId) => ytId && this.storage.setPlaylistYoutubeId(pl.id, ytId))
-                .catch(() => {});
-            }
           })
           .catch((err) => this.showToast(err.message));
       } else if (e.target.id === 'rename-playlist-form') {
@@ -1690,36 +1602,25 @@ class SonoraApp {
             this.showToast(`Импортировано треков: ${addedCount}`);
           })
           .catch((err) => this.showToast(err.message));
-      } else if (e.target.id === 'yt-account-form') {
+      } else if (e.target.id === 'yt-import-form') {
         e.preventDefault();
-        const serverUrl = document.getElementById('yt-server-url')?.value || '';
-        const cookieHeader = document.getElementById('yt-cookie-header')?.value || '';
-        const authUserIndex = Number(document.getElementById('yt-authuser-idx')?.value) || 0;
-        const dataSyncId = document.getElementById('yt-datasync-id')?.value || '';
-        this.handleYouTubeAccountSync(serverUrl, cookieHeader, { authUserIndex, dataSyncId });
-      } else if (e.target.id === 'routing-config-form') {
+        const rawText = document.getElementById('yt-import-json')?.value || '';
+        this.handleExternalYouTubeImportText(rawText);
+      } else if (e.target.id === 'catalog-sources-form') {
         e.preventDefault();
-        const workerCatalogUrl = document.getElementById('worker-catalog-url')?.value?.trim() || '';
-        const serverUrl = document.getElementById('routing-server-url')?.value?.trim() || '';
         const customApiBaseUrl = document.getElementById('custom-api-url')?.value?.trim() || '';
-
-        if (workerCatalogUrl && !sanitizeHttpsUrl(workerCatalogUrl)) {
-          this.showToast('Cloudflare Worker должен использовать https://');
-          return;
-        }
         if (customApiBaseUrl && !sanitizeHttpsUrl(customApiBaseUrl)) {
-          this.showToast('Piped API должен использовать https://');
+          this.showToast('Узел Piped API должен использовать https://');
           return;
         }
-
         this.storage
-          .updateSettings({ workerCatalogUrl, serverUrl, customApiBaseUrl })
+          .updateSettings({ customApiBaseUrl })
           .then(() => {
             this.api.activeInstance = null;
             this.closeModal();
             this.renderMain();
             this.loadHomeMood(this.state.homeMood);
-            this.showToast('Настройки маршрутизации сохранены');
+            this.showToast('Источники каталога обновлены');
           });
       }
     });
@@ -1734,6 +1635,14 @@ class SonoraApp {
       } else {
         await this.finishBackupImport(text);
       }
+    });
+
+    document.getElementById('yt-import-file-input')?.addEventListener('change', async (e) => {
+      const file = e.target.files?.[0];
+      e.target.value = '';
+      if (!file) return;
+      const text = await file.text();
+      await this.handleExternalYouTubeImportText(text, file.name);
     });
 
     document.addEventListener('click', (e) => {
@@ -1874,7 +1783,6 @@ class SonoraApp {
             this.renderPickerModal();
             this.renderMain();
             this.showToast(added ? 'Добавлено в плейлист' : 'Уже в плейлисте');
-            if (added) this._syncPlaylistAddWriteThrough(pid, [track.id]);
           });
         }
       } else if (action === 'open-rename-playlist') {
@@ -1930,10 +1838,13 @@ class SonoraApp {
         this.state.playerExpanded = false;
         this.renderPlayerSheet();
       } else if (action === 'toggle-play') {
+        this.player.unlockGesture();
         this.player.togglePlayPause();
       } else if (action === 'next-track') {
+        this.player.unlockGesture({ forcePrime: true });
         this.player.next(false);
       } else if (action === 'prev-track') {
+        this.player.unlockGesture({ forcePrime: true });
         this.player.previous();
       } else if (action === 'toggle-shuffle') {
         this.player.toggleShuffle();
@@ -1980,7 +1891,6 @@ class SonoraApp {
             if (this.state.playerExpanded) this.renderPlayerSheet();
             this.renderMain();
             this.showToast(added ? 'Добавлено в Избранное' : 'Удалено из Избранного');
-            this._syncLikeWriteThrough(track.id, added);
           });
         }
       } else if (action === 'toggle-offline-track') {
@@ -2021,7 +1931,6 @@ class SonoraApp {
           this.storage.addTrackToPlaylist(pid, track).then((added) => {
             this.closeModal();
             this.showToast(added ? 'Трек добавлен в плейлист' : 'Трек уже в плейлисте');
-            if (added) this._syncPlaylistAddWriteThrough(pid, [track.id]);
           });
         }
       } else if (action === 'remove-from-active-playlist') {
@@ -2032,7 +1941,6 @@ class SonoraApp {
             this.closeModal();
             this.renderMain();
             this.showToast('Трек удалён из плейлиста');
-            this._syncPlaylistRemoveWriteThrough(pid, vid);
           });
         }
       } else if (action === 'cycle-theme') {
@@ -2050,70 +1958,36 @@ class SonoraApp {
         this.storage
           .updateSettings({ autoplayEnabled: !this.storage.settings.autoplayEnabled })
           .then(() => this.renderMain());
-      } else if (action === 'toggle-auto-sync') {
-        this.storage
-          .updateSettings({ autoSyncEnabled: !this.storage.settings.autoSyncEnabled })
-          .then(() => this.renderMain());
-      } else if (action === 'toggle-write-through') {
-        this.storage
-          .updateSettings({ writeThroughSyncEnabled: !this.storage.settings.writeThroughSyncEnabled })
-          .then(() => this.renderMain());
       } else if (action === 'toggle-encrypt-backups') {
         this.storage
           .updateSettings({ encryptBackupsEnabled: !this.storage.settings.encryptBackupsEnabled })
           .then(() => this.renderMain());
       } else if (action === 'open-routing-modal') {
-        this.openRoutingModal();
-      } else if (action === 'test-routing-endpoints') {
-        this.testRoutingEndpointsFromModal();
-      } else if (action === 'copy-worker-script') {
-        navigator.clipboard?.writeText(CLOUDFLARE_WORKER_TEMPLATE).then(() => {
-          this.showToast('Код Cloudflare Worker скопирован');
-        });
+        this.openCatalogSourcesModal();
+      } else if (action === 'test-catalog-health') {
+        this.testCatalogHealthFromModal();
       } else if (action === 'open-yt-account') {
-        this.openYouTubeAccountModal();
+        this.openYouTubeImportModal();
       } else if (action === 'switch-yt-account') {
         this.storage.switchAccount(btn.dataset.accountId).then(() => {
           this.render();
           if (!document.getElementById('modal-backdrop')?.classList.contains('hidden')) {
-            this.openYouTubeAccountModal();
+            this.openYouTubeImportModal();
           }
-          this.showToast(`Аккаунт: ${this.storage.activeAccount?.name || 'YouTube Music'}`);
+          this.showToast(`Профиль: ${this.storage.activeAccount?.name || 'YouTube Music'}`);
         });
       } else if (action === 'remove-current-account') {
         this.storage.removeAccount(btn.dataset.accountId).then(() => {
           this.closeModal();
           this.render();
-          this.showToast('Аккаунт удалён');
+          this.showToast('Профиль удалён');
         });
-      } else if (action === 'sync-active-account') {
-        const acc = this.storage.activeAccount;
-        const serverUrl = this.storage.settings.serverUrl || acc?.proxyUrl;
-        if (acc?.cookieHeader && serverUrl) {
-          this.handleYouTubeAccountSync(serverUrl, acc.cookieHeader, {
-            authUserIndex: acc.authUserIndex,
-            dataSyncId: acc.dataSyncId
-          });
-        } else {
-          this.openYouTubeAccountModal();
-        }
-      } else if (action === 'unify-all-accounts') {
-        this.unifyAllAccounts();
-      } else if (action === 'check-server-status') {
-        const url = document.getElementById('yt-server-url')?.value?.trim() || '';
-        this.checkServerStatusForModal(url);
-      } else if (action === 'server-claim-passcode') {
-        const url = document.getElementById('yt-server-url')?.value?.trim() || this.storage.settings.serverUrl;
-        const pass = document.getElementById('server-passcode-input')?.value || '';
-        this.authenticateServerInModal(url, pass, true);
-      } else if (action === 'server-login-passcode') {
-        const url = document.getElementById('yt-server-url')?.value?.trim() || this.storage.settings.serverUrl;
-        const pass = document.getElementById('server-passcode-input')?.value || '';
-        this.authenticateServerInModal(url, pass, false);
-      } else if (action === 'copy-cookie-snippet') {
-        navigator.clipboard?.writeText(YOUTUBE_COOKIE_SNIPPET).then(() => {
-          this.showToast('Скрипт скопирован! Вставьте его в консоль на music.youtube.com');
+      } else if (action === 'copy-yt-export-snippet') {
+        navigator.clipboard?.writeText(YOUTUBE_DIRECT_EXPORT_SNIPPET).then(() => {
+          this.showToast('Скрипт скопирован! Выполните его на вкладке music.youtube.com');
         });
+      } else if (action === 'choose-yt-import-file') {
+        document.getElementById('yt-import-file-input')?.click();
       } else if (action === 'export-backup') {
         this.handleBackupExport();
       } else if (action === 'import-backup') {
@@ -2136,9 +2010,11 @@ class SonoraApp {
     try {
       this.showToast(`Скачиваем «${track.title}»…`);
       const info = await this.api.getStreamInfo(track.id, this.storage.settings.audioQuality);
-      const url = info.proxyCacheUrl || info.streamUrl;
-      if (!url) throw new Error('Для этого трека прямой поток недоступен для скачивания');
-      const bytes = await this.offline.downloadTrack(track, url);
+      const candidates =
+        Array.isArray(info.streamCandidates) && info.streamCandidates.length > 0
+          ? info.streamCandidates
+          : [info.proxyCacheUrl || info.streamUrl].filter(Boolean);
+      const bytes = await this.offline.downloadTrackWithCandidates(track, candidates);
       this.recommendations.tasteTracker.recordSignal(track, ImplicitSignalType.DOWNLOADED);
       if (this.state.playerExpanded) this.renderPlayerSheet();
       this.renderMain();
@@ -2159,9 +2035,12 @@ class SonoraApp {
     for (const track of missing) {
       try {
         const info = await this.api.getStreamInfo(track.id, this.storage.settings.audioQuality);
-        const url = info.proxyCacheUrl || info.streamUrl;
-        if (!url) continue;
-        await this.offline.downloadTrack(track, url);
+        const candidates =
+          Array.isArray(info.streamCandidates) && info.streamCandidates.length > 0
+            ? info.streamCandidates
+            : [info.proxyCacheUrl || info.streamUrl].filter(Boolean);
+        if (candidates.length === 0) continue;
+        await this.offline.downloadTrackWithCandidates(track, candidates);
         okCount++;
       } catch {
         // Continue remaining tracks
@@ -2282,160 +2161,91 @@ class SonoraApp {
     }
   }
 
-  openRoutingModal() {
+  openCatalogSourcesModal() {
     const s = this.storage.settings;
     this.openModal(
-      buildRoutingModalHtml({
-        workerCatalogUrl: s.workerCatalogUrl,
-        serverUrl: s.serverUrl,
+      buildCatalogSourcesModalHtml({
         customApiBaseUrl: s.customApiBaseUrl,
         activeSourceLabel: this.api.activeSourceLabel,
-        diagnosticsHtml: this.state.routingDiagnosticsHtml
+        diagnosticsHtml: this.state.catalogDiagnosticsHtml
       })
     );
   }
 
-  async testRoutingEndpointsFromModal() {
-    const workerUrl = document.getElementById('worker-catalog-url')?.value?.trim() || '';
-    const serverUrl = document.getElementById('routing-server-url')?.value?.trim() || '';
-    const lines = [];
-    if (workerUrl) {
-      try {
-        const res = await this.api.testHealthEndpoint(workerUrl);
-        lines.push(`<div>Cloudflare Worker: <b>OK (${res.latencyMs} мс)</b></div>`);
-      } catch (err) {
-        lines.push(`<div>Cloudflare Worker: <b>Ошибка (${escapeHtml(err.message)})</b></div>`);
-      }
-    } else {
-      lines.push(`<div>Cloudflare Worker: не указан</div>`);
-    }
-    if (serverUrl) {
-      try {
-        const res = await this.api.testHealthEndpoint(serverUrl);
-        lines.push(`<div>Node/Render сервер: <b>OK (${res.latencyMs} мс)</b></div>`);
-      } catch (err) {
-        lines.push(`<div>Node/Render сервер: <b>Ошибка (${escapeHtml(err.message)})</b></div>`);
-      }
-    } else {
-      lines.push(`<div>Node/Render сервер: не указан</div>`);
-    }
-    this.state.routingDiagnosticsHtml = lines.join('');
-    this.openRoutingModal();
+  async testCatalogHealthFromModal() {
+    this.state.catalogDiagnosticsHtml = '<div>Проверяем публичные источники…</div>';
+    this.openCatalogSourcesModal();
+    const health = await this.api.testCatalogHealth();
+    const row = (title, res) =>
+      res.ok
+        ? `<div>${title}: <b>OK (${escapeHtml(res.label)}, ${res.latencyMs} мс)</b></div>`
+        : `<div>${title}: <b>Недоступно (${escapeHtml(res.error || 'таймаут')})</b></div>`;
+    this.state.catalogDiagnosticsHtml = [
+      row('Piped', health.piped),
+      row('Invidious', health.invidious),
+      row('Audius', health.audius)
+    ].join('');
+    this.openCatalogSourcesModal();
   }
 
-  openYouTubeAccountModal() {
-    const serverUrl = this.storage.settings.serverUrl || this.storage.activeAccount?.proxyUrl || '';
-    const hasToken = Boolean(serverUrl && this.api.getServerToken(serverUrl));
+  openYouTubeImportModal() {
     this.openModal(
-      buildYouTubeAccountModalHtml({
-        serverUrl,
-        hasToken,
-        authStatus: this.state.ytModalAuthStatus,
+      buildYouTubeImportModalHtml({
         activeAccount: this.storage.activeAccount,
         accounts: this.storage.accounts,
         statusMessage: this.state.ytModalStatusMsg
       })
     );
-    if (serverUrl && !hasToken && !this.state.ytModalAuthStatus) {
-      this.checkServerStatusForModal(serverUrl);
-    }
   }
 
-  async checkServerStatusForModal(serverUrl) {
-    if (!serverUrl) {
-      this.showToast('Укажите URL вашего Node/Render-сервера');
-      return;
-    }
-    await this.storage.updateSettings({ serverUrl });
+  async handleExternalYouTubeImportText(rawText, fileName = '') {
     try {
-      const health = await this.api.testHealthEndpoint(serverUrl);
-      const authStatus = await this.api.getServerAuthStatus(serverUrl);
-      this.state.ytModalAuthStatus = authStatus;
-      this.state.ytModalStatusMsg = `Сервер отвечает (${health.latencyMs} мс)`;
-    } catch (err) {
-      this.state.ytModalAuthStatus = null;
-      this.state.ytModalStatusMsg = `Ошибка подключения: ${err.message}`;
-    }
-    this.openYouTubeAccountModal();
-  }
-
-  async authenticateServerInModal(serverUrl, passcode, isClaim) {
-    if (!serverUrl) {
-      this.showToast('Укажите URL сервера');
-      return;
-    }
-    try {
-      await this.storage.updateSettings({ serverUrl });
-      if (isClaim) {
-        await this.api.claimServerPasscode(serverUrl, passcode);
-        this.state.ytModalStatusMsg = 'Код доступа задан и сессия открыта';
-      } else {
-        await this.api.loginServerPasscode(serverUrl, passcode);
-        this.state.ytModalStatusMsg = 'Успешный вход на сервер';
-      }
-      this.state.ytModalAuthStatus = { needsClaim: false, authenticated: true };
-      this.openYouTubeAccountModal();
-      this.renderMain();
-    } catch (err) {
-      this.showToast(err.message);
-    }
-  }
-
-  async handleYouTubeAccountSync(serverUrl, cookieHeader, { authUserIndex = 0, dataSyncId = '' } = {}) {
-    try {
-      const cleanUrl = String(serverUrl || '').trim();
-      await this.storage.updateSettings({ serverUrl: cleanUrl });
-      const inlinePass = document.getElementById('server-passcode-input')?.value || '';
-      if (!this.api.getServerToken(cleanUrl)) {
-        if (!inlinePass) {
-          this.showToast('Сначала выполните вход на Node/Render сервер');
-          this.checkServerStatusForModal(cleanUrl);
-          return;
-        }
-        const status = await this.api.getServerAuthStatus(cleanUrl);
-        if (status?.needsClaim) {
-          await this.api.claimServerPasscode(cleanUrl, inlinePass);
-        } else {
-          await this.api.loginServerPasscode(cleanUrl, inlinePass);
-        }
+      if (BackupCipher.isEncryptedBackup(rawText)) {
+        this.openDecryptBackupModal(rawText);
+        return;
       }
 
-      this.showToast('Синхронизация с YouTube Music…');
-      const result = await this.api.syncYouTubeAccount(cleanUrl, cookieHeader, {
-        authUserIndex,
-        dataSyncId
-      });
+      const defaultName = fileName
+        ? fileName.replace(/\.(csv|json)$/i, '').slice(0, 80) || 'Импорт YouTube Music'
+        : 'Импорт YouTube Music';
+      const parsed = parseExternalYouTubeImport(rawText, defaultName);
 
-      const mergedStats = await this._mergeYouTubeSyncResult(result);
+      if (parsed.kind === 'sonora_backup') {
+        const stats = await this.storage.importBackupObject(parsed.backup);
+        this.closeModal();
+        this.render();
+        this.showToast(`Импортировано: треков ${stats.tracksRestored}, плейлистов ${stats.playlistsRestored}`);
+        return;
+      }
 
-      await this.storage.upsertAccount({
-        id: result.accountId || result.accountEmail || result.accountHandle || result.accountName,
-        name: result.accountName,
-        handle: result.accountHandle,
-        email: result.accountEmail,
-        avatarUrl: result.avatarUrl,
-        proxyUrl: cleanUrl,
-        cookieHeader,
-        authUserIndex,
-        dataSyncId,
-        lastSyncTimestamp: Date.now(),
-        syncedLikedCount: result.likedTracks.length,
-        syncedPlaylistsCount: result.playlists.length
-      });
+      const merged = await this._mergeYouTubeSyncResult(parsed);
+      if (parsed.account) {
+        await this.storage.upsertAccount({
+          id: parsed.account.id || parsed.account.email || parsed.account.handle || parsed.account.name,
+          name: parsed.account.name,
+          handle: parsed.account.handle,
+          email: parsed.account.email,
+          avatarUrl: parsed.account.avatarUrl,
+          lastSyncTimestamp: Date.now(),
+          syncedLikedCount: parsed.likedTracks.length,
+          syncedPlaylistsCount: parsed.playlists.length
+        });
+      }
 
+      this.state.ytModalStatusMsg = '';
       this.closeModal();
       this.render();
       this.showToast(
-        `Синхронизировано: +${mergedStats.likedAdded} лайков, ${result.playlists.length} плейлистов`
+        `Импортировано: +${merged.likedAdded} лайков, ${parsed.playlists.length} плейлистов`
       );
     } catch (err) {
-      this.showToast(err.message);
+      this.showToast(err?.message || 'Ошибка импорта данных YouTube Music');
     }
   }
 
   async _mergeYouTubeSyncResult(result) {
     let likedAdded = 0;
-    for (const t of result.likedTracks) {
+    for (const t of result.likedTracks || []) {
       if (!this.storage.isFavorite(t.id)) {
         await this.storage.toggleFavorite(t);
         likedAdded++;
@@ -2444,54 +2254,10 @@ class SonoraApp {
     for (const t of [...(result.historyTracks || [])].reverse()) {
       await this.storage.recordPlayback(t);
     }
-    for (const pl of result.playlists) {
+    for (const pl of result.playlists || []) {
       await this.storage.mergePlaylist(pl.name, pl.description, pl.tracks, pl.id);
     }
     return { likedAdded };
-  }
-
-  async unifyAllAccounts() {
-    if (this.storage.accounts.length === 0) return;
-    const serverUrl = this.storage.settings.serverUrl;
-    if (!serverUrl || !this.api.getServerToken(serverUrl)) {
-      this.openYouTubeAccountModal();
-      return;
-    }
-    this.showToast('Синхронизация всех аккаунтов…');
-    let totalLiked = 0;
-    for (const acc of this.storage.accounts) {
-      try {
-        const res = await this.api.syncYouTubeAccount(acc.proxyUrl || serverUrl, acc.cookieHeader, {
-          authUserIndex: acc.authUserIndex,
-          dataSyncId: acc.dataSyncId
-        });
-        const stats = await this._mergeYouTubeSyncResult(res);
-        totalLiked += stats.likedAdded;
-      } catch {
-        // Continue next account
-      }
-    }
-    this.render();
-    this.showToast(`Все аккаунты синхронизированы (+${totalLiked} треков)`);
-  }
-
-  _syncLikeWriteThrough(videoId, liked) {
-    if (!this.storage.settings.writeThroughSyncEnabled) return;
-    this.api.ytSetLike(videoId, liked).catch(() => {});
-  }
-
-  _syncPlaylistAddWriteThrough(playlistId, videoIds) {
-    if (!this.storage.settings.writeThroughSyncEnabled) return;
-    const pl = this.storage.library.playlists.find((p) => p.id === playlistId);
-    if (!pl?.youtubePlaylistId) return;
-    this.api.ytAddTracksToPlaylist(pl.youtubePlaylistId, videoIds).catch(() => {});
-  }
-
-  _syncPlaylistRemoveWriteThrough(playlistId, videoId) {
-    if (!this.storage.settings.writeThroughSyncEnabled) return;
-    const pl = this.storage.library.playlists.find((p) => p.id === playlistId);
-    if (!pl?.youtubePlaylistId) return;
-    this.api.ytRemoveTrackFromPlaylist(pl.youtubePlaylistId, videoId).catch(() => {});
   }
 
   handleBackupExport() {
