@@ -60,7 +60,9 @@ export class SonoraPlayer {
     this._trackLoadSeq = 0;
     this._realSrcSeq = 0;
     this._ignoreErrorsForSeq = -1;
+    this._lastErrorForSeq = -1;
     this._isRecoveringError = false;
+    this._stallTimer = null;
     this._pendingSeekSeconds = 0;
     this._lastSaveAt = 0;
 
@@ -292,7 +294,33 @@ export class SonoraPlayer {
     this.onStateChange?.(this.getSnapshot());
   }
 
+  _clearStallWatchdog() {
+    if (this._stallTimer) {
+      clearTimeout(this._stallTimer);
+      this._stallTimer = null;
+    }
+  }
+
+  _armStallWatchdog() {
+    this._clearStallWatchdog();
+    if (this.isOfflineSource || !this.currentTrack || !this.audio.src || this.audio.paused) return;
+    const seq = this._trackLoadSeq;
+    const srcSeq = this._realSrcSeq;
+    const startPos = Number(this.audio.currentTime) || 0;
+    this._stallTimer = setTimeout(() => {
+      this._stallTimer = null;
+      if (this._trackLoadSeq !== seq || this._realSrcSeq !== srcSeq) return;
+      if (this.audio.paused || this.isOfflineSource || !this.currentTrack) return;
+      const curPos = Number(this.audio.currentTime) || 0;
+      if (Math.abs(curPos - startPos) < 0.25) {
+        this._handleAudioError();
+      }
+    }, 8500);
+    this._stallTimer.unref?.();
+  }
+
   _resetFailoverState() {
+    this._clearStallWatchdog();
     this.activeStreamCandidates = [];
     this.candidateIndex = 0;
     this.activeSourceKey = null;
@@ -303,6 +331,7 @@ export class SonoraPlayer {
   }
 
   _assignAudioSrc(url) {
+    this._clearStallWatchdog();
     this._ignoreErrorsForSeq = this._realSrcSeq;
     try {
       if (this.audio.src && !this.audio.paused) {
@@ -369,6 +398,7 @@ export class SonoraPlayer {
 
     this.audio.addEventListener('pause', () => {
       if (this._isSilentPrimerEvent()) return;
+      this._clearStallWatchdog();
       this.isPlaying = false;
       this.isBuffering = false;
       if (this._activeSession) {
@@ -385,11 +415,18 @@ export class SonoraPlayer {
       if (this._activeSession) {
         this._activeSession.lastActiveTickAt = 0;
       }
+      this._armStallWatchdog();
       this._emit();
+    });
+
+    this.audio.addEventListener('stalled', () => {
+      if (this._isSilentPrimerEvent()) return;
+      this._armStallWatchdog();
     });
 
     this.audio.addEventListener('canplay', () => {
       if (this._isSilentPrimerEvent()) return;
+      this._clearStallWatchdog();
       this.isBuffering = false;
       this._emit();
     });
@@ -427,6 +464,7 @@ export class SonoraPlayer {
 
     this.audio.addEventListener('timeupdate', () => {
       if (this._isSilentPrimerEvent()) return;
+      this._clearStallWatchdog();
       this.currentTime = this.audio.currentTime || 0;
       if (Number.isFinite(this.audio.duration) && this.audio.duration > 0) {
         this.duration = this.audio.duration;
@@ -455,17 +493,24 @@ export class SonoraPlayer {
         this._primingSilentAudio = false;
         return;
       }
+      this._clearStallWatchdog();
       if (!this.currentTrack || !this.audio.src) return;
 
-      // Guard against a premature/truncated stub stream (< 2.5s when track is >= 10s)
+      // Guard against truncated/broken proxy streams ending after 1-8s on a full-length track
       const audioDur = Number(this.audio.duration);
       const expectedDur = Number(this.currentTrack?.durationSeconds) || 0;
+      const effectiveDur = Number.isFinite(audioDur) && audioDur > 0 ? audioDur : expectedDur;
+      const pos = Number(this.audio.currentTime) || 0;
+      const listenedMs = this._activeSession?.listenedMs || 0;
+      const isTruncatedChunk =
+        effectiveDur > 15 &&
+        pos > 0.2 &&
+        pos < effectiveDur - 8 &&
+        pos < effectiveDur * 0.85 &&
+        listenedMs < Math.max(12000, effectiveDur * 500);
       if (
-        Number.isFinite(audioDur) &&
-        audioDur > 0 &&
-        audioDur < 2.5 &&
-        expectedDur > 10 &&
-        (this._activeSession?.listenedMs || 0) < 3000
+        isTruncatedChunk ||
+        (Number.isFinite(audioDur) && audioDur > 0 && audioDur < 2.5 && expectedDur > 10 && listenedMs < 3000)
       ) {
         await this._handleAudioError();
         return;
@@ -496,8 +541,39 @@ export class SonoraPlayer {
       if (!this.audio.src || this._ignoreErrorsForSeq === this._realSrcSeq) {
         return;
       }
+      this._clearStallWatchdog();
+      this._lastErrorForSeq = this._realSrcSeq;
       await this._handleAudioError();
     });
+  }
+
+  async _tryPlayCandidateUrl(url, seq, resumeFromSeconds = 0) {
+    this.isBuffering = true;
+    this._pendingSeekSeconds = resumeFromSeconds >= 8 ? resumeFromSeconds : 0;
+    this._emit();
+    this._assignAudioSrc(url);
+    const assignedSeq = this._realSrcSeq;
+
+    try {
+      await this.audio.play();
+      this._audioUnlocked = true;
+      if (this._trackLoadSeq !== seq) return 'aborted';
+      if (this._lastErrorForSeq === assignedSeq) return 'failed';
+      return 'ok';
+    } catch (err) {
+      if (err?.name === 'NotAllowedError') {
+        this.isPlaying = false;
+        this.isBuffering = false;
+        this._emit();
+        return 'blocked';
+      }
+      if (err?.name === 'AbortError') {
+        if (this._trackLoadSeq !== seq) return 'aborted';
+        if (this._lastErrorForSeq === assignedSeq) return 'failed';
+        return 'aborted';
+      }
+      return 'failed';
+    }
   }
 
   async _handleAudioError() {
@@ -512,73 +588,69 @@ export class SonoraPlayer {
 
     this._isRecoveringError = true;
     const seq = this._trackLoadSeq;
+    const resumePos = Number(this.currentTime) || 0;
 
     try {
-      // 1. Try next URL candidate from the same extractor
-      if (this.candidateIndex + 1 < this.activeStreamCandidates.length) {
-        this.candidateIndex += 1;
-        const nextUrl = this.activeStreamCandidates[this.candidateIndex];
-        this.isBuffering = true;
-        this._pendingSeekSeconds = this.currentTime > 1 ? this.currentTime : 0;
-        this._emit();
-        this._assignAudioSrc(nextUrl);
-        try {
-          await this.audio.play();
-        } catch (err) {
-          if (err?.name === 'NotAllowedError') {
-            this.isPlaying = false;
-            this.isBuffering = false;
-            this._emit();
+      while (this._trackLoadSeq === seq && this.currentTrack?.id === track.id) {
+        // 1. Try remaining URL candidates from the current extractor
+        while (this.candidateIndex + 1 < this.activeStreamCandidates.length) {
+          this.candidateIndex += 1;
+          const nextUrl = this.activeStreamCandidates[this.candidateIndex];
+          const status = await this._tryPlayCandidateUrl(nextUrl, seq, resumePos);
+          if (status === 'ok' || status === 'blocked' || status === 'aborted') {
+            return;
           }
         }
-        return;
-      }
 
-      // 2. All candidates from this gateway failed: exclude sourceKey and try next extractor silently
-      if (this.extractorRetries < this.maxExtractorRetries && !track.id.startsWith('aud:')) {
+        // 2. Exhausted candidates on this gateway -> report failure & rotate to next extractor
         if (this.activeSourceKey) {
           this.failedGateways.add(this.activeSourceKey);
+          this.api.reportStreamFailure?.(this.activeSourceKey);
         }
+
+        if (this.extractorRetries >= this.maxExtractorRetries || track.id.startsWith('aud:')) {
+          break;
+        }
+
         this.extractorRetries += 1;
         this.streamCache.delete(track.id);
         this.isBuffering = true;
         this._emit();
 
+        let freshInfo = null;
         try {
-          const freshInfo = await this.api.getStreamInfo(track.id, this.storage.settings.audioQuality, {
+          freshInfo = await this.api.getStreamInfo(track.id, this.storage.settings.audioQuality, {
             excludeGateways: this.failedGateways
           });
-          if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
-
-          const candidates =
-            Array.isArray(freshInfo?.streamCandidates) && freshInfo.streamCandidates.length > 0
-              ? freshInfo.streamCandidates
-              : [freshInfo?.streamUrl].filter(Boolean);
-
-          if (candidates.length > 0) {
-            this.streamCache.set(track.id, { fetchedAt: Date.now(), info: freshInfo });
-            this.activeStreamCandidates = candidates;
-            this.candidateIndex = 0;
-            this.activeSourceKey = freshInfo.sourceKey || null;
-            this.sourceType = freshInfo.sourceType || 'audio';
-            this._pendingSeekSeconds = this.currentTime > 1 ? this.currentTime : 0;
-            this._assignAudioSrc(candidates[0]);
-            this._emit();
-            try {
-              await this.audio.play();
-            } catch (err) {
-              if (err?.name === 'NotAllowedError') {
-                this.isPlaying = false;
-                this.isBuffering = false;
-                this._emit();
-              }
-            }
-            return;
-          }
         } catch {
           if (this._trackLoadSeq !== seq) return;
+          break;
+        }
+
+        if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
+
+        const candidates =
+          Array.isArray(freshInfo?.streamCandidates) && freshInfo.streamCandidates.length > 0
+            ? freshInfo.streamCandidates
+            : [freshInfo?.streamUrl].filter(Boolean);
+
+        if (candidates.length === 0) {
+          break;
+        }
+
+        this.streamCache.set(track.id, { fetchedAt: Date.now(), info: freshInfo });
+        this.activeStreamCandidates = candidates;
+        this.candidateIndex = 0;
+        this.activeSourceKey = freshInfo.sourceKey || null;
+        this.sourceType = freshInfo.sourceType || 'audio';
+
+        const status = await this._tryPlayCandidateUrl(candidates[0], seq, resumePos);
+        if (status === 'ok' || status === 'blocked' || status === 'aborted') {
+          return;
         }
       }
+
+      if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
 
       // 3. Dead track in a multi-track queue -> skip cleanly at most once before pausing with error
       this._consecutiveTrackErrors += 1;

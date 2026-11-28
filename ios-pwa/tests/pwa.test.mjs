@@ -1408,6 +1408,109 @@ test('SonoraPlayer prevents 2-3s track-skipping loops on NotAllowedError, AbortE
   assert.ok(errors.length >= 2);
 });
 
+test('SonoraPlayer recovers from 2-3s truncated ended streams and iterative NotSupportedError candidate failures without skipping tracks', async () => {
+  const { SonoraPlayer } = await import('../src/player.js');
+  const storage = new SonoraStorage();
+  await storage.init();
+
+  const listeners = new Map();
+  const mockAudio = {
+    src: '',
+    paused: true,
+    currentTime: 0,
+    duration: 200,
+    playbackRate: 1,
+    volume: 1,
+    muted: false,
+    setAttribute() {},
+    removeAttribute() {},
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
+    async emit(type) {
+      for (const fn of listeners.get(type) || []) {
+        await fn();
+      }
+    },
+    async play() {
+      if (this.src.includes('bad-codec')) {
+        const err = new Error('Unsupported codec');
+        err.name = 'NotSupportedError';
+        throw err;
+      }
+      this.paused = false;
+      await this.emit('play');
+      await this.emit('canplay');
+    },
+    pause() {
+      this.paused = true;
+    },
+    load() {}
+  };
+
+  const reportedFailures = [];
+  const api = new SonoraApi(() => ({
+    fastNodes: { piped: 'https://broken-piped.example.com' }
+  }));
+  api.activeInstance = 'https://broken-piped.example.com';
+  const origReport = api.reportStreamFailure.bind(api);
+  api.reportStreamFailure = (gw) => {
+    reportedFailures.push(gw);
+    origReport(gw);
+  };
+  api.getStreamInfo = async (id, _q, { excludeGateways = new Set() } = {}) => {
+    if (!excludeGateways.has('https://broken-piped.example.com')) {
+      return {
+        engine: 'audio',
+        sourceType: 'piped',
+        sourceKey: 'https://broken-piped.example.com',
+        streamUrl: `https://broken-piped.example.com/${id}-c1.m4a`,
+        streamCandidates: [
+          `https://broken-piped.example.com/${id}-c1.m4a`,
+          `https://broken-piped.example.com/${id}-bad-codec.webm`
+        ],
+        mimeType: 'audio/mp4'
+      };
+    }
+    return {
+      engine: 'audio',
+      sourceType: 'invidious',
+      sourceKey: 'https://healthy-inv.example.com',
+      streamUrl: `https://healthy-inv.example.com/${id}-ok.m4a`,
+      streamCandidates: [`https://healthy-inv.example.com/${id}-ok.m4a`],
+      mimeType: 'audio/mp4'
+    };
+  };
+  api.fetchLyrics = async () => ({ synced: [], plain: '', source: '' });
+
+  const player = new SonoraPlayer({
+    api,
+    storage,
+    offline: null,
+    recommendations: null,
+    audioElement: mockAudio
+  });
+
+  const t1 = { id: 'tr000000001', title: 'Track One', artist: 'A', durationSeconds: 200 };
+  const t2 = { id: 'tr000000002', title: 'Track Two', artist: 'A', durationSeconds: 200 };
+
+  await player.playTrack(t1, [t1, t2]);
+  assert.equal(mockAudio.src, 'https://broken-piped.example.com/tr000000001-c1.m4a');
+
+  // Stream truncates early at 2.4s even though duration=200s -> must NOT skip to t2!
+  // Instead, it recovers through candidate #2 (which throws NotSupportedError and loops cleanly)
+  // and rotates to the healthy Invidious gateway while clearing sticky broken node.
+  mockAudio.currentTime = 2.4;
+  await mockAudio.emit('ended');
+
+  assert.equal(player.currentTrack.id, t1.id);
+  assert.equal(mockAudio.src, 'https://healthy-inv.example.com/tr000000001-ok.m4a');
+  assert.deepEqual(reportedFailures, ['https://broken-piped.example.com']);
+  assert.equal(api.lastFastNodes.piped, '');
+  assert.equal(api.activeInstance, null);
+});
+
 
 
 

@@ -455,6 +455,20 @@ export class SonoraApi {
     }
   }
 
+  reportStreamFailure(base) {
+    const clean = sanitizeCustomNodeUrl(base);
+    if (!clean) return;
+    this._markUnhealthy(clean);
+    if (this.activeInstance === clean) {
+      this.activeInstance = null;
+    }
+    for (const kind of ['piped', 'invidious', 'audius']) {
+      if (this.lastFastNodes[kind] === clean) {
+        this.lastFastNodes[kind] = '';
+      }
+    }
+  }
+
   _prioritizePool(basePool, excludeGateways = new Set()) {
     const unique = Array.from(new Set(basePool.map(sanitizeCustomNodeUrl).filter(Boolean))).filter(
       (base) => !excludeGateways?.has(base)
@@ -1351,19 +1365,24 @@ export class SonoraApi {
 
             const chosenMatch = audioCandidates.find((c) => c?.url === selected.url);
             const support = getAudioPlaybackSupport();
-            const extraPlayableUrls = audioCandidates
-              .filter(
-                (c) =>
-                  isDirectAudioOrM4a(c) ||
-                  (support.webm && String(c?.mimeType || '').toLowerCase().includes('webm'))
-              )
-              .flatMap((c) => [c.url, c.directUrl]);
+            const bestM4a = audioCandidates
+              .filter(isDirectAudioOrM4a)
+              .sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0))[0];
+            const bestWebm = support.webm
+              ? audioCandidates
+                  .filter((c) => {
+                    const mime = String(c?.mimeType || '').toLowerCase();
+                    return mime.includes('webm') || String(c?.codec || '').toLowerCase().includes('opus');
+                  })
+                  .sort((a, b) => (Number(b.bitrate) || 0) - (Number(a.bitrate) || 0))[0]
+              : null;
 
             const streamCandidates = this._buildStreamCandidates([
               selected.url,
-              chosenMatch?.directUrl,
-              ...extraPlayableUrls,
-              selected.fallbackUrl
+              bestM4a?.url,
+              bestWebm?.url,
+              selected.fallbackUrl,
+              chosenMatch?.directUrl
             ]);
             if (streamCandidates.length === 0) throw new Error('Пустой список аудиопотоков');
 
@@ -1417,10 +1436,15 @@ export class SonoraApi {
                     codec: f.encoding || ''
                   }))
               : [];
+            const support = getAudioPlaybackSupport();
             const invProxiedM4a = `${invBase}/latest_version?id=${encodeURIComponent(cleanId)}&itag=140&local=true`;
+            const invProxiedWebm = support.webm
+              ? `${invBase}/latest_version?id=${encodeURIComponent(cleanId)}&itag=251&local=true`
+              : null;
             const selected = selectBestIosAudioStream(formats, inv?.hlsUrl, quality);
             const streamCandidates = this._buildStreamCandidates([
               invProxiedM4a,
+              invProxiedWebm,
               selected?.url,
               selected?.fallbackUrl
             ]);
