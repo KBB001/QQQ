@@ -1,5 +1,6 @@
 const CACHE_VERSION = '__BUILD_VERSION__';
-const CACHE_NAME = `sonora-ios-shell-${CACHE_VERSION}`;
+const CACHE_REV = '2026-11-28-v3';
+const CACHE_NAME = `sonora-ios-shell-${CACHE_VERSION}-${CACHE_REV}`;
 
 const SHELL_ASSETS = [
   './',
@@ -64,33 +65,39 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  if (request.mode === 'navigate' || url.pathname.endsWith('index.html')) {
+  // Static icon PNGs can safely use cache-first with background refresh
+  if (url.pathname.includes('/icons/')) {
     event.respondWith(
-      fetch(request)
-        .then((networkResp) => {
-          if (networkResp && networkResp.ok) {
-            const copy = networkResp.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put('./index.html', copy));
-          }
-          return networkResp;
-        })
-        .catch(() => caches.match('./index.html'))
+      caches.match(request).then((cached) => {
+        const net = fetch(request)
+          .then((resp) => {
+            if (resp && resp.ok) {
+              const copy = resp.clone();
+              caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
+            }
+            return resp;
+          })
+          .catch(() => cached);
+        return cached || net;
+      })
     );
     return;
   }
 
+  // App shell (HTML, JS, CSS, manifest): network-first so updates take effect immediately,
+  // falling back to cache when offline.
   event.respondWith(
-    caches.match(request).then((cached) => {
-      const networkFetch = fetch(request)
-        .then((resp) => {
-          if (resp && resp.ok) {
-            const copy = resp.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(request, copy));
-          }
-          return resp;
-        })
-        .catch(() => cached);
-      return cached || networkFetch;
-    })
+    fetch(request, { cache: 'no-cache' })
+      .then((networkResp) => {
+        if (networkResp && networkResp.ok) {
+          const copy = networkResp.clone();
+          const targetKey = request.mode === 'navigate' ? './index.html' : request;
+          caches.open(CACHE_NAME).then((cache) => cache.put(targetKey, copy));
+        }
+        return networkResp;
+      })
+      .catch(() =>
+        caches.match(request).then((cached) => cached || (request.mode === 'navigate' ? caches.match('./index.html') : undefined))
+      )
   );
 });

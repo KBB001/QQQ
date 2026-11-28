@@ -247,8 +247,13 @@ class SonoraApp {
   async registerServiceWorker() {
     if (!('serviceWorker' in navigator)) return;
     try {
-      const reg = await navigator.serviceWorker.register('./sw.js', { scope: './' });
+      const hadController = Boolean(navigator.serviceWorker.controller);
+      const reg = await navigator.serviceWorker.register('./sw.js', {
+        scope: './',
+        updateViaCache: 'none'
+      });
       this.swRegistration = reg;
+      reg.update().catch(() => {});
       if (reg.waiting) {
         this.state.swUpdateWaiting = reg.waiting;
         this.renderBanner();
@@ -270,7 +275,9 @@ class SonoraApp {
         }
       });
       navigator.serviceWorker.addEventListener('controllerchange', () => {
-        window.location.reload();
+        if (hadController) {
+          window.location.reload();
+        }
       });
     } catch {
       // Ignore
