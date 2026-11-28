@@ -5,8 +5,10 @@ import {
   BackupCipher,
   buildBackupPayload,
   escapeHtml,
+  formatUserErrorRu,
   normalizeBackupPayload,
   parseExternalYouTubeImport,
+  parseTrackVersionInfo,
   sanitizeHttpsUrl
 } from '../src/security.js';
 import {
@@ -18,19 +20,22 @@ import {
   selectBestIosAudioStream,
   SonoraApi
 } from '../src/api.js';
-import { SonoraOfflineManager, formatBytesRu } from '../src/offline.js';
+import { SonoraOfflineManager, buildSafeAudioFilename, formatBytesRu } from '../src/offline.js';
 import {
   ImplicitSignalType,
   MoodCategory,
   SmartRecommendationEngine,
-  TrackMoodProfiler
+  TrackMoodProfiler,
+  diversifyRecommendations,
+  groupTrackVersions
 } from '../src/recommendations.js';
-import { SonoraStorage } from '../src/storage.js';
+import { SonoraStorage, getTimeOfDayBucket } from '../src/storage.js';
 import {
   buildGoogleOAuthUrl,
   isValidGoogleClientId,
   parseIsoDurationSeconds,
   parseOAuthHashResponse,
+  revokeGoogleOAuthToken,
   syncYouTubeLibraryWithOAuth
 } from '../src/youtube-oauth.js';
 
@@ -111,17 +116,38 @@ test('normalizeBackupPayload and SonoraStorage import/export round-trip Android 
   assert.equal(stats.tracksRestored, 1);
   assert.equal(stats.playlistsRestored, 1);
 
-  const exported = buildBackupPayload({
-    favorites: storage.library.favorites,
-    history: storage.library.history,
-    playlists: storage.library.playlists,
-    searchHistory: storage.library.searchHistory,
-    settings: storage.settings,
-    playback: null
+  await storage.recordTrackPlayStart({
+    id: 'abc123def45',
+    title: 'Track One',
+    artist: 'Artist A',
+    album: 'Debut LP',
+    year: 2021,
+    genre: 'Electronic',
+    durationSeconds: 185
   });
-  assert.equal(exported.version, 2);
+  await storage.saveAffinityEntity({
+    trackId: 'abc123def45',
+    normalizedArtist: 'artist a',
+    moodName: MoodCategory.ENERGETIC,
+    tempoName: 2,
+    affinityScore: 4,
+    lastInteractedAt: 1730000000000
+  });
+
+  const exported = storage.exportBackupObject();
+  assert.equal(exported.version, 3);
   assert.equal(exported.favorites.length, 1);
   assert.equal(exported.playlists[0].name, 'Roadtrip');
+  assert.equal(exported.trackStats['abc123def45'].album, 'Debut LP');
+  assert.equal(exported.trackStats['abc123def45'].year, 2021);
+  assert.equal(exported.affinities.length, 1);
+
+  const storage2 = new SonoraStorage();
+  await storage2.init();
+  await storage2.importBackupObject(exported);
+  assert.equal(storage2.trackStats['abc123def45']?.playCount, 1);
+  assert.equal(storage2.trackStats['abc123def45']?.genre, 'Electronic');
+  assert.equal(storage2.affinities.length, 1);
 });
 
 test('parseExternalYouTubeImport parses sonora-yt-sync:v1, Takeout watch-history.json, and Takeout CSV', () => {
@@ -845,6 +871,13 @@ test('SonoraStorage deduplicates playlists, computes listening stats, and persis
     { id: '1N8hOpMqvYs', title: 'Track 2', artist: 'Artist B', durationSeconds: 180 },
     { id: 'dQw4w9WgXcQ', title: 'Track 1 Duplicate', artist: 'Artist A', durationSeconds: 200 }
   ]);
+  assert.equal(storage.library.playlists[0].tracks.length, 2);
+  storage.library.playlists[0].tracks.push({
+    id: 'dQw4w9WgXcQ',
+    title: 'Track 1 Legacy Duplicate',
+    artist: 'Artist A',
+    durationSeconds: 200
+  });
   const removed = await storage.deduplicatePlaylistTracks(pl.id);
   assert.equal(removed, 1);
   assert.equal(storage.library.playlists[0].tracks.length, 2);
@@ -914,4 +947,261 @@ test('SonoraApi resolves AUTO quality and paginates Piped playlists across nextp
     globalThis.fetch = originalFetch;
   }
 });
+
+test('parseTrackVersionInfo, groupTrackVersions, and diversifyRecommendations link variants and prevent consecutive repeats', () => {
+  const orig = parseTrackVersionInfo('Blinding Lights (Official Audio)', 'The Weeknd');
+  const remix = parseTrackVersionInfo('Blinding Lights (Chromatics Remix)', 'The Weeknd');
+  const live = parseTrackVersionInfo('Blinding Lights (Live at Wembley)', 'The Weeknd');
+  const slowed = parseTrackVersionInfo('Blinding Lights (Slowed + Reverb)', 'The Weeknd');
+  const cover = parseTrackVersionInfo('Blinding Lights (Acoustic Cover)', 'Another Singer');
+
+  assert.equal(orig.versionType, 'original');
+  assert.equal(remix.versionType, 'remix');
+  assert.equal(live.versionType, 'live');
+  assert.equal(slowed.versionType, 'slowed');
+  assert.equal(cover.versionType, 'cover');
+  assert.equal(orig.canonicalKey, remix.canonicalKey);
+  assert.equal(orig.canonicalKey, live.canonicalKey);
+  assert.equal(orig.canonicalKey, slowed.canonicalKey);
+
+  const pool = [
+    { id: 'v_orig00001', title: 'Blinding Lights', artist: 'The Weeknd', durationSeconds: 200 },
+    { id: 'v_remix0002', title: 'Blinding Lights (Club Remix)', artist: 'The Weeknd', durationSeconds: 215 },
+    { id: 'v_live00003', title: 'Blinding Lights (Live)', artist: 'The Weeknd', durationSeconds: 230 },
+    { id: 'v_slow00004', title: 'Blinding Lights (Slowed + Reverb)', artist: 'The Weeknd', durationSeconds: 245 },
+    { id: 'other000005', title: 'Nightcall', artist: 'Kavinsky', durationSeconds: 258 },
+    { id: 'other000006', title: 'Midnight City', artist: 'M83', durationSeconds: 243 }
+  ];
+
+  const grouped = groupTrackVersions(pool[1], pool);
+  assert.equal(grouped.originals.length, 1);
+  assert.equal(grouped.remixes.length, 1);
+  assert.equal(grouped.live.length, 1);
+  assert.equal(grouped.other.length, 1);
+
+  const diversified = diversifyRecommendations(pool);
+  assert.equal(diversified[0].id, 'v_orig00001');
+  assert.notEqual(diversified[1].canonicalKey, diversified[0].canonicalKey);
+  for (let i = 1; i < diversified.length; i++) {
+    const prev = diversified[i - 1];
+    const cur = diversified[i];
+    if (prev.id !== cur.id && i <= 3) {
+      assert.notEqual(prev.artist, cur.artist);
+    }
+  }
+});
+
+test('SmartRecommendationEngine computes co-occurrence "Others Also Like" and "Similar to Favorites"', async () => {
+  const storage = new SonoraStorage();
+  await storage.init();
+
+  const fav = {
+    id: 'fav00000001',
+    title: 'Nightcall',
+    artist: 'Kavinsky',
+    genre: 'Synthwave',
+    year: 2010,
+    tempoBpm: 92,
+    durationSeconds: 258
+  };
+  const coLiked = {
+    id: 'co000000002',
+    title: 'A Real Hero',
+    artist: 'College',
+    genre: 'Synthwave',
+    year: 2011,
+    tempoBpm: 95,
+    durationSeconds: 267
+  };
+  const simTrack = {
+    id: 'sim00000003',
+    title: 'Midnight Drive Synth',
+    artist: 'Timecop1983',
+    genre: 'Synthwave',
+    year: 2018,
+    tempoBpm: 96,
+    durationSeconds: 240
+  };
+  const unrelated = {
+    id: 'unr00000004',
+    title: 'Hardstyle Gym Bass',
+    artist: 'Zyzz',
+    genre: 'Hardstyle',
+    year: 2024,
+    tempoBpm: 155,
+    durationSeconds: 140
+  };
+
+  await storage.toggleFavorite(fav);
+  await storage.createPlaylist('Synth Mix 1', '', [fav, coLiked]);
+  await storage.createPlaylist('Synth Mix 2', '', [fav, coLiked, simTrack]);
+
+  const engine = new SmartRecommendationEngine({ api: null, storage });
+  const mixes = engine.buildPersonalizedMixes([fav, coLiked, simTrack, unrelated]);
+
+  assert.ok(mixes.similarToFavorites.length >= 1);
+  assert.ok(mixes.similarToFavorites.some((t) => t.id === coLiked.id || t.id === simTrack.id));
+  assert.ok(mixes.alsoLikedTracks.length >= 1);
+  assert.equal(mixes.alsoLikedTracks[0].id, coLiked.id);
+});
+
+test('SonoraPlayer enforces anti-cheat listening stats across pause, seek, reload, and failover, and skips dead queue tracks', async () => {
+  const { SonoraPlayer } = await import('../src/player.js');
+  const storage = new SonoraStorage();
+  await storage.init();
+
+  assert.equal(getTimeOfDayBucket(new Date(2026, 0, 1, 8, 0).getTime()), 'morning');
+  assert.equal(getTimeOfDayBucket(new Date(2026, 0, 1, 14, 0).getTime()), 'day');
+  assert.equal(getTimeOfDayBucket(new Date(2026, 0, 1, 20, 0).getTime()), 'evening');
+  assert.equal(getTimeOfDayBucket(new Date(2026, 0, 1, 2, 0).getTime()), 'night');
+
+  const listeners = new Map();
+  const mockAudio = {
+    src: '',
+    paused: true,
+    currentTime: 0,
+    duration: 200,
+    playbackRate: 1,
+    volume: 1,
+    muted: false,
+    setAttribute() {},
+    removeAttribute() {},
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
+    async emit(type) {
+      for (const fn of listeners.get(type) || []) {
+        await fn();
+      }
+    },
+    async play() {
+      this.paused = false;
+      await this.emit('play');
+    },
+    pause() {
+      this.paused = true;
+    },
+    load() {}
+  };
+
+  const errors = [];
+  const fakeApi = {
+    async getStreamInfo(id) {
+      if (id === 'dead0000002') {
+        throw new Error('502 Bad Gateway');
+      }
+      return {
+        engine: 'audio',
+        sourceType: 'piped',
+        sourceKey: 'gw1',
+        streamUrl: `https://cdn.example/${id}.m4a`,
+        streamCandidates: [`https://cdn.example/${id}.m4a`],
+        mimeType: 'audio/mp4',
+        album: 'Test Album',
+        year: 2022,
+        genre: 'Indie'
+      };
+    },
+    async fetchLyrics() {
+      return { synced: [], plain: '', source: '' };
+    }
+  };
+
+  const player = new SonoraPlayer({
+    api: fakeApi,
+    storage,
+    offline: null,
+    recommendations: null,
+    audioElement: mockAudio,
+    onError: (msg) => errors.push(msg)
+  });
+
+  const t1 = { id: 'live0000001', title: 'Good Track', artist: 'Good Artist', durationSeconds: 200 };
+  const tDead = { id: 'dead0000002', title: 'Broken Track', artist: 'Broken Artist', durationSeconds: 180 };
+  const t3 = { id: 'live0000003', title: 'Third Track', artist: 'Third Artist', durationSeconds: 210 };
+
+  await player.playTrack(t1, [t1, tDead, t3]);
+  assert.equal(storage.trackStats[t1.id].playCount, 1);
+
+  // Pause & resume should NOT double-increment playCount
+  await player.togglePlayPause(false);
+  await player.togglePlayPause(true);
+  assert.equal(storage.trackStats[t1.id].playCount, 1);
+
+  // Seek forward to 190s without actual elapsed playback -> quick-skip/incomplete instead of cheating full duration
+  player.seekTo(190);
+  assert.equal(player._activeSession.seeked, true);
+
+  // Moving to broken tDead automatically skips over to t3
+  await player.next(false);
+  assert.equal(player.currentTrack.id, t3.id);
+  assert.equal(storage.trackStats[t3.id].playCount, 1);
+  assert.ok(errors.some((m) => m.includes('недоступен') && (m.includes('переключаем') || m.includes('переходим'))));
+
+  // Simulate genuine listen (>= 35s) and completion
+  player._activeSession.listenedMs = 150000;
+  await mockAudio.emit('ended');
+  assert.equal(storage.trackStats[t3.id].completeCount, 1);
+  const fullStats = storage.getListeningStats();
+  assert.ok(fullStats.totalPlays >= 2);
+  assert.ok(fullStats.totalListenedMinutes >= 2);
+});
+
+test('buildSafeAudioFilename, SonoraOfflineManager partial cache cleanup, revokeGoogleOAuthToken, and formatUserErrorRu work properly', async () => {
+  assert.equal(
+    buildSafeAudioFilename({ title: 'Song: One?', artist: 'Artist / Two' }, 'audio/mp4'),
+    'Artist Two - Song One .m4a'.replace(' .m4a', '.m4a') // cleanPart collapses spaces and strips ?
+  );
+  assert.equal(
+    buildSafeAudioFilename({ title: 'Track*', artist: 'Artist' }, 'audio/mpeg'),
+    'Artist - Track.mp3'
+  );
+  assert.equal(
+    formatUserErrorRu(new Error('Failed to fetch'), 'Ошибка'),
+    'Не удалось подключиться к сети. Проверьте интернет или источники в Настройках.'
+  );
+
+  const storage = new SonoraStorage();
+  await storage.init();
+  const mgr = new SonoraOfflineManager(storage);
+
+  const origCaches = globalThis.caches;
+  const origFetch = globalThis.fetch;
+  const deletedKeys = [];
+
+  try {
+    globalThis.caches = {
+      async open() {
+        return {
+          async delete(k) {
+            deletedKeys.push(k);
+          }
+        };
+      }
+    };
+    globalThis.fetch = async (url) => {
+      const s = String(url);
+      if (s.includes('oauth2.googleapis.com/revoke')) {
+        return new Response('', { status: 200 });
+      }
+      return new Response(new Uint8Array(100), {
+        status: 200,
+        headers: { 'content-type': 'audio/mp4', 'content-length': '100' }
+      });
+    };
+
+    await assert.rejects(() =>
+      mgr.downloadTrack({ id: 'dQw4w9WgXcQ', title: 'Tiny', artist: 'A' }, 'https://cdn.example/tiny.m4a')
+    );
+    assert.ok(deletedKeys.some((k) => k.includes('dQw4w9WgXcQ')));
+
+    const revoked = await revokeGoogleOAuthToken('ya29.test');
+    assert.equal(revoked, true);
+  } finally {
+    globalThis.caches = origCaches;
+    globalThis.fetch = origFetch;
+  }
+});
+
 

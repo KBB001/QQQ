@@ -16,6 +16,7 @@ const KEY_SETTINGS = 'app_settings_v1';
 const KEY_PLAYBACK = 'playback_state_v1';
 const KEY_ACCOUNT = 'account_state_v1';
 const KEY_AFFINITIES = 'taste_affinities_v1';
+const KEY_TRACK_STATS = 'track_stats_v1';
 const KEY_OFFLINE = 'offline_tracks_v1';
 const KEY_DEVICE_KEY = 'device_aes_key_v1';
 const KEY_HOME_CACHE = 'home_swr_cache_v1';
@@ -36,6 +37,63 @@ const DEFAULT_LIBRARY = {
   playlists: [],
   searchHistory: []
 };
+
+export function getTimeOfDayBucket(timestampMs = Date.now()) {
+  const hour = new Date(timestampMs).getHours();
+  if (hour >= 5 && hour <= 11) return 'morning';
+  if (hour >= 12 && hour <= 16) return 'day';
+  if (hour >= 17 && hour <= 22) return 'evening';
+  return 'night';
+}
+
+const TIME_OF_DAY_LABELS_RU = {
+  morning: 'Утро (05:00–11:59)',
+  day: 'День (12:00–16:59)',
+  evening: 'Вечер (17:00–22:59)',
+  night: 'Ночь (23:00–04:59)'
+};
+
+function dedupeTrackList(list = []) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of Array.isArray(list) ? list : []) {
+    const clean = sanitizeTrack(raw);
+    if (!clean || seen.has(clean.id)) continue;
+    seen.add(clean.id);
+    if (raw?.addedAt) clean.addedAt = Number(raw.addedAt) || Date.now();
+    if (raw?.playedAt) clean.playedAt = Number(raw.playedAt) || Date.now();
+    out.push(clean);
+  }
+  return out;
+}
+
+function sanitizeTrackStatEntry(id, raw = {}) {
+  const cleanId = String(id || raw?.id || '').trim().slice(0, 64);
+  if (!cleanId) return null;
+  const tod = raw?.timeOfDayCounts || {};
+  return {
+    id: cleanId,
+    title: String(raw?.title || '').trim().slice(0, 240) || 'Без названия',
+    artist: String(raw?.artist || '').trim().slice(0, 200) || 'Неизвестный исполнитель',
+    album: String(raw?.album || '').trim().slice(0, 200),
+    year: Number(raw?.year) || 0,
+    genre: String(raw?.genre || '').trim().slice(0, 80),
+    versionType: String(raw?.versionType || 'original'),
+    canonicalKey: String(raw?.canonicalKey || '').trim().slice(0, 260),
+    playCount: Math.max(0, Math.floor(Number(raw?.playCount) || 0)),
+    completeCount: Math.max(0, Math.floor(Number(raw?.completeCount) || 0)),
+    quickSkipCount: Math.max(0, Math.floor(Number(raw?.quickSkipCount) || 0)),
+    partialSkipCount: Math.max(0, Math.floor(Number(raw?.partialSkipCount) || 0)),
+    totalListenedSeconds: Math.max(0, Math.floor(Number(raw?.totalListenedSeconds) || 0)),
+    lastPlayedAt: Math.max(0, Number(raw?.lastPlayedAt) || 0),
+    timeOfDayCounts: {
+      morning: Math.max(0, Math.floor(Number(tod.morning) || 0)),
+      day: Math.max(0, Math.floor(Number(tod.day) || 0)),
+      evening: Math.max(0, Math.floor(Number(tod.evening) || 0)),
+      night: Math.max(0, Math.floor(Number(tod.night) || 0))
+    }
+  };
+}
 
 function openDatabase() {
   return new Promise((resolve, reject) => {
@@ -107,6 +165,7 @@ export class SonoraStorage {
     this.accounts = [];
     this.activeAccountId = '';
     this.affinities = [];
+    this.trackStats = {};
     this.downloadedTracks = [];
     this.homeCache = {};
     this.fastNodes = { piped: '', invidious: '', audius: '' };
@@ -120,7 +179,6 @@ export class SonoraStorage {
     );
   }
 
-  // Backwards-compatible getter for single account view
   get account() {
     const active = this.activeAccount;
     if (active) return active;
@@ -198,6 +256,7 @@ export class SonoraStorage {
       savedPlayback,
       savedAccountState,
       savedAffinities,
+      savedTrackStats,
       savedOffline,
       savedHomeCache,
       savedFastNodes
@@ -207,6 +266,7 @@ export class SonoraStorage {
       this._read(KEY_PLAYBACK),
       this._read(KEY_ACCOUNT),
       this._read(KEY_AFFINITIES),
+      this._read(KEY_TRACK_STATS),
       this._read(KEY_OFFLINE),
       this._read(KEY_HOME_CACHE),
       this._read(KEY_FAST_NODES)
@@ -226,9 +286,19 @@ export class SonoraStorage {
 
     if (savedLib && typeof savedLib === 'object') {
       this.library = {
-        favorites: Array.isArray(savedLib.favorites) ? savedLib.favorites : [],
-        history: Array.isArray(savedLib.history) ? savedLib.history : [],
-        playlists: Array.isArray(savedLib.playlists) ? savedLib.playlists : [],
+        favorites: dedupeTrackList(savedLib.favorites),
+        history: dedupeTrackList(savedLib.history).slice(0, 120),
+        playlists: Array.isArray(savedLib.playlists)
+          ? savedLib.playlists
+              .filter((pl) => pl && typeof pl === 'object' && pl.name)
+              .map((pl) => ({
+                ...pl,
+                id: pl.id || Date.now() + Math.floor(Math.random() * 1000),
+                name: String(pl.name).trim().slice(0, 120),
+                description: String(pl.description || '').trim().slice(0, 500),
+                tracks: dedupeTrackList(pl.tracks)
+              }))
+          : [],
         searchHistory: Array.isArray(savedLib.searchHistory) ? savedLib.searchHistory : []
       };
     }
@@ -238,11 +308,26 @@ export class SonoraStorage {
     }
 
     if (savedPlayback && typeof savedPlayback === 'object') {
-      this.playback = { ...this.playback, ...savedPlayback };
+      this.playback = {
+        ...this.playback,
+        ...savedPlayback,
+        queue: Array.isArray(savedPlayback.queue)
+          ? savedPlayback.queue.map(sanitizeTrack).filter(Boolean).slice(0, 300)
+          : []
+      };
     }
 
     if (Array.isArray(savedAffinities)) {
       this.affinities = savedAffinities;
+    }
+
+    if (savedTrackStats && typeof savedTrackStats === 'object') {
+      const hydratedStats = {};
+      for (const [id, entry] of Object.entries(savedTrackStats)) {
+        const cleanEntry = sanitizeTrackStatEntry(id, entry);
+        if (cleanEntry) hydratedStats[cleanEntry.id] = cleanEntry;
+      }
+      this.trackStats = hydratedStats;
     }
 
     if (Array.isArray(savedOffline)) {
@@ -295,6 +380,19 @@ export class SonoraStorage {
     await this._write(KEY_LIBRARY, this.library);
   }
 
+  async _saveTrackStats() {
+    const entries = Object.values(this.trackStats);
+    if (entries.length > 600) {
+      entries.sort((a, b) => (b.lastPlayedAt || 0) - (a.lastPlayedAt || 0));
+      const trimmed = {};
+      for (const item of entries.slice(0, 600)) {
+        trimmed[item.id] = item;
+      }
+      this.trackStats = trimmed;
+    }
+    await this._write(KEY_TRACK_STATS, this.trackStats);
+  }
+
   async _saveAccounts() {
     if (this.accounts.length === 0) {
       await this._remove(KEY_ACCOUNT);
@@ -342,6 +440,72 @@ export class SonoraStorage {
     await this._write(KEY_AFFINITIES, this.affinities);
   }
 
+  async recordTrackPlayStart(track, timestampMs = Date.now()) {
+    const clean = sanitizeTrack(track);
+    if (!clean) return null;
+
+    const bucket = getTimeOfDayBucket(timestampMs);
+    const existing =
+      sanitizeTrackStatEntry(clean.id, this.trackStats[clean.id]) ||
+      sanitizeTrackStatEntry(clean.id, clean);
+
+    existing.title = clean.title;
+    existing.artist = clean.artist;
+    if (clean.album) existing.album = clean.album;
+    if (clean.year) existing.year = clean.year;
+    if (clean.genre) existing.genre = clean.genre;
+    existing.versionType = clean.versionType || existing.versionType || 'original';
+    existing.canonicalKey = clean.canonicalKey || existing.canonicalKey || '';
+    existing.playCount += 1;
+    existing.lastPlayedAt = timestampMs;
+    existing.timeOfDayCounts[bucket] = (existing.timeOfDayCounts[bucket] || 0) + 1;
+
+    this.trackStats[clean.id] = existing;
+
+    this.library.history = [
+      { ...clean, playedAt: timestampMs },
+      ...this.library.history.filter((t) => t.id !== clean.id)
+    ].slice(0, 120);
+
+    await Promise.all([this._saveTrackStats(), this._saveLibrary()]);
+    return existing;
+  }
+
+  async recordTrackSessionOutcome(
+    track,
+    {
+      listenedSeconds = 0,
+      completed = false,
+      quickSkipped = false,
+      partialSkipped = false
+    } = {}
+  ) {
+    const clean = sanitizeTrack(track);
+    if (!clean) return null;
+
+    const existing =
+      sanitizeTrackStatEntry(clean.id, this.trackStats[clean.id]) ||
+      sanitizeTrackStatEntry(clean.id, clean);
+
+    existing.title = clean.title;
+    existing.artist = clean.artist;
+    if (clean.album) existing.album = clean.album;
+    if (clean.year) existing.year = clean.year;
+    if (clean.genre) existing.genre = clean.genre;
+    existing.versionType = clean.versionType || existing.versionType || 'original';
+    existing.canonicalKey = clean.canonicalKey || existing.canonicalKey || '';
+
+    const safeListened = Math.max(0, Math.round(Number(listenedSeconds) || 0));
+    existing.totalListenedSeconds += safeListened;
+    if (completed) existing.completeCount += 1;
+    else if (quickSkipped) existing.quickSkipCount += 1;
+    else if (partialSkipped) existing.partialSkipCount += 1;
+
+    this.trackStats[clean.id] = existing;
+    await this._saveTrackStats();
+    return existing;
+  }
+
   async saveDownloadedTrack(trackMeta) {
     if (!trackMeta?.id) return;
     this.downloadedTracks = [
@@ -378,11 +542,11 @@ export class SonoraStorage {
     return !exists;
   }
 
-  async recordPlayback(track) {
+  async recordPlayback(track, timestampMs = Date.now()) {
     const clean = sanitizeTrack(track);
     if (!clean) return;
     this.library.history = [
-      { ...clean, playedAt: Date.now() },
+      { ...clean, playedAt: timestampMs },
       ...this.library.history.filter((t) => t.id !== clean.id)
     ].slice(0, 120);
     await this._saveLibrary();
@@ -448,7 +612,7 @@ export class SonoraStorage {
   async createPlaylist(name, description = '', tracks = [], youtubePlaylistId = null) {
     const cleanName = String(name ?? '').trim().slice(0, 120);
     if (!cleanName) throw new Error('Введите название плейлиста');
-    const cleanTracks = tracks.map(sanitizeTrack).filter(Boolean);
+    const cleanTracks = dedupeTrackList(tracks);
     const playlist = {
       id: Date.now() + Math.floor(Math.random() * 1000),
       name: cleanName,
@@ -483,7 +647,7 @@ export class SonoraStorage {
       return { playlist: created, addedCount: created.tracks.length };
     }
     const existingIds = new Set(existing.tracks.map((t) => t.id));
-    const additions = tracks.map(sanitizeTrack).filter((t) => t && !existingIds.has(t.id));
+    const additions = dedupeTrackList(tracks).filter((t) => !existingIds.has(t.id));
     existing.tracks = [...existing.tracks, ...additions];
     if (youtubePlaylistId && !existing.youtubePlaylistId) {
       existing.youtubePlaylistId = youtubePlaylistId;
@@ -583,30 +747,102 @@ export class SonoraStorage {
 
   getListeningStats() {
     const artistCounts = new Map();
+    const genreCounts = new Map();
     const countArtist = (t, weight = 1) => {
       const a = String(t?.artist || '').trim();
       if (!a || a === 'YouTube Music' || a === 'Неизвестный исполнитель') return;
       artistCounts.set(a, (artistCounts.get(a) || 0) + weight);
+      const g = String(t?.genre || '').trim();
+      if (g) genreCounts.set(g, (genreCounts.get(g) || 0) + weight);
     };
+
     for (const t of this.library.history) countArtist(t, 2);
     for (const t of this.library.favorites) countArtist(t, 3);
     for (const pl of this.library.playlists) {
       for (const t of pl.tracks || []) countArtist(t, 1);
     }
+
+    let totalPlays = 0;
+    let totalCompletes = 0;
+    let totalQuickSkips = 0;
+    let totalListenedSeconds = 0;
+    const timeOfDayCounts = { morning: 0, day: 0, evening: 0, night: 0 };
+    const statEntries = Object.values(this.trackStats || {});
+
+    for (const st of statEntries) {
+      totalPlays += st.playCount || 0;
+      totalCompletes += st.completeCount || 0;
+      totalQuickSkips += st.quickSkipCount || 0;
+      totalListenedSeconds += st.totalListenedSeconds || 0;
+      const tod = st.timeOfDayCounts || {};
+      timeOfDayCounts.morning += tod.morning || 0;
+      timeOfDayCounts.day += tod.day || 0;
+      timeOfDayCounts.evening += tod.evening || 0;
+      timeOfDayCounts.night += tod.night || 0;
+      countArtist(st, (st.completeCount || 0) * 3 + (st.playCount || 0));
+    }
+
     const topArtists = Array.from(artistCounts.entries())
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 3)
+      .slice(0, 5)
       .map(([name]) => name);
+
+    const topGenres = Array.from(genreCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 4)
+      .map(([name]) => name);
+
+    const moodScores = new Map();
+    for (const aff of this.affinities || []) {
+      if (aff?.moodName && (Number(aff.affinityScore) || 0) > 0) {
+        moodScores.set(
+          aff.moodName,
+          (moodScores.get(aff.moodName) || 0) + Number(aff.affinityScore)
+        );
+      }
+    }
+    const topMoods = Array.from(moodScores.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([mood]) => mood);
+
+    const topTracks = statEntries
+      .filter((s) => (s.playCount || 0) > 0 || (s.completeCount || 0) > 0)
+      .sort(
+        (a, b) =>
+          (b.completeCount * 2 + b.playCount - b.quickSkipCount) -
+            (a.completeCount * 2 + a.playCount - a.quickSkipCount) ||
+          (b.lastPlayedAt || 0) - (a.lastPlayedAt || 0)
+      )
+      .slice(0, 8);
+
+    const todOrder = Object.entries(timeOfDayCounts).sort((a, b) => b[1] - a[1]);
+    const peakTimeOfDay = todOrder[0] && todOrder[0][1] > 0 ? todOrder[0][0] : 'evening';
+    const outcomes = totalCompletes + totalQuickSkips;
+    const completionRatePct = outcomes > 0 ? Math.round((totalCompletes / outcomes) * 100) : 0;
+
     const totalPlaylistTracks = this.library.playlists.reduce(
       (sum, pl) => sum + (pl.tracks?.length || 0),
       0
     );
+
     return {
       favoritesCount: this.library.favorites.length,
       historyCount: this.library.history.length,
       playlistsCount: this.library.playlists.length,
       totalPlaylistTracks,
-      topArtists
+      topArtists,
+      topGenres,
+      topMoods,
+      topTracks,
+      totalPlays,
+      totalCompletes,
+      totalQuickSkips,
+      completionRatePct,
+      totalListenedMinutes: Math.round(totalListenedSeconds / 60),
+      timeOfDayCounts,
+      peakTimeOfDay,
+      peakTimeOfDayRu: TIME_OF_DAY_LABELS_RU[peakTimeOfDay] || TIME_OF_DAY_LABELS_RU.evening
     };
   }
 
@@ -722,7 +958,9 @@ export class SonoraStorage {
         shuffleEnabled: this.playback.shuffleEnabled,
         repeatMode: this.playback.repeatMode,
         playbackSpeed: this.playback.playbackSpeed
-      }
+      },
+      trackStats: this.trackStats,
+      affinities: this.affinities
     });
   }
 
@@ -734,6 +972,8 @@ export class SonoraStorage {
       if (!favMap.has(track.id)) {
         favMap.set(track.id, track);
         tracksRestored++;
+      } else {
+        favMap.set(track.id, { ...favMap.get(track.id), ...track });
       }
     }
     this.library.favorites = Array.from(favMap.values());
@@ -743,6 +983,8 @@ export class SonoraStorage {
       if (!histMap.has(track.id)) {
         histMap.set(track.id, track);
         tracksRestored++;
+      } else {
+        histMap.set(track.id, { ...histMap.get(track.id), ...track });
       }
     }
     this.library.history = Array.from(histMap.values()).slice(0, 120);
@@ -768,6 +1010,48 @@ export class SonoraStorage {
       }
     }
     this.library.searchHistory = this.library.searchHistory.slice(0, 20);
+
+    if (normalized.trackStats && typeof normalized.trackStats === 'object') {
+      for (const [id, entry] of Object.entries(normalized.trackStats)) {
+        const cleanEntry = sanitizeTrackStatEntry(id, entry);
+        if (!cleanEntry) continue;
+        const cur = this.trackStats[cleanEntry.id];
+        if (!cur) {
+          this.trackStats[cleanEntry.id] = cleanEntry;
+        } else {
+          this.trackStats[cleanEntry.id] = {
+            ...cur,
+            ...cleanEntry,
+            playCount: Math.max(cur.playCount || 0, cleanEntry.playCount),
+            completeCount: Math.max(cur.completeCount || 0, cleanEntry.completeCount),
+            quickSkipCount: Math.max(cur.quickSkipCount || 0, cleanEntry.quickSkipCount),
+            partialSkipCount: Math.max(cur.partialSkipCount || 0, cleanEntry.partialSkipCount),
+            totalListenedSeconds: Math.max(cur.totalListenedSeconds || 0, cleanEntry.totalListenedSeconds),
+            lastPlayedAt: Math.max(cur.lastPlayedAt || 0, cleanEntry.lastPlayedAt),
+            timeOfDayCounts: {
+              morning: Math.max(cur.timeOfDayCounts?.morning || 0, cleanEntry.timeOfDayCounts.morning),
+              day: Math.max(cur.timeOfDayCounts?.day || 0, cleanEntry.timeOfDayCounts.day),
+              evening: Math.max(cur.timeOfDayCounts?.evening || 0, cleanEntry.timeOfDayCounts.evening),
+              night: Math.max(cur.timeOfDayCounts?.night || 0, cleanEntry.timeOfDayCounts.night)
+            }
+          };
+        }
+      }
+      await this._saveTrackStats();
+    }
+
+    if (Array.isArray(normalized.affinities)) {
+      const affMap = new Map(this.affinities.map((a) => [a.trackId, a]));
+      for (const entity of normalized.affinities) {
+        if (!entity?.trackId) continue;
+        const cur = affMap.get(entity.trackId);
+        if (!cur || (Number(entity.lastInteractedAt) || 0) > (Number(cur.lastInteractedAt) || 0)) {
+          affMap.set(entity.trackId, entity);
+        }
+      }
+      this.affinities = Array.from(affMap.values()).slice(0, 500);
+      await this._write(KEY_AFFINITIES, this.affinities);
+    }
 
     if (normalized.settings) {
       await this.updateSettings({

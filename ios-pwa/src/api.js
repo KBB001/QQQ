@@ -1,4 +1,4 @@
-import { sanitizeHttpsUrl, sanitizeTrack } from './security.js';
+import { formatUserErrorRu, parseTrackVersionInfo, sanitizeHttpsUrl, sanitizeTrack } from './security.js';
 
 export const DEFAULT_PIPED_INSTANCES = [
   'https://api.piped.private.coffee',
@@ -31,9 +31,11 @@ export const DEFAULT_AUDIUS_NODES = [
 
 export const MOOD_CHIPS = [
   { id: 'ALL', label: 'Для вас', query: 'popular music hits' },
-  { id: 'RELAX', label: 'Расслабиться', query: 'chill acoustic ambient' },
-  { id: 'ENERGIZE', label: 'Энергия', query: 'workout upbeat electronic' },
+  { id: 'ENERGIZE', label: 'Энергия', query: 'upbeat electronic dance music' },
+  { id: 'WORKOUT', label: 'Тренировка', query: 'workout phonk gym bass music' },
   { id: 'FOCUS', label: 'Фокус', query: 'focus instrumental study' },
+  { id: 'RELAX', label: 'Спокойное', query: 'chill acoustic ambient' },
+  { id: 'MELANCHOLY', label: 'Грустное', query: 'sad atmospheric ballad slowed music' },
   { id: 'NIGHT', label: 'Вечер', query: 'late night r&b chill' },
   { id: 'LOFI', label: 'Lo-Fi биты', query: 'lofi hip hop radio' }
 ];
@@ -255,6 +257,18 @@ function getPreferredThumbnail(videoId, candidate) {
   return '';
 }
 
+function parseReleaseYear(raw) {
+  if (!raw) return 0;
+  if (typeof raw === 'number' && raw > 1_000_000_000) {
+    const ms = raw > 1e12 ? raw : raw * 1000;
+    const y = new Date(ms).getUTCFullYear();
+    return y >= 1900 && y <= 2100 ? y : 0;
+  }
+  const str = String(raw);
+  const m = str.match(/\b(19\d{2}|20\d{2})\b/);
+  return m ? Number(m[1]) : 0;
+}
+
 function normalizePipedTrack(item) {
   const id = extractVideoId(item?.url || item?.id || '');
   if (!id) return null;
@@ -262,6 +276,9 @@ function normalizePipedTrack(item) {
     id,
     title: item.title || 'Без названия',
     artist: item.uploaderName || item.author || item.uploader || 'Исполнитель',
+    album: item.album || '',
+    year: parseReleaseYear(item.uploadedDate || item.uploaded),
+    genre: item.category || '',
     durationSeconds: Number(item.duration) || 0,
     thumbnailUrl: getPreferredThumbnail(id, item.thumbnail)
   });
@@ -276,6 +293,8 @@ function normalizeInvidiousTrack(item) {
     id,
     title: item.title || 'Без названия',
     artist: item.author || 'Исполнитель',
+    year: parseReleaseYear(item.published),
+    genre: item.genre || '',
     durationSeconds: Number(item.lengthSeconds) || 0,
     thumbnailUrl: getPreferredThumbnail(id, bestThumb)
   });
@@ -287,10 +306,18 @@ function normalizeAudiusTrack(item) {
     sanitizeHttpsUrl(item.artwork?.['480x480']) ||
     sanitizeHttpsUrl(item.artwork?.['150x150']) ||
     '';
+  const tags = String(item.tags || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (item.mood) tags.unshift(item.mood);
   return sanitizeTrack({
     id: `aud:${item.id}`,
     title: item.title || 'Без названия',
     artist: item.user?.name || item.user?.handle || 'Исполнитель',
+    year: parseReleaseYear(item.release_date),
+    genre: item.genre || '',
+    moodTags: tags,
     durationSeconds: Number(item.duration) || 0,
     thumbnailUrl: thumb
   });
@@ -369,6 +396,9 @@ export class SonoraApi {
   }
 
   async _fetchJson(url, options = {}, timeoutMs = 3600) {
+    if (typeof globalThis.navigator !== 'undefined' && globalThis.navigator.onLine === false) {
+      throw new Error('Нет подключения к интернету. Доступна музыка из оффлайн-кэша.');
+    }
     const safeUrl = sanitizeHttpsUrl(url);
     if (!safeUrl) throw new Error('Разрешены только HTTPS-запросы');
     const controller = new AbortController();
@@ -400,6 +430,9 @@ export class SonoraApi {
         throw new Error(json.message || json.error);
       }
       return json ?? {};
+    } catch (err) {
+      if (err?.status) throw err;
+      throw new Error(formatUserErrorRu(err, 'Ошибка сетевого запроса'));
     } finally {
       clearTimeout(timer);
     }
@@ -727,6 +760,10 @@ export class SonoraApi {
             id: directVideoId,
             title: info?.title || `YouTube трек (${directVideoId})`,
             artist: info?.artist || 'YouTube',
+            album: info?.album || '',
+            year: info?.year || 0,
+            genre: info?.genre || '',
+            moodTags: info?.moodTags || [],
             durationSeconds: info?.durationSeconds || 0,
             thumbnailUrl: getPreferredThumbnail(directVideoId, info?.thumbnailUrl)
           })
@@ -1092,6 +1129,10 @@ export class SonoraApi {
               id: cleanId,
               title: data.title || 'Без названия',
               artist: data.uploader || 'Исполнитель',
+              album: data.album || '',
+              year: parseReleaseYear(data.uploadDate),
+              genre: data.category || '',
+              moodTags: Array.isArray(data.tags) ? data.tags.slice(0, 6) : [],
               durationSeconds: Number(data.duration) || 0,
               thumbnailUrl: getPreferredThumbnail(cleanId, data.thumbnailUrl),
               streamUrl: streamCandidates[0],
@@ -1147,6 +1188,9 @@ export class SonoraApi {
               id: cleanId,
               title: inv.title || 'Без названия',
               artist: inv.author || 'Исполнитель',
+              year: parseReleaseYear(inv.published),
+              genre: inv.genre || '',
+              moodTags: Array.isArray(inv.keywords) ? inv.keywords.slice(0, 6) : [],
               durationSeconds: Number(inv.lengthSeconds) || 0,
               thumbnailUrl: getPreferredThumbnail(cleanId, inv.videoThumbnails?.[0]?.url),
               streamUrl: streamCandidates[0],
@@ -1188,6 +1232,33 @@ export class SonoraApi {
     const radioQuery = `${artist || ''} ${title || ''}`.trim() || 'popular music hits';
     const items = await this.search(radioQuery, 'TRACKS').catch(() => []);
     return items.filter((it) => it.type === 'track' && it.id !== id);
+  }
+
+  async getTrackVersions(track) {
+    if (!track) return [];
+    const parsed = parseTrackVersionInfo(track.title, track.artist);
+    const artistPart = String(track.artist || '')
+      .replace(/YouTube Music|Неизвестный исполнитель/gi, '')
+      .trim();
+    const basePart = parsed.baseTitle || track.title;
+    const query = `${artistPart} ${basePart}`.trim();
+    if (!query) return [];
+
+    const [directSearch, remixSearch] = await Promise.all([
+      this.search(query, 'TRACKS').catch(() => []),
+      this.search(`${query} remix live cover`, 'TRACKS').catch(() => [])
+    ]);
+
+    const seen = new Set();
+    const out = [];
+    for (const item of [...directSearch, ...remixSearch]) {
+      const t = item?.type === 'track' ? item : null;
+      if (t?.id && !seen.has(t.id)) {
+        seen.add(t.id);
+        out.push(t);
+      }
+    }
+    return out;
   }
 
   async getPlaylist(rawPlaylistInput, { maxPages = 5 } = {}) {

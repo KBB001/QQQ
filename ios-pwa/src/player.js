@@ -1,5 +1,5 @@
 import { ImplicitSignalType } from './recommendations.js';
-import { sanitizeTrack } from './security.js';
+import { formatUserErrorRu, sanitizeTrack } from './security.js';
 
 export class SonoraPlayer {
   constructor({
@@ -56,10 +56,12 @@ export class SonoraPlayer {
     this.failedGateways = new Set();
     this.extractorRetries = 0;
     this.maxExtractorRetries = 3;
+    this._consecutiveTrackErrors = 0;
     this._trackLoadSeq = 0;
     this._pendingSeekSeconds = 0;
     this._lastSaveAt = 0;
 
+    this._activeSession = null;
     this._silentWavUrl = '';
     this._primingSilentAudio = false;
     this._prefetchedOfflineUrls = new Map();
@@ -91,6 +93,82 @@ export class SonoraPlayer {
   get currentTrack() {
     if (this.currentIndex < 0 || this.currentIndex >= this.queue.length) return null;
     return this.queue[this.currentIndex];
+  }
+
+  _startListeningSession(track, seq) {
+    if (!track) {
+      this._activeSession = null;
+      return;
+    }
+    this._activeSession = {
+      seq,
+      track,
+      playCounted: false,
+      outcomeRecorded: false,
+      seeked: false,
+      listenedMs: 0,
+      lastActiveTickAt: 0
+    };
+  }
+
+  async _commitSessionStart(track, seq) {
+    const s = this._activeSession;
+    if (!s || s.seq !== seq || s.track?.id !== track?.id || s.playCounted) return;
+    s.playCounted = true;
+    s.lastActiveTickAt = Date.now();
+    this.recommendations?.markHeardInSession?.(track.id);
+    await this.storage?.recordTrackPlayStart?.(track);
+  }
+
+  async _finalizeListeningSession(reason = 'switch') {
+    const s = this._activeSession;
+    if (!s || s.outcomeRecorded || !s.playCounted) return;
+    s.outcomeRecorded = true;
+    const track = s.track;
+    const dur = this.duration || track.durationSeconds || 0;
+    const pos = this.currentTime || 0;
+    const effectiveListenedSec =
+      s.listenedMs > 0 ? s.listenedMs / 1000 : s.seeked ? 0 : pos;
+
+    if (reason === 'ended') {
+      await this.recommendations?.tasteTracker?.recordSignal(
+        track,
+        this.repeatMode === 'ONE'
+          ? ImplicitSignalType.REPEAT_PLAY
+          : ImplicitSignalType.COMPLETE_PLAY
+      );
+      await this.storage?.recordTrackSessionOutcome?.(track, {
+        listenedSeconds: Math.max(effectiveListenedSec, dur > 0 ? Math.min(dur, effectiveListenedSec || dur) : effectiveListenedSec),
+        completed: true
+      });
+      return;
+    }
+
+    const ratio = dur > 0 ? effectiveListenedSec / dur : 0;
+    const completed = effectiveListenedSec >= 25 && (ratio >= 0.65 || (dur <= 0 && effectiveListenedSec >= 45));
+    const quickSkipped = !completed && effectiveListenedSec < 30 && (dur <= 0 || ratio < 0.25);
+
+    if (quickSkipped) {
+      this.recentSkippedTracks = [track, ...this.recentSkippedTracks].slice(0, 4);
+      await this.recommendations?.tasteTracker?.recordSignal(track, ImplicitSignalType.QUICK_SKIP);
+      await this.storage?.recordTrackSessionOutcome?.(track, {
+        listenedSeconds: effectiveListenedSec,
+        quickSkipped: true
+      });
+    } else if (!completed) {
+      await this.recommendations?.tasteTracker?.recordSignal(track, ImplicitSignalType.PARTIAL_SKIP);
+      await this.storage?.recordTrackSessionOutcome?.(track, {
+        listenedSeconds: effectiveListenedSec,
+        partialSkipped: true
+      });
+    } else {
+      this.recentSkippedTracks = [];
+      await this.recommendations?.tasteTracker?.recordSignal(track, ImplicitSignalType.COMPLETE_PLAY);
+      await this.storage?.recordTrackSessionOutcome?.(track, {
+        listenedSeconds: effectiveListenedSec,
+        completed: true
+      });
+    }
   }
 
   _computeNextShuffleIndex() {
@@ -163,7 +241,6 @@ export class SonoraPlayer {
   _getSilentWavUrl() {
     if (this._silentWavUrl) return this._silentWavUrl;
     if (typeof Blob !== 'undefined' && typeof URL !== 'undefined' && typeof URL.createObjectURL === 'function') {
-      // 44-byte PCM WAV header + 1 silent sample (8000 Hz mono 8-bit 0x80)
       const bytes = new Uint8Array([
         0x52, 0x49, 0x46, 0x46, 0x25, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45,
         0x66, 0x6d, 0x74, 0x20, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00,
@@ -222,15 +299,24 @@ export class SonoraPlayer {
   }
 
   _bindVisibilityListener() {
-    if (typeof document === 'undefined' || !document.addEventListener) return;
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden' && this.currentTrack) {
-        this._ensurePlaybackAudioSession();
-        this._updateMediaMetadata(this.currentTrack);
-        this._setMediaPlaybackState(this.isPlaying ? 'playing' : 'paused');
-        this._updatePositionState();
-      }
-    });
+    if (typeof document !== 'undefined' && document.addEventListener) {
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden' && this.currentTrack) {
+          this._ensurePlaybackAudioSession();
+          this._updateMediaMetadata(this.currentTrack);
+          this._setMediaPlaybackState(this.isPlaying ? 'playing' : 'paused');
+          this._updatePositionState();
+          this._persistPlayback(true);
+        }
+      });
+    }
+    if (typeof window !== 'undefined' && window.addEventListener) {
+      const saveNow = () => {
+        if (this.currentTrack) this._persistPlayback(true);
+      };
+      window.addEventListener('pagehide', saveNow);
+      window.addEventListener('beforeunload', saveNow);
+    }
   }
 
   _bindAudioEvents() {
@@ -239,6 +325,13 @@ export class SonoraPlayer {
       this._ensurePlaybackAudioSession();
       this.isPlaying = true;
       this.isBuffering = false;
+      this._consecutiveTrackErrors = 0;
+      if (this._activeSession && this.currentTrack?.id === this._activeSession.track?.id) {
+        this._activeSession.lastActiveTickAt = Date.now();
+        if (!this._activeSession.playCounted) {
+          this._commitSessionStart(this._activeSession.track, this._activeSession.seq);
+        }
+      }
       this._updateMediaMetadata(this.currentTrack);
       this._setMediaPlaybackState('playing');
       this._updatePositionState();
@@ -252,6 +345,9 @@ export class SonoraPlayer {
       if (this._isSilentPrimerEvent()) return;
       this.isPlaying = false;
       this.isBuffering = false;
+      if (this._activeSession) {
+        this._activeSession.lastActiveTickAt = 0;
+      }
       this._setMediaPlaybackState('paused');
       this._persistPlayback(true);
       this._emit();
@@ -260,12 +356,16 @@ export class SonoraPlayer {
     this.audio.addEventListener('waiting', () => {
       if (this._isSilentPrimerEvent()) return;
       this.isBuffering = true;
+      if (this._activeSession) {
+        this._activeSession.lastActiveTickAt = 0;
+      }
       this._emit();
     });
 
     this.audio.addEventListener('canplay', () => {
       if (this._isSilentPrimerEvent()) return;
       this.isBuffering = false;
+      this._consecutiveTrackErrors = 0;
       this._emit();
     });
 
@@ -302,6 +402,13 @@ export class SonoraPlayer {
         this.duration = this.audio.duration;
       }
       const now = Date.now();
+      if (this._activeSession && this.isPlaying && !this.audio.paused) {
+        if (this._activeSession.lastActiveTickAt > 0) {
+          const delta = Math.max(0, Math.min(2500, now - this._activeSession.lastActiveTickAt));
+          this._activeSession.listenedMs += delta;
+        }
+        this._activeSession.lastActiveTickAt = now;
+      }
       if (now - this._lastSaveAt > 5000) {
         this._lastSaveAt = now;
         this._persistPlayback(false);
@@ -317,17 +424,16 @@ export class SonoraPlayer {
       }
       this.isPlaying = false;
       const finished = this.currentTrack;
-      if (finished) {
-        this.recommendations?.tasteTracker?.recordSignal(
-          finished,
-          this.repeatMode === 'ONE'
-            ? ImplicitSignalType.REPEAT_PLAY
-            : ImplicitSignalType.COMPLETE_PLAY
-        );
-      }
-      if (this.repeatMode === 'ONE') {
+      await this._finalizeListeningSession('ended');
+      if (this.repeatMode === 'ONE' && finished) {
+        this._startListeningSession(finished, this._trackLoadSeq);
         this.seekTo(0);
-        await this.audio.play().catch(() => {});
+        try {
+          await this.audio.play();
+          await this._commitSessionStart(finished, this._trackLoadSeq);
+        } catch {
+          // Ignore
+        }
         return;
       }
       await this.next(true);
@@ -371,7 +477,7 @@ export class SonoraPlayer {
       return;
     }
 
-    // 2. All candidates from this gateway failed: exclude sourceKey and try next extractor
+    // 2. All candidates from this gateway failed: exclude sourceKey and try next extractor silently
     if (this.extractorRetries < this.maxExtractorRetries && !track.id.startsWith('aud:')) {
       if (this.activeSourceKey) {
         this.failedGateways.add(this.activeSourceKey);
@@ -411,10 +517,27 @@ export class SonoraPlayer {
       }
     }
 
+    // 3. Dead track in a multi-track queue -> skip cleanly to next playable track
+    this._consecutiveTrackErrors += 1;
+    const hasNext =
+      this.queue.length > 1 &&
+      (this.currentIndex + 1 < this.queue.length || this.repeatMode === 'ALL' || this.shuffleEnabled);
+
+    if (hasNext && this._consecutiveTrackErrors < 3) {
+      this.onError?.(`Поток «${track.title}» недоступен — переключаем на следующий трек`);
+      await this.next(true);
+      return;
+    }
+
     this.isBuffering = false;
     this.isPlaying = false;
     this._emit();
-    this.onError?.('Не удалось загрузить поток без рекламы. Попробуйте другой трек или проверьте источники в Настройках.');
+    this.onError?.(
+      formatUserErrorRu(
+        null,
+        'Не удалось загрузить поток без рекламы. Попробуйте другой трек или проверьте источники в Настройках.'
+      )
+    );
   }
 
   _bindMediaSession() {
@@ -428,7 +551,6 @@ export class SonoraPlayer {
       }
     };
 
-    // Keep previoustrack / nexttrack without seekbackward / seekforward so iOS Lock Screen shows track skip buttons
     safeHandler('play', () => this.togglePlayPause(true));
     safeHandler('pause', () => this.togglePlayPause(false));
     safeHandler('previoustrack', () => this.previous());
@@ -452,7 +574,7 @@ export class SonoraPlayer {
       navigator.mediaSession.metadata = new MediaMetadata({
         title: track.title,
         artist: track.artist,
-        album: 'Sonora',
+        album: track.album || 'Sonora',
         artwork
       });
     } catch {
@@ -536,6 +658,8 @@ export class SonoraPlayer {
 
     if (this.currentTrack?.id === clean.id && this.isPlaying) {
       this.recommendations?.tasteTracker?.recordSignal(clean, ImplicitSignalType.REPEAT_PLAY);
+    } else {
+      await this._finalizeListeningSession('switch');
     }
 
     if (Array.isArray(list) && list.length > 0) {
@@ -553,12 +677,13 @@ export class SonoraPlayer {
       }
     }
 
+    this._consecutiveTrackErrors = 0;
     this._computeNextShuffleIndex();
     this._resetFailoverState();
     await this._loadAndPlayTrack(this.currentTrack, 0, true);
   }
 
-  async _loadAndPlayTrack(track, resumeSeconds = 0, shouldPlay = true) {
+  async _loadAndPlayTrack(track, resumeSeconds = 0, shouldPlay = true, { countSession = true } = {}) {
     if (!track) return;
     const seq = ++this._trackLoadSeq;
     this._ensurePlaybackAudioSession();
@@ -568,11 +693,15 @@ export class SonoraPlayer {
     this.currentTime = resumeSeconds;
     this.duration = track.durationSeconds || 0;
     this._pendingSeekSeconds = resumeSeconds > 0 ? resumeSeconds : 0;
+
+    if (countSession) {
+      this._startListeningSession(track, seq);
+    }
+
     this._updateMediaMetadata(track);
     this._emit();
 
     try {
-      // Synchronous check for prefetched offline URL enables instant background track switch on lock screen
       let offlineUrl = this._prefetchedOfflineUrls.get(track.id) || null;
       if (!offlineUrl && this.offline) {
         offlineUrl = await this.offline.getOfflinePlaybackUrl(track.id);
@@ -588,9 +717,12 @@ export class SonoraPlayer {
         this._primingSilentAudio = false;
         this.audio.src = offlineUrl;
         this.audio.playbackRate = this.playbackSpeed;
-        if (shouldPlay) await this.audio.play();
-        this.recommendations?.markHeardInSession(track.id);
-        await this.storage.recordPlayback(track);
+        if (shouldPlay) {
+          await this.audio.play();
+          if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
+          this._consecutiveTrackErrors = 0;
+          await this._commitSessionStart(track, seq);
+        }
         await this._persistPlayback(true);
         this.loadLyricsForCurrentTrack(track);
         this._prefetchNextTrack();
@@ -610,6 +742,24 @@ export class SonoraPlayer {
 
       if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
 
+      // Enrich active track metadata if stream probe returned album/year/genre/tags
+      if (info && (info.album || info.year || info.genre || info.moodTags?.length)) {
+        const enriched = sanitizeTrack({
+          ...track,
+          album: track.album || info.album,
+          year: track.year || info.year,
+          genre: track.genre || info.genre,
+          moodTags: track.moodTags?.length ? track.moodTags : info.moodTags
+        });
+        if (enriched && this.queue[this.currentIndex]?.id === enriched.id) {
+          this.queue[this.currentIndex] = enriched;
+          if (this._activeSession?.track?.id === enriched.id) {
+            this._activeSession.track = enriched;
+          }
+          this._updateMediaMetadata(enriched);
+        }
+      }
+
       const candidates =
         Array.isArray(info?.streamCandidates) && info.streamCandidates.length > 0
           ? info.streamCandidates
@@ -625,25 +775,34 @@ export class SonoraPlayer {
       this.activeStreamCandidates = candidates;
       this.candidateIndex = 0;
 
-      // Replace src cleanly without pause()/removeAttribute() to keep iOS AVAudioSession active
       this._primingSilentAudio = false;
       this.audio.src = candidates[0];
       this.audio.playbackRate = this.playbackSpeed;
       if (shouldPlay) {
         await this.audio.play();
+        if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
+        this._consecutiveTrackErrors = 0;
+        await this._commitSessionStart(this.currentTrack || track, seq);
       }
 
-      this.recommendations?.markHeardInSession(track.id);
-      await this.storage.recordPlayback(track);
       await this._persistPlayback(true);
       this.loadLyricsForCurrentTrack(track);
       this._prefetchNextTrack();
     } catch (err) {
       if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
+      this._consecutiveTrackErrors += 1;
+      const hasNext =
+        this.queue.length > 1 &&
+        (this.currentIndex + 1 < this.queue.length || this.repeatMode === 'ALL' || this.shuffleEnabled);
+      if (shouldPlay && hasNext && this._consecutiveTrackErrors < 3) {
+        this.onError?.(`Трек «${track.title}» недоступен — переходим к следующему`);
+        await this.next(true);
+        return;
+      }
       this.isBuffering = false;
       this.isPlaying = false;
       this._emit();
-      this.onError?.(err?.message || 'Ошибка загрузки аудиопотока без рекламы');
+      this.onError?.(formatUserErrorRu(err, 'Ошибка загрузки аудиопотока без рекламы'));
     }
   }
 
@@ -679,10 +838,15 @@ export class SonoraPlayer {
       return;
     }
 
+    // Resume an existing restored-after-reload or paused track cleanly without inflating playCount
     if (!this.audio.src || (this._silentWavUrl && this.audio.src === this._silentWavUrl)) {
       this.unlockGesture({ forcePrime: true });
       this._resetFailoverState();
-      await this._loadAndPlayTrack(track, this.currentTime, true);
+      const hasExistingSession =
+        this._activeSession && this._activeSession.track?.id === track.id;
+      await this._loadAndPlayTrack(track, this.currentTime, true, {
+        countSession: !hasExistingSession && (this.currentTime || 0) <= 0
+      });
       return;
     }
 
@@ -691,13 +855,16 @@ export class SonoraPlayer {
     } catch {
       this.unlockGesture({ forcePrime: true });
       this._resetFailoverState();
-      await this._loadAndPlayTrack(track, this.currentTime, true);
+      await this._loadAndPlayTrack(track, this.currentTime, true, { countSession: false });
     }
   }
 
   seekTo(seconds) {
     const dur = this.duration || this.currentTrack?.durationSeconds || 0;
     const clamped = Math.max(0, dur > 0 ? Math.min(dur, seconds) : seconds);
+    if (this._activeSession && Math.abs(clamped - (this.currentTime || 0)) > 4) {
+      this._activeSession.seeked = true;
+    }
     this.currentTime = clamped;
     if (this.audio.src && !this._isSilentPrimerEvent()) {
       try {
@@ -721,29 +888,23 @@ export class SonoraPlayer {
     }
 
     const prevTrack = this.currentTrack;
-    if (!fromEnded && prevTrack && this.recommendations) {
-      const dur = this.duration || prevTrack.durationSeconds || 0;
-      const pos = this.currentTime || 0;
-      const ratio = dur > 0 ? pos / dur : 0;
-      if (pos < 25 && ratio < 0.2) {
-        this.recentSkippedTracks = [prevTrack, ...this.recentSkippedTracks].slice(0, 4);
-        this.recommendations.tasteTracker.recordSignal(prevTrack, ImplicitSignalType.QUICK_SKIP);
-
-        if (!this.shuffleEnabled && this.currentIndex + 2 < this.queue.length) {
-          const head = this.queue.slice(0, this.currentIndex + 1);
-          const tail = this.queue.slice(this.currentIndex + 1);
-          const reranked = this.recommendations.softRerankUpcoming(
-            tail,
-            prevTrack,
-            this.recentSkippedTracks
-          );
-          this.queue = [...head, ...reranked];
-        }
-      } else if (ratio < 0.65) {
-        this.recommendations.tasteTracker.recordSignal(prevTrack, ImplicitSignalType.PARTIAL_SKIP);
-      } else {
-        this.recentSkippedTracks = [];
-        this.recommendations.tasteTracker.recordSignal(prevTrack, ImplicitSignalType.COMPLETE_PLAY);
+    if (!fromEnded) {
+      await this._finalizeListeningSession('switch');
+      if (
+        prevTrack &&
+        this.recommendations &&
+        !this.shuffleEnabled &&
+        this.currentIndex + 2 < this.queue.length &&
+        this.recentSkippedTracks.length > 0
+      ) {
+        const head = this.queue.slice(0, this.currentIndex + 1);
+        const tail = this.queue.slice(this.currentIndex + 1);
+        const reranked = this.recommendations.softRerankUpcoming(
+          tail,
+          prevTrack,
+          this.recentSkippedTracks
+        );
+        this.queue = [...head, ...reranked];
       }
     }
 
@@ -808,6 +969,7 @@ export class SonoraPlayer {
       return;
     }
     this.unlockGesture({ forcePrime: true });
+    await this._finalizeListeningSession('switch');
     if (this.currentIndex > 0) {
       this.currentIndex -= 1;
     } else if (this.repeatMode === 'ALL') {
@@ -866,6 +1028,9 @@ export class SonoraPlayer {
       return;
     }
     const removingCurrent = index === this.currentIndex;
+    if (removingCurrent) {
+      await this._finalizeListeningSession('switch');
+    }
     this.queue.splice(index, 1);
     if (index < this.currentIndex) {
       this.currentIndex -= 1;
@@ -907,6 +1072,7 @@ export class SonoraPlayer {
 
   async clearQueue() {
     this._trackLoadSeq += 1;
+    this._activeSession = null;
     this._primingSilentAudio = false;
     try {
       this.audio.pause();

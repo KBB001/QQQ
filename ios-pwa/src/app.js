@@ -15,20 +15,30 @@ import {
   buildDeletePlaylistModalHtml,
   buildEncryptExportModalHtml,
   buildImportPlaylistModalHtml,
+  buildListeningStatsModalHtml,
   buildMixPreviewModalHtml,
   buildQueueModalHtml,
   buildRemotePlaylistModalHtml,
   buildRenamePlaylistModalHtml,
   buildSleepTimerModalHtml,
   buildTrackMenuHtml,
+  buildTrackVersionsModalHtml,
   buildYouTubeImportModalHtml
 } from './modals.js';
 import { SonoraOfflineManager, formatBytesRu } from './offline.js';
 import { SonoraPlayer } from './player.js';
-import { ImplicitSignalType, MoodCategory, SmartRecommendationEngine } from './recommendations.js';
+import {
+  ImplicitSignalType,
+  MoodCategory,
+  SmartRecommendationEngine,
+  VERSION_LABELS_RU,
+  diversifyRecommendations,
+  groupTrackVersions
+} from './recommendations.js';
 import {
   BackupCipher,
   escapeHtml,
+  formatUserErrorRu,
   parseExternalYouTubeImport,
   sanitizeHttpsUrl,
   sanitizeTrack
@@ -40,6 +50,7 @@ import {
   fetchYouTubePlaylistTracksWithOAuth,
   getOAuthRedirectUri,
   isValidGoogleClientId,
+  revokeGoogleOAuthToken,
   syncYouTubeLibraryWithOAuth
 } from './youtube-oauth.js';
 
@@ -128,6 +139,7 @@ class SonoraApp {
       homeRefreshing: false,
       homeError: '',
       homeTracks: [],
+      homeFeedTracks: [],
       searchQuery: '',
       searchFilter: 'TRACKS',
       searchLoading: false,
@@ -150,6 +162,9 @@ class SonoraApp {
       isScrubbing: false,
       scrubValue: 0,
       batchOfflineState: null,
+      similarToFavoritesCache: [],
+      alsoLikedCache: [],
+      versionPoolTracks: [],
       installDismissed: localStorage.getItem('sonora_ios_install_dismissed') === '1',
       swUpdateWaiting: null,
       appVersionLabel: 'PWA (GitHub Pages)'
@@ -370,7 +385,7 @@ class SonoraApp {
       this.state.homeLoading = false;
       this.state.homeRefreshing = false;
       if (!hasCache || this.state.homeTracks.length === 0) {
-        this.state.homeError = err?.message || 'Не удалось загрузить подборку';
+        this.state.homeError = formatUserErrorRu(err, 'Не удалось загрузить подборку');
       }
       if (this.state.activeTab === 'home') this.renderMain();
     }
@@ -410,7 +425,7 @@ class SonoraApp {
       this.state.searchLoading = false;
     } catch (err) {
       this.state.searchLoading = false;
-      this.state.searchError = err?.message || 'Ошибка поиска';
+      this.state.searchError = formatUserErrorRu(err, 'Ошибка поиска');
     }
     if (this.state.activeTab === 'search') this.renderMain();
   }
@@ -430,7 +445,7 @@ class SonoraApp {
       const details = await this.api.getArtistDetails(artistItem);
       this.state.selectedArtist = details;
     } catch (err) {
-      this.showToast(err.message);
+      this.showToast(formatUserErrorRu(err, 'Не удалось загрузить профиль артиста'));
     } finally {
       this.state.artistLoading = false;
       if (this.state.activeTab === 'search') {
@@ -649,11 +664,23 @@ class SonoraApp {
         </button>
       `;
 
+    const versionBadge =
+      track.versionType && track.versionType !== 'original' && VERSION_LABELS_RU[track.versionType]
+        ? `<span class="version-pill">${escapeHtml(VERSION_LABELS_RU[track.versionType])}</span>`
+        : '';
+
     const badge = isDownloading
       ? `<span class="dl-pct-badge" data-dl-track="${escapeHtml(track.id)}">${prog?.percent > 0 ? `${prog.percent}%` : '…'}</span>`
       : isOffline
         ? `<span class="offline-dot" title="Доступно оффлайн">${SVG.checkCircle}</span>`
         : '';
+
+    const subParts = [
+      track.artist,
+      track.album || '',
+      track.year > 1900 ? String(track.year) : '',
+      dur
+    ].filter(Boolean);
 
     return `
       <div class="track-row ${active ? 'active-track' : ''}" data-track-id="${escapeHtml(track.id)}" data-list-key="${escapeHtml(listKey)}" data-index="${idx}">
@@ -662,9 +689,10 @@ class SonoraApp {
         <button type="button" class="track-meta" data-action="play-track" data-track-id="${escapeHtml(track.id)}" data-list-key="${escapeHtml(listKey)}">
           <div class="track-title">
             ${escapeHtml(track.title)}
+            ${versionBadge}
             ${badge}
           </div>
-          <div class="track-sub">${escapeHtml(track.artist)}${dur ? ` • ${escapeHtml(dur)}` : ''}</div>
+          <div class="track-sub">${escapeHtml(subParts.join(' • '))}</div>
         </button>
         ${trailingActions}
       </div>
@@ -847,8 +875,14 @@ class SonoraApp {
       </button>`
     ).join('');
 
-    const { dailyMixTracks, dailyMixSubtitle, madeForYou } =
-      this.recommendations.buildPersonalizedMixes(this.state.homeTracks);
+    const { dailyMixTracks, dailyMixSubtitle, madeForYou, similarToFavorites, alsoLikedTracks } =
+      this.recommendations.buildPersonalizedMixes(this.state.homeTracks, [
+        this.storage.library.favorites,
+        this.storage.library.history
+      ]);
+    this.state.similarToFavoritesCache = similarToFavorites || [];
+    this.state.alsoLikedCache = alsoLikedTracks || [];
+
     if (dailyMixTracks.length > 0) {
       this.renderedMixes.set('daily', {
         id: 'daily',
@@ -911,6 +945,39 @@ class SonoraApp {
       </div>`
         : '';
 
+    const renderTrackStripSection = (title, tracks, listKey) => {
+      if (!tracks || tracks.length === 0) return '';
+      return `
+      <div class="section-header">
+        <h2 class="section-title">${escapeHtml(title)}</h2>
+      </div>
+      <div class="h-strip">
+        ${tracks
+          .slice(0, 14)
+          .map((t) => {
+            this._registerTrack(t);
+            return `
+            <button type="button" class="square-card" data-action="play-track" data-track-id="${escapeHtml(t.id)}" data-list-key="${escapeHtml(listKey)}">
+              <img src="${escapeHtml(getSafeThumb(t))}" alt="" class="square-thumb" loading="lazy" />
+              <div class="square-title">${escapeHtml(t.title)}</div>
+              <div class="square-sub">${escapeHtml(t.artist)}</div>
+            </button>`;
+          })
+          .join('')}
+      </div>`;
+    };
+
+    const similarFavsHtml = renderTrackStripSection(
+      'Похожее на любимое',
+      similarToFavorites,
+      'similar_favs'
+    );
+    const alsoLikedHtml = renderTrackStripSection(
+      'Другим тоже нравится',
+      alsoLikedTracks,
+      'also_liked'
+    );
+
     const quickSource = [
       ...this.storage.library.favorites,
       ...this.storage.downloadedTracks,
@@ -970,10 +1037,12 @@ class SonoraApp {
         : '';
 
     const seed = this.storage.library.favorites[0] || this.storage.library.history[0] || null;
-    const feedTracks =
+    const rawFeed =
       this.state.homeMood === 'ALL' && seed
         ? this.recommendations.rankCandidates(this.state.homeTracks, seed)
         : this.state.homeTracks;
+    const feedTracks = diversifyRecommendations(rawFeed, this.recommendations.moodProfiler);
+    this.state.homeFeedTracks = feedTracks;
 
     let feedHtml = '';
     if (this.state.homeLoading && feedTracks.length === 0) {
@@ -999,6 +1068,8 @@ class SonoraApp {
       <div class="chips-row">${chipsHtml}</div>
       ${heroHtml}
       ${madeForYouHtml}
+      ${similarFavsHtml}
+      ${alsoLikedHtml}
       ${quickHtml}
       ${historyStrip}
       <div class="section-header">
@@ -1176,15 +1247,20 @@ class SonoraApp {
     `;
   }
 
-  renderPlaylistTracksHtml(pl) {
+  _getFilteredPlaylistTracks(pl) {
+    if (!pl || !Array.isArray(pl.tracks)) return [];
     const filterQ = this.state.playlistFilter.trim().toLowerCase();
-    const filteredTracks = filterQ
-      ? pl.tracks.filter(
-          (t) =>
-            t.title.toLowerCase().includes(filterQ) ||
-            t.artist.toLowerCase().includes(filterQ)
-        )
-      : pl.tracks;
+    if (!filterQ) return pl.tracks;
+    return pl.tracks.filter(
+      (t) =>
+        t.title.toLowerCase().includes(filterQ) ||
+        t.artist.toLowerCase().includes(filterQ)
+    );
+  }
+
+  renderPlaylistTracksHtml(pl) {
+    const filterQ = this.state.playlistFilter.trim();
+    const filteredTracks = this._getFilteredPlaylistTracks(pl);
 
     if (filteredTracks.length === 0) {
       return `<div class="state-card no-border"><p>По запросу «${escapeHtml(this.state.playlistFilter)}» ничего не найдено.</p></div>`;
@@ -1461,6 +1537,13 @@ class SonoraApp {
                </div>`
             : ''
         }
+        <button type="button" class="setting-row" data-action="open-listening-stats">
+          <div>
+            <div class="setting-label">Подробная статистика прослушиваний</div>
+            <div class="setting-sub">Включений: ${listeningStats.totalPlays} • Дослушано: ${listeningStats.completionRatePct}% • ${listeningStats.totalListenedMinutes} мин</div>
+          </div>
+          <span class="setting-value">Открыть ›</span>
+        </button>
       </div>
 
       <div class="settings-group-title">Источники каталога</div>
@@ -2097,7 +2180,12 @@ class SonoraApp {
   }
 
   getListForKey(key) {
-    if (key === 'home') return this.state.homeTracks;
+    if (key === 'home') {
+      return this.state.homeFeedTracks.length > 0 ? this.state.homeFeedTracks : this.state.homeTracks;
+    }
+    if (key === 'similar_favs') return this.state.similarToFavoritesCache;
+    if (key === 'also_liked') return this.state.alsoLikedCache;
+    if (key === 'versions') return this.state.versionPoolTracks;
     if (key === 'favorites') return this.storage.library.favorites;
     if (key === 'history') return this.storage.library.history;
     if (key === 'offline') return this.storage.downloadedTracks;
@@ -2112,7 +2200,9 @@ class SonoraApp {
     }
     if (key?.startsWith('playlist:')) {
       const pid = Number(key.slice('playlist:'.length));
-      return this.storage.library.playlists.find((p) => p.id === pid)?.tracks || [];
+      const pl = this.storage.library.playlists.find((p) => p.id === pid);
+      if (!pl) return [];
+      return pid === this.state.selectedPlaylistId ? this._getFilteredPlaylistTracks(pl) : pl.tracks || [];
     }
     return [];
   }
@@ -2130,6 +2220,39 @@ class SonoraApp {
       },
       true
     );
+
+    // Desktop keyboard shortcuts (Space play/pause, arrows seek/skip, Escape close modals)
+    document.addEventListener('keydown', (e) => {
+      const tag = e.target?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || e.target?.isContentEditable) {
+        return;
+      }
+      const modalOpen = !document.getElementById('modal-backdrop')?.classList.contains('hidden');
+      if (e.key === 'Escape') {
+        if (modalOpen) {
+          this.closeModal();
+        } else if (this.state.playerExpanded) {
+          this.state.playerExpanded = false;
+          this.renderPlayerSheet();
+        }
+        return;
+      }
+      if (modalOpen || !this.player?.currentTrack) return;
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        this.player.unlockGesture();
+        this.player.togglePlayPause();
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        if (e.shiftKey) this.player.previous();
+        else this.player.seekBy(-10);
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        if (e.shiftKey) this.player.next(false);
+        else this.player.seekBy(10);
+      }
+    });
 
     document.querySelectorAll('.tab-btn').forEach((btn) => {
       btn.addEventListener('click', () => {
@@ -2346,8 +2469,9 @@ class SonoraApp {
       } else if (action === 'retry-home') {
         this.loadHomeMood(this.state.homeMood, { forceFresh: true });
       } else if (action === 'play-all-home') {
-        if (this.state.homeTracks.length > 0) {
-          this.player.playTrack(this.state.homeTracks[0], this.state.homeTracks);
+        const homeQueue = this.getListForKey('home');
+        if (homeQueue.length > 0) {
+          this.player.playTrack(homeQueue[0], homeQueue);
         }
       } else if (action === 'play-mix') {
         const mix = this.renderedMixes.get(btn.dataset.mixId);
@@ -2701,6 +2825,26 @@ class SonoraApp {
         const track = this.renderedTracks.get(btn.dataset.trackId) || this.player.currentTrack;
         this.closeModal();
         if (track) this.player.startRadio(track);
+      } else if (action === 'menu-open-versions') {
+        const track = this.renderedTracks.get(btn.dataset.trackId) || this.player.currentTrack;
+        if (track) this.openTrackVersionsModal(track, { fetchCatalog: false });
+      } else if (action === 'search-more-versions') {
+        const track = this.renderedTracks.get(btn.dataset.trackId) || this.player.currentTrack;
+        if (track) this.openTrackVersionsModal(track, { fetchCatalog: true });
+      } else if (action === 'play-version-track') {
+        const track = this.renderedTracks.get(btn.dataset.trackId);
+        if (track) {
+          const list = this.state.versionPoolTracks.length > 0 ? this.state.versionPoolTracks : [track];
+          this.player.playTrack(track, list);
+          this.closeModal();
+        }
+      } else if (action === 'export-offline-file') {
+        this.exportOfflineAudioTrack(btn.dataset.trackId);
+      } else if (action === 'open-listening-stats') {
+        const stats = this.storage.getListeningStats();
+        this.openModal(
+          buildListeningStatsModalHtml(stats, (m) => this.recommendations.moodProfiler.moodLabelRu(m))
+        );
       } else if (action === 'menu-add-playlist') {
         const track = this.renderedTracks.get(btn.dataset.trackId) || this.player.currentTrack;
         if (track) {
@@ -2767,10 +2911,14 @@ class SonoraApp {
           this.showToast(`Профиль: ${this.storage.activeAccount?.name || 'YouTube Music'}`);
         });
       } else if (action === 'remove-current-account') {
+        const acc = this.storage.accounts.find((a) => a.id === btn.dataset.accountId);
+        if (acc?.accessToken) {
+          revokeGoogleOAuthToken(acc.accessToken).catch(() => {});
+        }
         this.storage.removeAccount(btn.dataset.accountId).then(() => {
           this.closeModal();
           this.render();
-          this.showToast('Профиль удалён');
+          this.showToast('Вы вышли из аккаунта, профиль удалён');
         });
       } else if (action === 'copy-yt-bookmarklet') {
         navigator.clipboard?.writeText(YOUTUBE_EXPORT_BOOKMARKLET).then(() => {
@@ -2822,9 +2970,14 @@ class SonoraApp {
       this.showToast(added > 0 ? `Добавлено в очередь: ${added}` : 'Треки уже в очереди');
     });
     document.getElementById('mix-modal-save')?.addEventListener('click', async () => {
-      await this.storage.createPlaylist(mix.title || 'Персональный микс', mix.subtitle || '', tracks);
-      this.closeModal();
-      this.showToast('Микс сохранён в Медиатеку');
+      try {
+        await this.storage.createPlaylist(mix.title || 'Персональный микс', mix.subtitle || '', tracks);
+        this.closeModal();
+        if (this.state.activeTab === 'library') this.renderMain();
+        this.showToast('Микс сохранён в Медиатеку');
+      } catch (err) {
+        this.showToast(formatUserErrorRu(err, 'Не удалось сохранить микс'));
+      }
     });
   }
 
@@ -2889,6 +3042,10 @@ class SonoraApp {
             id: vid,
             title: info?.title || `YouTube трек (${vid})`,
             artist: info?.artist || 'YouTube Music',
+            album: info?.album || '',
+            year: info?.year || 0,
+            genre: info?.genre || '',
+            moodTags: info?.moodTags || [],
             durationSeconds: info?.durationSeconds || 0,
             thumbnailUrl: info?.thumbnailUrl || `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`
           });
@@ -2978,7 +3135,7 @@ class SonoraApp {
     } catch (err) {
       this._syncTrackOfflineUi(track.id);
       if (err?.name !== 'AbortError') {
-        this.showToast(err?.message || 'Ошибка оффлайн-загрузки');
+        this.showToast(formatUserErrorRu(err, 'Ошибка оффлайн-загрузки'));
       }
     }
   }
@@ -3116,7 +3273,7 @@ class SonoraApp {
       const items = await this.api.search(q, 'TRACKS');
       this.state.pickerState.results = items.filter((i) => i.type === 'track');
     } catch (err) {
-      this.showToast(err.message);
+      this.showToast(formatUserErrorRu(err, 'Ошибка поиска'));
     } finally {
       this.state.pickerState.loading = false;
       this.renderPickerModal();
@@ -3155,6 +3312,71 @@ class SonoraApp {
     );
   }
 
+  async openTrackVersionsModal(track, { fetchCatalog = false } = {}) {
+    this._registerTrack(track);
+    const localPool = [
+      ...Array.from(this.renderedTracks.values()),
+      ...this.state.homeTracks,
+      ...this.storage.library.favorites,
+      ...this.storage.library.history,
+      ...this.storage.library.playlists.flatMap((pl) => pl.tracks || [])
+    ];
+    let grouped = groupTrackVersions(track, localPool);
+    for (const t of grouped.all) this._registerTrack(t);
+    this.state.versionPoolTracks = grouped.all;
+
+    this.openModal(
+      buildTrackVersionsModalHtml(track, grouped, {
+        loadingCatalog: fetchCatalog,
+        getSafeThumb
+      })
+    );
+
+    if (!fetchCatalog) return;
+    try {
+      const remoteVersions = await this.api.getTrackVersions(track);
+      grouped = groupTrackVersions(track, [...localPool, ...remoteVersions]);
+      for (const t of grouped.all) this._registerTrack(t);
+      this.state.versionPoolTracks = grouped.all;
+      if (!document.getElementById('modal-backdrop')?.classList.contains('hidden')) {
+        this.openModal(
+          buildTrackVersionsModalHtml(track, grouped, {
+            loadingCatalog: false,
+            getSafeThumb
+          })
+        );
+      }
+    } catch (err) {
+      if (!document.getElementById('modal-backdrop')?.classList.contains('hidden')) {
+        this.openModal(
+          buildTrackVersionsModalHtml(track, grouped, {
+            loadingCatalog: false,
+            getSafeThumb
+          })
+        );
+      }
+      this.showToast(formatUserErrorRu(err, 'Не удалось найти дополнительные версии'));
+    }
+  }
+
+  async exportOfflineAudioTrack(trackId) {
+    try {
+      const { blob, filename } = await this.offline.getOfflineBlobForExport(trackId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1500);
+      this.closeModal();
+      this.showToast(`Сохраняем файл: ${filename}`);
+    } catch (err) {
+      this.showToast(formatUserErrorRu(err, 'Не удалось выгрузить аудиофайл'));
+    }
+  }
+
   async openRemotePlaylistModal(item) {
     this.openModal(`<h3 class="modal-title">${escapeHtml(item.title)}</h3><p class="modal-desc">Загрузка треков плейлиста…</p>`);
     try {
@@ -3172,9 +3394,14 @@ class SonoraApp {
         this.showToast(added > 0 ? `Добавлено в очередь: ${added}` : 'Треки уже в очереди');
       });
       document.getElementById('remote-pl-save')?.addEventListener('click', async () => {
-        await this.storage.mergePlaylist(remote.title || item.title, remote.description || '', tracks, item.id);
-        this.closeModal();
-        this.showToast('Плейлист сохранён в Медиатеку');
+        try {
+          await this.storage.mergePlaylist(remote.title || item.title, remote.description || '', tracks, item.id);
+          this.closeModal();
+          if (this.state.activeTab === 'library') this.renderMain();
+          this.showToast('Плейлист сохранён в Медиатеку');
+        } catch (err) {
+          this.showToast(formatUserErrorRu(err, 'Не удалось сохранить плейлист'));
+        }
       });
       document.getElementById('remote-pl-offline')?.addEventListener('click', () => {
         this.closeModal();
@@ -3182,7 +3409,7 @@ class SonoraApp {
       });
     } catch (err) {
       this.closeModal();
-      this.showToast(err.message);
+      this.showToast(formatUserErrorRu(err, 'Не удалось загрузить плейлист'));
     }
   }
 
@@ -3344,7 +3571,7 @@ class SonoraApp {
       this.renderMain();
       this.showToast(addedCount > 0 ? `Добавлено треков: ${addedCount}` : 'Плейлист уже актуален');
     } catch (err) {
-      this.showToast(err?.message || 'Не удалось обновить плейлист из YouTube');
+      this.showToast(formatUserErrorRu(err, 'Не удалось обновить плейлист из YouTube'));
     }
   }
 

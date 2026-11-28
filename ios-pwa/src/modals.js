@@ -1,3 +1,4 @@
+import { VERSION_LABELS_RU } from './recommendations.js';
 import { escapeHtml } from './security.js';
 
 export const YOUTUBE_DIRECT_EXPORT_SNIPPET = `(async () => {
@@ -179,8 +180,14 @@ export function buildTrackMenuHtml(track, { isFav, isOffline, isDownloading, pro
     <button type="button" class="btn-secondary-full" data-action="menu-play-next" data-track-id="${safeId}">Играть следующим</button>
     <button type="button" class="btn-secondary-full" data-action="menu-add-queue" data-track-id="${safeId}">Добавить в очередь</button>
     <button type="button" class="btn-secondary-full" data-action="menu-start-radio" data-track-id="${safeId}">Запустить радио по треку</button>
+    <button type="button" class="btn-secondary-full" data-action="menu-open-versions" data-track-id="${safeId}">Версии и ремиксы</button>
     <button type="button" class="btn-secondary-full" data-action="menu-open-artist" data-track-id="${safeId}">Перейти к артисту</button>
     <button type="button" class="btn-secondary-full" data-action="menu-add-playlist" data-track-id="${safeId}">Добавить в плейлист</button>
+    ${
+      isOffline
+        ? `<button type="button" class="btn-secondary-full" data-action="export-offline-file" data-track-id="${safeId}">Сохранить аудиофайл на устройство</button>`
+        : ''
+    }
     <button type="button" class="btn-secondary-full" data-action="share-track" data-track-id="${safeId}">Поделиться треком</button>
     ${
       canRemoveFromPl
@@ -478,7 +485,7 @@ export function buildYouTubeImportModalHtml({
     </form>
 
     <button type="button" class="btn-secondary-full" data-action="choose-yt-import-file">Выбрать файл (.json, .csv Takeout, .sonoraenc)</button>
-    ${acc.id ? `<button type="button" class="btn-danger-full" data-action="remove-current-account" data-account-id="${escapeHtml(acc.id)}">Выйти и удалить профиль «${escapeHtml(acc.name)}»</button>` : ''}
+    ${acc.id ? `<button type="button" class="btn-danger-full" data-action="remove-current-account" data-account-id="${escapeHtml(acc.id)}">Выйти из аккаунта и удалить профиль «${escapeHtml(acc.name)}»</button>` : ''}
     <button type="button" class="btn-secondary-full" data-action="close-modal">Закрыть</button>
   `;
 }
@@ -528,3 +535,146 @@ export function buildDecryptImportModalHtml() {
     </form>
   `;
 }
+
+export function buildTrackVersionsModalHtml(seedTrack, grouped, { loadingCatalog = false, getSafeThumb } = {}) {
+  const safeSeedId = escapeHtml(seedTrack?.id || '');
+  const sections = [
+    { label: 'Оригинал', tracks: grouped?.originals || [] },
+    { label: 'Ремиксы', tracks: grouped?.remixes || [] },
+    { label: 'Каверы', tracks: grouped?.covers || [] },
+    { label: 'Концертные записи', tracks: grouped?.live || [] },
+    { label: 'Slowed / Sped Up / Акустика', tracks: grouped?.other || [] }
+  ].filter((sec) => sec.tracks.length > 0);
+
+  const thumbFn = typeof getSafeThumb === 'function' ? getSafeThumb : (t) => t?.thumbnailUrl || 'icons/icon-192.png';
+
+  const sectionsHtml =
+    sections.length > 0
+      ? sections
+          .map(
+            (sec) => `
+          <div class="settings-group-title">${escapeHtml(sec.label)} (${sec.tracks.length})</div>
+          <div class="grouped-card modal-preview-list">
+            ${sec.tracks
+              .map((t) => {
+                const badge = VERSION_LABELS_RU[t.versionType] || VERSION_LABELS_RU.original;
+                return `
+                  <button type="button" class="track-row ${t.id === seedTrack?.id ? 'active-track' : ''}" data-action="play-version-track" data-track-id="${escapeHtml(t.id)}">
+                    <img src="${escapeHtml(thumbFn(t))}" alt="" class="track-thumb" loading="lazy" />
+                    <div class="track-meta">
+                      <div class="track-title">${escapeHtml(t.title)} <span class="version-pill">${escapeHtml(badge)}</span></div>
+                      <div class="track-sub">${escapeHtml(t.artist)}</div>
+                    </div>
+                  </button>`;
+              })
+              .join('')}
+          </div>`
+          )
+          .join('')
+      : '<p class="modal-desc">Связанные версии пока не найдены.</p>';
+
+  return `
+    <h3 class="modal-title">Версии и ремиксы</h3>
+    <p class="modal-sub-title">${escapeHtml(grouped?.baseTitle || seedTrack?.title || '')} • ${escapeHtml(seedTrack?.artist || '')}</p>
+    ${
+      loadingCatalog
+        ? '<div class="modal-status-msg">Ищем оригинал, ремиксы и каверы в каталоге…</div>'
+        : `<button type="button" class="btn-primary-full" data-action="search-more-versions" data-track-id="${safeSeedId}">Найти ещё версии в каталоге</button>`
+    }
+    ${sectionsHtml}
+    <button type="button" class="btn-secondary-full mt-12" data-action="close-modal">Закрыть</button>
+  `;
+}
+
+export function buildListeningStatsModalHtml(stats, moodLabelFn) {
+  const tod = stats?.timeOfDayCounts || { morning: 0, day: 0, evening: 0, night: 0 };
+  const todTotal = Math.max(1, (tod.morning || 0) + (tod.day || 0) + (tod.evening || 0) + (tod.night || 0));
+  const todRows = [
+    { label: 'Утро (05–11)', count: tod.morning || 0 },
+    { label: 'День (12–16)', count: tod.day || 0 },
+    { label: 'Вечер (17–22)', count: tod.evening || 0 },
+    { label: 'Ночь (23–04)', count: tod.night || 0 }
+  ];
+
+  const moodChips = (stats?.topMoods || [])
+    .map((m) => (typeof moodLabelFn === 'function' ? moodLabelFn(m) : m))
+    .filter(Boolean);
+  const tagChips = [...(stats?.topGenres || []), ...moodChips];
+
+  const topTracksHtml =
+    (stats?.topTracks || []).length > 0
+      ? `<div class="grouped-card">
+          ${stats.topTracks
+            .map(
+              (t, idx) => `
+            <div class="track-row">
+              <span class="track-index-num">${idx + 1}</span>
+              <div class="track-meta">
+                <div class="track-title">${escapeHtml(t.title)}</div>
+                <div class="track-sub">${escapeHtml(t.artist)} • ${t.playCount || 0} включ. • ${t.completeCount || 0} до конца</div>
+              </div>
+            </div>`
+            )
+            .join('')}
+        </div>`
+      : '<p class="modal-desc">Послушайте несколько треков, чтобы собрать персональную статистику.</p>';
+
+  return `
+    <h3 class="modal-title">Статистика прослушиваний</h3>
+    <p class="modal-sub-title">Пик активности: ${escapeHtml(stats?.peakTimeOfDayRu || 'Вечер')}</p>
+    <div class="grouped-card">
+      <div class="stats-grid-pad">
+        <div class="stat-tile">
+          <div class="stat-val">${stats?.totalPlays || 0}</div>
+          <div class="stat-lbl">Включений</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-val">${stats?.completionRatePct || 0}%</div>
+          <div class="stat-lbl">Дослушано</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-val">${stats?.totalListenedMinutes || 0}</div>
+          <div class="stat-lbl">Минут</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="settings-group-title">Активность по времени суток</div>
+    <div class="stats-bars-card">
+      ${todRows
+        .map((r) => {
+          const pct = Math.round((r.count / todTotal) * 100);
+          return `
+          <div class="stats-bar-row">
+            <div class="stats-bar-meta">
+              <span>${escapeHtml(r.label)}</span>
+              <span>${r.count} (${pct}%)</span>
+            </div>
+            <div class="stats-bar-track"><div class="stats-bar-fill" style="width:${pct}%"></div></div>
+          </div>`;
+        })
+        .join('')}
+    </div>
+
+    ${
+      tagChips.length > 0
+        ? `<div class="settings-group-title">Любимые жанры и настроение</div>
+           <div class="chips-row">
+             ${tagChips.map((tag) => `<span class="chip-btn">${escapeHtml(tag)}</span>`).join('')}
+           </div>`
+        : ''
+    }
+
+    ${
+      (stats?.topArtists || []).length > 0
+        ? `<div class="settings-group-title">Частые исполнители</div>
+           <div class="helper-box">${escapeHtml(stats.topArtists.join(' • '))}</div>`
+        : ''
+    }
+
+    <div class="settings-group-title">Топ треков</div>
+    ${topTracksHtml}
+    <button type="button" class="btn-secondary-full mt-12" data-action="close-modal">Закрыть</button>
+  `;
+}
+

@@ -1,6 +1,7 @@
-import { sanitizeTrack } from './security.js';
+import { formatUserErrorRu, sanitizeTrack } from './security.js';
 
 const OFFLINE_CACHE_NAME = 'sonora-offline-audio-v1';
+const CHUNK_READ_TIMEOUT_MS = 25000;
 
 function cacheKeyForTrack(trackId) {
   return `./offline-audio/${encodeURIComponent(String(trackId || '').trim())}`;
@@ -11,6 +12,41 @@ export function formatBytesRu(bytes) {
   if (n <= 0) return '0 КБ';
   if (n >= 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} МБ`;
   return `${Math.max(1, Math.round(n / 1024))} КБ`;
+}
+
+export function buildSafeAudioFilename(track, mimeType = 'audio/mp4') {
+  const cleanPart = (val, fallback) => {
+    const cleaned = String(val ?? '')
+      .replace(/[\\/:*?"<>|\u0000-\u001F]+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .slice(0, 70);
+    return cleaned || fallback;
+  };
+  const artist = cleanPart(track?.artist, 'Sonora');
+  const title = cleanPart(track?.title, 'Track');
+  const mt = String(mimeType || '').toLowerCase();
+  let ext = 'm4a';
+  if (mt.includes('mpeg') || mt.includes('mp3')) ext = 'mp3';
+  else if (mt.includes('webm')) ext = 'webm';
+  else if (mt.includes('ogg') || mt.includes('opus')) ext = 'ogg';
+  else if (mt.includes('wav')) ext = 'wav';
+  return `${artist} - ${title}.${ext}`;
+}
+
+async function readChunkWithTimeout(reader, timeoutMs) {
+  let timerId = null;
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise((_, reject) => {
+        timerId = setTimeout(() => reject(new Error('Время ожидания загрузки истекло')), timeoutMs);
+        timerId.unref?.();
+      })
+    ]);
+  } finally {
+    if (timerId) clearTimeout(timerId);
+  }
 }
 
 export class SonoraOfflineManager {
@@ -66,6 +102,25 @@ export class SonoraOfflineManager {
     }
   }
 
+  async getOfflineBlobForExport(trackId) {
+    if (!this.isSupported() || !trackId) {
+      throw new Error('Оффлайн-кэш не поддерживается браузером');
+    }
+    const cache = await caches.open(OFFLINE_CACHE_NAME);
+    const match = await cache.match(cacheKeyForTrack(trackId));
+    if (!match) {
+      throw new Error('Файл не найден в оффлайн-кэше');
+    }
+    const blob = await match.blob();
+    if (!blob || blob.size === 0) {
+      throw new Error('Сохранённый аудиофайл повреждён');
+    }
+    const meta = this.storage?.downloadedTracks?.find((t) => t.id === trackId);
+    const mimeType = meta?.mimeType || blob.type || 'audio/mp4';
+    const filename = meta?.filename || buildSafeAudioFilename(meta || { id: trackId }, mimeType);
+    return { blob, filename, mimeType };
+  }
+
   async downloadTrack(track, streamUrl, { onProgress = null, signal = null } = {}) {
     const clean = sanitizeTrack(track);
     if (!clean) throw new Error('Некорректный трек для сохранения');
@@ -85,10 +140,12 @@ export class SonoraOfflineManager {
     this.downloadProgress.set(clean.id, { receivedBytes: 0, totalBytes: 0, percent: 0 });
     onProgress?.({ trackId: clean.id, receivedBytes: 0, totalBytes: 0, percent: 0 });
 
+    const key = cacheKeyForTrack(clean.id);
+
     try {
       const resp = await fetch(streamUrl, { signal: localController.signal });
       if (!resp.ok) {
-        throw new Error(`Ошибка загрузки аудио (${resp.status})`);
+        throw new Error(`Ошибка загрузки аудио (HTTP ${resp.status})`);
       }
 
       const contentType = resp.headers.get('content-type') || 'audio/mp4';
@@ -102,7 +159,7 @@ export class SonoraOfflineManager {
         let lastNotifyAt = 0;
 
         while (true) {
-          const { done, value } = await reader.read();
+          const { done, value } = await readChunkWithTimeout(reader, CHUNK_READ_TIMEOUT_MS);
           if (done) break;
           if (value) {
             chunks.push(value);
@@ -123,13 +180,14 @@ export class SonoraOfflineManager {
       }
 
       if (!blob || blob.size < 1024) {
-        throw new Error('Получен пустой аудиофайл');
+        throw new Error('Получен пустой или неполный аудиофайл');
       }
 
       const finalType = contentType || blob.type || 'audio/mp4';
+      const filename = buildSafeAudioFilename(clean, finalType);
       const cache = await caches.open(OFFLINE_CACHE_NAME);
       await cache.put(
-        cacheKeyForTrack(clean.id),
+        key,
         new Response(blob, {
           status: 200,
           headers: {
@@ -139,7 +197,6 @@ export class SonoraOfflineManager {
         })
       );
 
-      // Update or clear old ObjectURL so next play gets fresh cached blob
       const prev = this.activeObjectUrls.get(clean.id);
       if (prev) {
         URL.revokeObjectURL(prev);
@@ -148,6 +205,7 @@ export class SonoraOfflineManager {
 
       await this.storage?.saveDownloadedTrack?.({
         ...clean,
+        filename,
         sizeBytes: blob.size,
         mimeType: finalType,
         downloadedAt: Date.now()
@@ -160,6 +218,18 @@ export class SonoraOfflineManager {
       });
       onProgress?.({ trackId: clean.id, receivedBytes: blob.size, totalBytes: blob.size, percent: 100 });
       return blob.size;
+    } catch (err) {
+      // Remove any partial/stale cache entry so aborted or broken downloads don't leave junk
+      try {
+        const cache = await caches.open(OFFLINE_CACHE_NAME);
+        await cache.delete(key);
+      } catch {
+        // Ignore cleanup failure
+      }
+      if (err?.name === 'AbortError' || localController.signal.aborted) {
+        throw err;
+      }
+      throw new Error(formatUserErrorRu(err, 'Ошибка оффлайн-загрузки'));
     } finally {
       if (signal) signal.removeEventListener('abort', onExternalAbort);
       this.activeControllers.delete(clean.id);
@@ -173,7 +243,6 @@ export class SonoraOfflineManager {
     if (list.length === 0) {
       throw new Error('Нет доступного потока для оффлайн-сохранения');
     }
-    // Prefer CORS-friendly proxied routes (Invidious local=true or Audius) before raw CDN links
     const prioritized = [...list].sort((a, b) => {
       const aScore = a.includes('local=true') || a.includes('audius') ? 0 : 1;
       const bScore = b.includes('local=true') || b.includes('audius') ? 0 : 1;

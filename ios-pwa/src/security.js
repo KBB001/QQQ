@@ -169,14 +169,162 @@ export const BackupCipher = {
   }
 };
 
+const VERSION_RULES = [
+  { type: 'slowed', pattern: /\b(slowed(?:\s*(?:&|\+|and)?\s*reverb)?|chopped\s*(?:&|and)?\s*screwed|reverb\s*version)\b|замедл[её]н/i },
+  { type: 'sped_up', pattern: /\b(sped\s*up|speed\s*up|nightcore|anti[\s-]?nightcore)\b|ускор[её]н/i },
+  { type: 'remix', pattern: /\b(remix|rmx|vip\s*mix|club\s*mix|radio\s*edit|extended\s*mix|bootleg|rework|flip|mashup|edit)\b|ремикс/i },
+  { type: 'live', pattern: /\b(live(?:\s+(?:at|from|in|session|version))?|concert|on\s+stage|tiny\s+desk)\b|концерт/i },
+  { type: 'cover', pattern: /\b(cover|tribute)\b|кавер/i },
+  { type: 'acoustic', pattern: /\b(acoustic|unplugged|piano\s*version)\b|акустик/i },
+  { type: 'instrumental', pattern: /\b(instrumental|karaoke|backing\s*track)\b|минус|инструментал/i }
+];
+
+const STRIP_TITLE_NOISE_RE =
+  /[\(\[][^()\[\]]*(?:\b(?:official|music\s*video|lyrics?|audio|visualizer|hd|4k|hq|remaster(?:ed)?|explicit|clean|feat\.?|ft\.?|remix|rmx|bootleg|rework|flip|edit|cover|live|unplugged|slowed|reverb|sped\s*up|speed\s*up|nightcore|acoustic|instrumental)(?!\p{L})|ремикс|кавер|концерт|акустик|замедл|ускор)[^()\[\]]*[\)\]]/giu;
+
+export function parseTrackVersionInfo(rawTitle, rawArtist = '') {
+  const titleStr = String(rawTitle ?? '').trim();
+  let artistStr = String(rawArtist ?? '')
+    .replace(/\s*-\s*Topic$/i, '')
+    .replace(/\s*VEVO$/i, '')
+    .trim();
+
+  let versionType = 'original';
+  for (const rule of VERSION_RULES) {
+    if (rule.pattern.test(titleStr)) {
+      versionType = rule.type;
+      break;
+    }
+  }
+
+  let workingTitle = titleStr;
+  const dashSplit = workingTitle.match(/^(.{2,60}?)\s+[–—-]\s+(.{2,140})$/);
+  if (dashSplit) {
+    if (!artistStr || artistStr === 'YouTube Music' || artistStr === 'Исполнитель' || artistStr === 'Неизвестный исполнитель') {
+      artistStr = dashSplit[1].trim();
+    }
+    workingTitle = dashSplit[2].trim();
+  }
+
+  let baseTitle = workingTitle
+    .replace(STRIP_TITLE_NOISE_RE, ' ')
+    .replace(/\s+(?:feat\.?|ft\.?|featuring)\s+.+$/i, '')
+    .replace(/\s+[-–—]\s*(?:remix|cover|live|slowed|sped\s*up|acoustic|instrumental|ремикс|кавер).*$/i, '')
+    .replace(/\s+\b(?:remix|rmx|slowed|reverb|sped\s*up|nightcore|cover|live|unplugged|acoustic|instrumental|ремикс|кавер)\b.*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!baseTitle) {
+    baseTitle = workingTitle.replace(/\s+/g, ' ').trim() || titleStr;
+  }
+
+  const norm = (s) =>
+    String(s || '')
+      .toLowerCase()
+      .replace(/\b(topic|vevo|official|records|music)\b/gi, ' ')
+      .replace(/[^\p{L}\p{N}]+/gu, ' ')
+      .trim()
+      .replace(/\s+/g, ' ');
+
+  const normBase = norm(baseTitle);
+  const normArtist = norm(artistStr);
+  const canonicalKey = normBase
+    ? (normArtist && normArtist !== 'youtube' && normArtist !== 'youtube music' && normArtist !== 'неизвестный исполнитель'
+        ? `${normArtist}::${normBase}`
+        : normBase)
+    : '';
+
+  return {
+    versionType,
+    baseTitle,
+    canonicalKey
+  };
+}
+
+export function formatUserErrorRu(err, fallback = 'Произошла ошибка. Попробуйте ещё раз.') {
+  if (typeof globalThis.navigator !== 'undefined' && globalThis.navigator.onLine === false) {
+    return 'Нет подключения к интернету. Доступна музыка из оффлайн-кэша.';
+  }
+  const msg = String(err?.message ?? err ?? '').trim();
+  if (!msg) return fallback;
+  if (/AbortError|aborted|timed?\s*out/i.test(msg)) {
+    return 'Сервер отвечает слишком долго. Попробуйте повторить запрос.';
+  }
+  if (/Failed to fetch|NetworkError|Load failed|ERR_NETWORK/i.test(msg)) {
+    return 'Не удалось подключиться к сети. Проверьте интернет или источники в Настройках.';
+  }
+  if (/Unexpected token|JSON/i.test(msg)) {
+    return 'Внешний сервис вернул неполные или повреждённые данные.';
+  }
+  if (/HTTP 401|Unauthorized|Invalid Credentials/i.test(msg)) {
+    return 'Сессия аккаунта истекла. Войдите снова.';
+  }
+  if (/HTTP 403|Forbidden/i.test(msg)) {
+    return 'Доступ ограничен внешним сервисом.';
+  }
+  if (/HTTP 429|quota|rate limit/i.test(msg)) {
+    return 'Слишком много запросов. Подождите немного и повторите.';
+  }
+  if (/HTTP 5\d\d/i.test(msg)) {
+    return 'Временный сбой внешнего сервера. Автоматически пробуем другой источник.';
+  }
+  return msg;
+}
+
 export function sanitizeTrack(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const id = String(raw.id ?? '').trim().slice(0, 64);
   if (!id) return null;
+
+  const title = String(raw.title ?? '').trim().slice(0, 240) || 'Без названия';
+  const artist = String(raw.artist ?? '').trim().slice(0, 200) || 'Неизвестный исполнитель';
+  const album = String(raw.album ?? '').trim().slice(0, 200);
+  const rawYear = Number(raw.year);
+  const year =
+    Number.isInteger(rawYear) && rawYear >= 1900 && rawYear <= 2100 ? rawYear : 0;
+  const genre = String(raw.genre ?? '').trim().slice(0, 80);
+  const moodTags = Array.isArray(raw.moodTags)
+    ? Array.from(
+        new Set(
+          raw.moodTags
+            .map((t) => String(t ?? '').trim().toLowerCase().slice(0, 40))
+            .filter(Boolean)
+        )
+      ).slice(0, 8)
+    : [];
+  const rawBpm = Number(raw.tempoBpm);
+  const tempoBpm =
+    Number.isFinite(rawBpm) && rawBpm >= 40 && rawBpm <= 240 ? Math.round(rawBpm) : 0;
+
+  const parsedVersion = parseTrackVersionInfo(title, artist);
+  const allowedVersions = new Set([
+    'original',
+    'remix',
+    'cover',
+    'live',
+    'slowed',
+    'sped_up',
+    'acoustic',
+    'instrumental'
+  ]);
+  const versionType = allowedVersions.has(raw.versionType)
+    ? raw.versionType
+    : parsedVersion.versionType;
+  const baseTitle = String(raw.baseTitle || parsedVersion.baseTitle || title).trim().slice(0, 240);
+  const canonicalKey = String(raw.canonicalKey || parsedVersion.canonicalKey || '').trim().slice(0, 260);
+
   return {
     id,
-    title: String(raw.title ?? '').trim().slice(0, 240) || 'Без названия',
-    artist: String(raw.artist ?? '').trim().slice(0, 200) || 'Неизвестный исполнитель',
+    title,
+    artist,
+    album,
+    year,
+    genre,
+    moodTags,
+    tempoBpm,
+    versionType,
+    baseTitle,
+    canonicalKey,
     durationSeconds: Math.max(0, Math.floor(Number(raw.durationSeconds) || 0)),
     thumbnailUrl: sanitizeHttpsUrl(raw.thumbnailUrl) || '',
     streamUrl: null
@@ -213,6 +361,10 @@ export function normalizeBackupPayload(rawJson) {
         .filter(Boolean)
     : [];
 
+  const trackStats =
+    parsed.trackStats && typeof parsed.trackStats === 'object' ? parsed.trackStats : null;
+  const affinities = Array.isArray(parsed.affinities) ? parsed.affinities.slice(0, 500) : null;
+
   return {
     version: Number(parsed.version) || 2,
     exportedAt: Number(parsed.exportedAt) || Date.now(),
@@ -222,13 +374,15 @@ export function normalizeBackupPayload(rawJson) {
     searchHistory,
     settings: parsed.settings && typeof parsed.settings === 'object' ? parsed.settings : null,
     playback: parsed.playback && typeof parsed.playback === 'object' ? parsed.playback : null,
-    equalizer: parsed.equalizer && typeof parsed.equalizer === 'object' ? parsed.equalizer : null
+    equalizer: parsed.equalizer && typeof parsed.equalizer === 'object' ? parsed.equalizer : null,
+    trackStats,
+    affinities
   };
 }
 
 export function buildBackupPayload(state) {
   return {
-    version: 2,
+    version: 3,
     exportedAt: Date.now(),
     favorites: (state.favorites || []).map(sanitizeTrack).filter(Boolean),
     history: (state.history || []).map(sanitizeTrack).filter(Boolean),
@@ -242,7 +396,9 @@ export function buildBackupPayload(state) {
     searchHistory: (state.searchHistory || []).slice(0, 30),
     settings: state.settings || null,
     playback: state.playback || null,
-    equalizer: null
+    equalizer: null,
+    trackStats: state.trackStats || {},
+    affinities: Array.isArray(state.affinities) ? state.affinities.slice(0, 500) : []
   };
 }
 

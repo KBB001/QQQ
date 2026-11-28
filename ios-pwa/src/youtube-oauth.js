@@ -144,6 +144,23 @@ export function consumeOAuthRedirectCallback() {
   };
 }
 
+export async function revokeGoogleOAuthToken(accessToken) {
+  const token = String(accessToken || '').trim();
+  if (!token) return false;
+  try {
+    const resp = await fetch(
+      `https://oauth2.googleapis.com/revoke?token=${encodeURIComponent(token)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+      }
+    );
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+
 async function fetchGoogleJson(url, accessToken) {
   const resp = await fetch(url, {
     headers: {
@@ -153,7 +170,11 @@ async function fetchGoogleJson(url, accessToken) {
   });
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
-    const msg = data?.error?.message || `Google API ошибка (${resp.status})`;
+    const rawMsg = data?.error?.message || `HTTP ${resp.status}`;
+    const msg =
+      resp.status === 401
+        ? 'Сессия Google истекла (401). Войдите в аккаунт повторно.'
+        : rawMsg;
     const err = new Error(msg);
     err.status = resp.status;
     throw err;
