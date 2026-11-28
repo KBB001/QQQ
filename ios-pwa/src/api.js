@@ -96,6 +96,44 @@ export function extractPlaylistId(input, { allowBareId = true } = {}) {
   return null;
 }
 
+export function extractChannelQuery(input) {
+  const raw = String(input ?? '').trim();
+  if (!raw) return null;
+
+  if (/^UC[A-Za-z0-9_-]{20,}$/.test(raw)) {
+    return { kind: 'channelId', channelId: raw, pipedPath: `/channel/${raw}`, handle: '', query: raw };
+  }
+  if (/^@[A-Za-z0-9._-]{2,}$/.test(raw)) {
+    return { kind: 'handle', channelId: '', pipedPath: `/${raw}`, handle: raw, query: raw.slice(1) };
+  }
+
+  try {
+    const candidate = raw.includes('://') ? raw : `https://${raw}`;
+    const url = new URL(candidate);
+    const host = url.hostname.replace(/^www\.|^m\.|^music\./, '');
+    if (host === 'youtube.com' || host === 'youtu.be') {
+      const playlistId = url.searchParams.get('list');
+      if (playlistId && /^[A-Za-z0-9_-]{2,}$/.test(playlistId)) {
+        return { kind: 'playlistId', playlistId, channelId: '', pipedPath: '', handle: '', query: playlistId };
+      }
+      const parts = url.pathname.split('/').filter(Boolean);
+      if (parts[0] === 'channel' && parts[1] && /^UC[A-Za-z0-9_-]{20,}$/.test(parts[1])) {
+        return { kind: 'channelId', channelId: parts[1], pipedPath: `/channel/${parts[1]}`, handle: '', query: parts[1] };
+      }
+      if (parts[0] && parts[0].startsWith('@') && parts[0].length >= 3) {
+        return { kind: 'handle', channelId: '', pipedPath: `/${parts[0]}`, handle: parts[0], query: parts[0].slice(1) };
+      }
+      if ((parts[0] === 'c' || parts[0] === 'user') && parts[1]) {
+        return { kind: 'custom', channelId: '', pipedPath: `/${parts[0]}/${parts[1]}`, handle: '', query: decodeURIComponent(parts[1]) };
+      }
+    }
+  } catch {
+    // Plain channel name query
+  }
+
+  return { kind: 'search', channelId: '', pipedPath: '', handle: '', query: raw };
+}
+
 export function isDirectAudioOrM4a(stream) {
   const mime = String(stream?.mimeType ?? stream?.type ?? '').toLowerCase();
   const codec = String(stream?.codec ?? '').toLowerCase();
@@ -976,6 +1014,177 @@ export class SonoraApi {
       this.artistCache.set(cacheKey, { fetchedAt: Date.now(), details });
     }
     return details;
+  }
+
+  async resolveYouTubeChannelAccount(rawInput) {
+    const parsed = extractChannelQuery(rawInput);
+    if (!parsed) {
+      throw new Error('Введите @никнейм, имя или ссылку на канал YouTube');
+    }
+
+    if (parsed.kind === 'playlistId') {
+      const pl = await this.getPlaylist(parsed.playlistId);
+      const tracks = Array.isArray(pl?.tracks) ? pl.tracks : [];
+      if (tracks.length === 0) {
+        throw new Error('Плейлист не найден или пуст');
+      }
+      const name = pl.author && pl.author !== 'YouTube Music' ? pl.author : pl.title;
+      return {
+        account: {
+          id: `yt_pl_${pl.id}`,
+          name: name || 'Канал YouTube',
+          handle: '',
+          avatarUrl: pl.thumbnailUrl || tracks[0]?.thumbnailUrl || '',
+          channelUrl: '',
+          authType: 'youtube_channel'
+        },
+        tracks,
+        playlists: [
+          {
+            id: pl.id,
+            name: pl.title || 'Плейлист YouTube',
+            description: pl.description || `YouTube • ${name || 'Канал'}`,
+            tracks
+          }
+        ]
+      };
+    }
+
+    let channelId = parsed.channelId || '';
+    let name = '';
+    let handle = parsed.handle || '';
+    let avatarUrl = '';
+    let channelPath = parsed.pipedPath || '';
+    let tracks = [];
+
+    if (channelPath) {
+      try {
+        const { data } = await this._tryPipedPool(channelPath);
+        if (data?.id) channelId = String(data.id);
+        if (data?.name) name = String(data.name).trim();
+        avatarUrl = sanitizeHttpsUrl(data?.avatarUrl) || avatarUrl;
+        tracks = (Array.isArray(data?.relatedStreams) ? data.relatedStreams : [])
+          .map(normalizePipedTrack)
+          .filter(Boolean);
+        if (channelId) channelPath = `/channel/${channelId}`;
+      } catch {
+        // Fallback to Invidious / channel search below
+      }
+    }
+
+    if (!name && channelId) {
+      try {
+        const { data: inv } = await this._tryInvidiousPool(
+          `/api/v1/channels/${encodeURIComponent(channelId)}`
+        );
+        if (inv?.author) name = String(inv.author).trim();
+        const thumbs = Array.isArray(inv?.authorThumbnails) ? inv.authorThumbnails : [];
+        avatarUrl = sanitizeHttpsUrl(thumbs[thumbs.length - 1]?.url || thumbs[0]?.url) || avatarUrl;
+        if (tracks.length === 0) {
+          const rawVideos = Array.isArray(inv?.latestVideos)
+            ? inv.latestVideos
+            : Array.isArray(inv?.topVideos)
+              ? inv.topVideos
+              : [];
+          tracks = rawVideos.map(normalizeInvidiousTrack).filter(Boolean);
+        }
+        channelPath = `/channel/${channelId}`;
+      } catch {
+        // Continue to channel search fallback
+      }
+    }
+
+    if (!name || tracks.length === 0) {
+      const searchQ = parsed.handle || parsed.query;
+      const artists = await this.search(searchQ, 'ARTISTS').catch(() => []);
+      const normalizedNeedle = parsed.query.toLowerCase();
+      const matched =
+        artists.find((a) => String(a.title || '').toLowerCase() === normalizedNeedle) ||
+        artists[0] ||
+        null;
+
+      if (matched) {
+        if (!name) name = matched.title;
+        if (!avatarUrl) avatarUrl = matched.thumbnailUrl || '';
+        if (!channelPath && matched.channelUrl) channelPath = matched.channelUrl;
+        if (!channelId && channelPath.startsWith('/channel/')) {
+          channelId = channelPath.slice('/channel/'.length).split('/')[0];
+        }
+        const details = await this.getArtistDetails(matched).catch(() => null);
+        if (details) {
+          if (!name && details.title) name = details.title;
+          if (!avatarUrl && details.thumbnailUrl) avatarUrl = details.thumbnailUrl;
+          if (tracks.length === 0 && Array.isArray(details.tracks)) {
+            tracks = details.tracks;
+          }
+        }
+      }
+    }
+
+    if (!name) {
+      throw new Error('Канал YouTube не найден. Проверьте @никнейм или ссылку на канал.');
+    }
+
+    const playlists = [];
+    if (channelId) {
+      try {
+        const { data: plResp } = await this._tryInvidiousPool(
+          `/api/v1/channels/${encodeURIComponent(channelId)}/playlists`
+        );
+        const rawPls = Array.isArray(plResp?.playlists)
+          ? plResp.playlists
+          : Array.isArray(plResp)
+            ? plResp
+            : [];
+        for (const item of rawPls.slice(0, 5)) {
+          const pid = String(item?.playlistId || '').trim();
+          if (!pid) continue;
+          try {
+            const fullPl = await this.getPlaylist(pid);
+            if (fullPl?.tracks?.length > 0) {
+              playlists.push({
+                id: fullPl.id,
+                name: fullPl.title || item.title || 'Плейлист канала',
+                description: fullPl.description || `YouTube • ${name}`,
+                tracks: fullPl.tracks
+              });
+            }
+          } catch {
+            // Skip unreadable playlist
+          }
+        }
+      } catch {
+        // Public playlists tab optional
+      }
+    }
+
+    if (playlists.length === 0 && tracks.length > 0) {
+      playlists.push({
+        id: channelId ? `yt_ch_${channelId}` : `yt_ch_${name.toLowerCase().replace(/\s+/g, '_')}`,
+        name: `Треки: ${name}`,
+        description: `Канал YouTube • ${handle || name}`,
+        tracks: tracks.slice(0, 60)
+      });
+    }
+
+    const resolvedId = channelId
+      ? `yt_${channelId}`
+      : handle
+        ? `yt_${handle.toLowerCase()}`
+        : `yt_${name.toLowerCase().replace(/[^a-zа-яё0-9]+/gi, '_').slice(0, 40)}`;
+
+    return {
+      account: {
+        id: resolvedId,
+        name,
+        handle: handle || (channelId ? `@${channelId}` : ''),
+        avatarUrl: avatarUrl || tracks[0]?.thumbnailUrl || '',
+        channelUrl: channelPath || (channelId ? `/channel/${channelId}` : ''),
+        authType: 'youtube_channel'
+      },
+      tracks,
+      playlists
+    };
   }
 
   async getSuggestions(query) {

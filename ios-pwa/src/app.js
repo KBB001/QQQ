@@ -5,8 +5,7 @@ import {
   extractVideoId
 } from './api.js';
 import {
-  YOUTUBE_DIRECT_EXPORT_SNIPPET,
-  YOUTUBE_EXPORT_BOOKMARKLET,
+  buildAccountAuthModalHtml,
   buildAddToPlaylistModalHtml,
   buildAddTracksPickerModalHtml,
   buildCatalogSourcesModalHtml,
@@ -22,8 +21,7 @@ import {
   buildRenamePlaylistModalHtml,
   buildSleepTimerModalHtml,
   buildTrackMenuHtml,
-  buildTrackVersionsModalHtml,
-  buildYouTubeImportModalHtml
+  buildTrackVersionsModalHtml
 } from './modals.js';
 import { SonoraOfflineManager, formatBytesRu } from './offline.js';
 import { SonoraPlayer } from './player.js';
@@ -39,17 +37,13 @@ import {
   BackupCipher,
   escapeHtml,
   formatUserErrorRu,
-  parseExternalYouTubeImport,
   sanitizeHttpsUrl,
   sanitizeTrack
 } from './security.js';
 import { SonoraStorage } from './storage.js';
 import {
-  buildGoogleOAuthUrl,
   consumeOAuthRedirectCallback,
   fetchYouTubePlaylistTracksWithOAuth,
-  getOAuthRedirectUri,
-  isValidGoogleClientId,
   revokeGoogleOAuthToken,
   syncYouTubeLibraryWithOAuth
 } from './youtube-oauth.js';
@@ -153,7 +147,10 @@ class SonoraApp {
       playlistFilter: '',
       playlistEditMode: false,
       pickerState: { playlistId: null, tab: 'search', query: '', results: [], loading: false },
-      ytModalStatusMsg: '',
+      accountModalTab: 'youtube',
+      accountShowAddForm: false,
+      accountLoading: false,
+      accountStatusMsg: '',
       catalogDiagnosticsHtml: '',
       playerExpanded: false,
       playerLyricsOpen: false,
@@ -589,14 +586,14 @@ class SonoraApp {
     } else {
       const acc = this.storage.activeAccount;
       const avatarHtml = acc
-        ? `<button type="button" class="header-avatar-btn" data-action="open-yt-account" title="${escapeHtml(acc.name)}" aria-label="Аккаунт YouTube Music">
+        ? `<button type="button" class="header-avatar-btn" data-action="open-yt-account" title="${escapeHtml(acc.name)}" aria-label="Аккаунт">
              ${
                acc.avatarUrl
                  ? `<img src="${escapeHtml(acc.avatarUrl)}" alt="" class="header-avatar-img" />`
-                 : `<span class="header-avatar-fallback">${escapeHtml((acc.name || 'Y')[0].toUpperCase())}</span>`
+                 : `<span class="header-avatar-fallback">${escapeHtml((acc.name || 'S')[0].toUpperCase())}</span>`
              }
            </button>`
-        : `<button type="button" class="icon-pill-btn" data-action="open-yt-account" aria-label="Войти в YouTube">Войти</button>`;
+        : `<button type="button" class="icon-pill-btn" data-action="open-yt-account" aria-label="Войти в аккаунт">Войти</button>`;
       actionsEl.innerHTML = `
         ${avatarHtml}
         <button type="button" class="icon-pill-btn" data-action="retry-home" aria-label="Обновить ленту">${SVG.refresh}</button>
@@ -1472,8 +1469,23 @@ class SonoraApp {
     const themeNames = { SYSTEM: 'Системная', LIGHT: 'Светлая', DARK: 'Тёмная' };
     const qualityNames = { AUTO: 'Авто (по сети)', HIGH: 'Высокое', MEDIUM: 'Среднее', LOW: 'Экономия' };
 
+    const accTypeLabel =
+      acc?.authType === 'youtube_channel'
+        ? 'YouTube канал'
+        : acc?.authType === 'google_oauth'
+          ? 'Google аккаунт'
+          : 'Профиль Sonora';
+    const accSub = acc
+      ? [
+          acc.handle || acc.email || accTypeLabel,
+          acc.syncedPlaylistsCount > 0 ? `${acc.syncedPlaylistsCount} плейлистов` : ''
+        ]
+          .filter(Boolean)
+          .join(' • ')
+      : 'Профиль Sonora или ваш канал YouTube';
+
     return `
-      <div class="settings-group-title">Аккаунт YouTube и импорт</div>
+      <div class="settings-group-title">Аккаунт</div>
       <div class="grouped-card">
         ${
           accounts.length > 1
@@ -1499,15 +1511,11 @@ class SonoraApp {
                 : ''
             }
             <div>
-              <div class="setting-label">${acc ? escapeHtml(acc.name) : 'Войти в Google / YouTube или импортировать'}</div>
-              <div class="setting-sub">${
-                acc
-                  ? `${acc.authType === 'google_oauth' ? 'Google OAuth • ' : ''}${acc.handle || acc.email ? `${escapeHtml(acc.handle || acc.email)} • ` : ''}♥ ${acc.syncedLikedCount}, ${acc.syncedPlaylistsCount} плейлистов`
-                  : 'Прямой вход Google OAuth, закладка Safari, Takeout'
-              }</div>
+              <div class="setting-label">${acc ? escapeHtml(acc.name) : 'Войти в аккаунт'}</div>
+              <div class="setting-sub">${escapeHtml(accSub)}</div>
             </div>
           </div>
-          <span class="setting-value">${acc ? 'Управлять ›' : 'Войти ›'}</span>
+          <span class="setting-value">${acc ? 'Профиль ›' : 'Войти ›'}</span>
         </button>
       </div>
 
@@ -2391,14 +2399,15 @@ class SonoraApp {
         e.preventDefault();
         const rawText = document.getElementById('yt-playlist-url')?.value || '';
         this.handleBatchLinksImport(rawText);
-      } else if (e.target.id === 'yt-import-form') {
+      } else if (e.target.id === 'account-youtube-form') {
         e.preventDefault();
-        const rawText = document.getElementById('yt-import-json')?.value || '';
-        this.handleExternalYouTubeImportText(rawText);
-      } else if (e.target.id === 'google-oauth-form') {
+        const rawChannel = document.getElementById('account-yt-channel')?.value?.trim() || '';
+        this.signInWithYouTubeChannel(rawChannel);
+      } else if (e.target.id === 'account-profile-form') {
         e.preventDefault();
-        const rawClientId = document.getElementById('google-client-id-input')?.value?.trim() || '';
-        this.startGoogleOAuthFlow(rawClientId);
+        const name = document.getElementById('account-profile-name')?.value?.trim() || '';
+        const email = document.getElementById('account-profile-email')?.value?.trim() || '';
+        this.signInWithLocalProfile(name, email);
       } else if (e.target.id === 'catalog-sources-form') {
         e.preventDefault();
         const customApiBaseUrl = document.getElementById('custom-api-url')?.value?.trim() || '';
@@ -2428,14 +2437,6 @@ class SonoraApp {
       } else {
         await this.finishBackupImport(text);
       }
-    });
-
-    document.getElementById('yt-import-file-input')?.addEventListener('change', async (e) => {
-      const file = e.target.files?.[0];
-      e.target.value = '';
-      if (!file) return;
-      const text = await file.text();
-      await this.handleExternalYouTubeImportText(text, file.name);
     });
 
     document.addEventListener('click', (e) => {
@@ -2894,21 +2895,28 @@ class SonoraApp {
       } else if (action === 'test-catalog-health') {
         this.testCatalogHealthFromModal();
       } else if (action === 'open-yt-account') {
-        this.openYouTubeImportModal();
-      } else if (action === 'sync-google-oauth') {
-        this.syncActiveGoogleOAuthAccount();
-      } else if (action === 'copy-oauth-redirect-uri') {
-        const uri = btn.dataset.uri || getOAuthRedirectUri();
-        navigator.clipboard?.writeText(uri).then(() => {
-          this.showToast('Redirect URI скопирован');
-        });
+        this.state.accountShowAddForm = false;
+        this.state.accountStatusMsg = '';
+        this.openAccountModal();
+      } else if (action === 'set-account-tab') {
+        this.state.accountModalTab = btn.dataset.accountTab === 'profile' ? 'profile' : 'youtube';
+        this.state.accountStatusMsg = '';
+        this.openAccountModal();
+      } else if (action === 'toggle-add-account') {
+        this.state.accountShowAddForm = !this.state.accountShowAddForm;
+        this.state.accountStatusMsg = '';
+        this.openAccountModal();
+      } else if (action === 'sync-active-account') {
+        this.syncActiveAccount();
       } else if (action === 'switch-yt-account') {
         this.storage.switchAccount(btn.dataset.accountId).then(() => {
+          this.state.accountShowAddForm = false;
+          this.state.accountStatusMsg = '';
           this.render();
           if (!document.getElementById('modal-backdrop')?.classList.contains('hidden')) {
-            this.openYouTubeImportModal();
+            this.openAccountModal();
           }
-          this.showToast(`Профиль: ${this.storage.activeAccount?.name || 'YouTube Music'}`);
+          this.showToast(`Аккаунт: ${this.storage.activeAccount?.name || 'Sonora'}`);
         });
       } else if (action === 'remove-current-account') {
         const acc = this.storage.accounts.find((a) => a.id === btn.dataset.accountId);
@@ -2916,20 +2924,12 @@ class SonoraApp {
           revokeGoogleOAuthToken(acc.accessToken).catch(() => {});
         }
         this.storage.removeAccount(btn.dataset.accountId).then(() => {
+          this.state.accountShowAddForm = false;
+          this.state.accountStatusMsg = '';
           this.closeModal();
           this.render();
-          this.showToast('Вы вышли из аккаунта, профиль удалён');
+          this.showToast('Вы вышли из аккаунта');
         });
-      } else if (action === 'copy-yt-bookmarklet') {
-        navigator.clipboard?.writeText(YOUTUBE_EXPORT_BOOKMARKLET).then(() => {
-          this.showToast('Закладка скопирована! Создайте закладку в Safari и вставьте код в URL.');
-        });
-      } else if (action === 'copy-yt-export-snippet') {
-        navigator.clipboard?.writeText(YOUTUBE_DIRECT_EXPORT_SNIPPET).then(() => {
-          this.showToast('Скрипт скопирован! Выполните его на вкладке music.youtube.com');
-        });
-      } else if (action === 'choose-yt-import-file') {
-        document.getElementById('yt-import-file-input')?.click();
       } else if (action === 'export-backup') {
         this.handleBackupExport();
       } else if (action === 'import-backup') {
@@ -3440,51 +3440,113 @@ class SonoraApp {
     this.openCatalogSourcesModal();
   }
 
-  openYouTubeImportModal() {
+  openAccountModal() {
     this.openModal(
-      buildYouTubeImportModalHtml({
+      buildAccountAuthModalHtml({
         activeAccount: this.storage.activeAccount,
         accounts: this.storage.accounts,
-        googleClientId: this.storage.settings.googleClientId || '',
-        redirectUri: getOAuthRedirectUri(),
-        statusMessage: this.state.ytModalStatusMsg
+        tab: this.state.accountModalTab,
+        showAddForm: this.state.accountShowAddForm,
+        loading: this.state.accountLoading,
+        statusMessage: this.state.accountStatusMsg
       })
     );
   }
 
-  async startGoogleOAuthFlow(rawClientId) {
-    const cleanId = String(rawClientId || '').trim();
-    if (!isValidGoogleClientId(cleanId)) {
-      this.showToast('Введите корректный Google OAuth Client ID (вида 12345-xxx.apps.googleusercontent.com)');
+  async signInWithYouTubeChannel(rawInput) {
+    const clean = String(rawInput || '').trim();
+    if (!clean) {
+      this.showToast('Введите @никнейм или ссылку на канал YouTube');
       return;
     }
-    await this.storage.updateSettings({ googleClientId: cleanId });
 
-    let authUrl = '';
+    this.state.accountLoading = true;
+    this.state.accountStatusMsg = 'Подключаем канал YouTube…';
+    this.openAccountModal();
+
     try {
-      authUrl = buildGoogleOAuthUrl({ clientId: cleanId });
+      const resolved = await this.api.resolveYouTubeChannelAccount(clean);
+      const playlists = Array.isArray(resolved.playlists) ? resolved.playlists : [];
+      for (const pl of playlists) {
+        await this.storage.mergePlaylist(pl.name, pl.description, pl.tracks, pl.id);
+      }
+
+      await this.storage.upsertAccount({
+        id: resolved.account.id,
+        name: resolved.account.name,
+        handle: resolved.account.handle,
+        avatarUrl: resolved.account.avatarUrl,
+        channelUrl: resolved.account.channelUrl,
+        authType: 'youtube_channel',
+        lastSyncTimestamp: Date.now(),
+        syncedPlaylistsCount: playlists.length
+      });
+
+      this.state.accountLoading = false;
+      this.state.accountShowAddForm = false;
+      this.state.accountStatusMsg = '';
+      this.closeModal();
+      this.render();
+      this.showToast(
+        playlists.length > 0
+          ? `Вход выполнен: ${resolved.account.name} (${playlists.length} плейлистов)`
+          : `Вход выполнен: ${resolved.account.name}`
+      );
     } catch (err) {
-      this.showToast(err?.message || 'Не удалось сформировать ссылку входа Google');
+      this.state.accountLoading = false;
+      this.state.accountStatusMsg = formatUserErrorRu(err, 'Не удалось найти канал YouTube');
+      this.openAccountModal();
+      this.showToast(this.state.accountStatusMsg);
+    }
+  }
+
+  async signInWithLocalProfile(rawName, rawEmail = '') {
+    const name = String(rawName || '').trim().slice(0, 80);
+    if (!name) {
+      this.showToast('Введите имя или ник');
+      return;
+    }
+    const email = String(rawEmail || '').trim().slice(0, 120);
+    const slug = name.toLowerCase().replace(/[^a-zа-яё0-9]+/gi, '_').slice(0, 32) || 'user';
+    const id = email ? `profile_${email.toLowerCase()}` : `profile_${slug}_${Date.now()}`;
+
+    await this.storage.upsertAccount({
+      id,
+      name,
+      email,
+      authType: 'local',
+      lastSyncTimestamp: Date.now()
+    });
+
+    this.state.accountShowAddForm = false;
+    this.state.accountStatusMsg = '';
+    this.closeModal();
+    this.render();
+    this.showToast(`Добро пожаловать, ${name}!`);
+  }
+
+  async syncActiveAccount() {
+    const acc = this.storage.activeAccount;
+    if (!acc) return;
+
+    if (acc.authType === 'google_oauth' && acc.accessToken) {
+      await this.syncActiveGoogleOAuthAccount();
       return;
     }
 
-    const isStandalone =
-      window.matchMedia?.('(display-mode: standalone)').matches || window.navigator?.standalone === true;
-    if (!isStandalone) {
-      const popup = window.open(authUrl, 'sonora_google_oauth', 'width=480,height=640');
-      if (popup && !popup.closed) {
-        this.state.ytModalStatusMsg = 'Ожидаем подтверждение входа в окне Google…';
-        this.openYouTubeImportModal();
-        return;
+    if (acc.authType === 'youtube_channel') {
+      const target = acc.channelUrl || acc.handle || acc.name;
+      if (target) {
+        await this.signInWithYouTubeChannel(target);
       }
     }
-    window.location.href = authUrl;
   }
 
   async completeGoogleOAuthLogin(accessToken, expiresAt = Date.now() + 3600_000) {
-    this.state.ytModalStatusMsg = 'Синхронизируем аккаунт YouTube Music…';
+    this.state.accountLoading = true;
+    this.state.accountStatusMsg = 'Обновляем плейлисты из Google…';
     if (!document.getElementById('modal-backdrop')?.classList.contains('hidden')) {
-      this.openYouTubeImportModal();
+      this.openAccountModal();
     } else {
       this.showToast('Загружаем плейлисты и лайки из Google…');
     }
@@ -3506,28 +3568,29 @@ class SonoraApp {
         syncedPlaylistsCount: synced.playlists.length
       });
 
-      this.state.ytModalStatusMsg = '';
+      this.state.accountLoading = false;
+      this.state.accountStatusMsg = '';
       this.closeModal();
       this.render();
       this.showToast(
         `Вход выполнен: ${synced.account.name} (+${merged.likedAdded} лайков, ${synced.playlists.length} плейлистов)`
       );
     } catch (err) {
-      this.state.ytModalStatusMsg = err?.message || 'Ошибка синхронизации Google YouTube';
-      this.openYouTubeImportModal();
-      this.showToast(this.state.ytModalStatusMsg);
+      this.state.accountLoading = false;
+      this.state.accountStatusMsg = formatUserErrorRu(err, 'Ошибка синхронизации аккаунта');
+      this.openAccountModal();
+      this.showToast(this.state.accountStatusMsg);
     }
   }
 
   async syncActiveGoogleOAuthAccount() {
     const acc = this.storage.activeAccount;
     if (!acc || acc.authType !== 'google_oauth' || !acc.accessToken) {
-      this.showToast('Сначала войдите через Google OAuth');
       return;
     }
     if (acc.tokenExpiresAt && acc.tokenExpiresAt <= Date.now() + 30_000) {
-      this.state.ytModalStatusMsg = 'Срок токена Google истёк. Нажмите «Войти через Google / YouTube».';
-      this.openYouTubeImportModal();
+      this.state.accountStatusMsg = 'Срок сессии Google истёк — войдите повторно.';
+      this.openAccountModal();
       return;
     }
     await this.completeGoogleOAuthLogin(acc.accessToken, acc.tokenExpiresAt);
@@ -3616,50 +3679,7 @@ class SonoraApp {
     }
   }
 
-  async handleExternalYouTubeImportText(rawText, fileName = '') {
-    try {
-      if (BackupCipher.isEncryptedBackup(rawText)) {
-        this.openDecryptBackupModal(rawText);
-        return;
-      }
 
-      const defaultName = fileName
-        ? fileName.replace(/\.(csv|json)$/i, '').slice(0, 80) || 'Импорт YouTube Music'
-        : 'Импорт YouTube Music';
-      const parsed = parseExternalYouTubeImport(rawText, defaultName);
-
-      if (parsed.kind === 'sonora_backup') {
-        const stats = await this.storage.importBackupObject(parsed.backup);
-        this.closeModal();
-        this.render();
-        this.showToast(`Импортировано: треков ${stats.tracksRestored}, плейлистов ${stats.playlistsRestored}`);
-        return;
-      }
-
-      const merged = await this._mergeYouTubeSyncResult(parsed);
-      if (parsed.account) {
-        await this.storage.upsertAccount({
-          id: parsed.account.id || parsed.account.email || parsed.account.handle || parsed.account.name,
-          name: parsed.account.name,
-          handle: parsed.account.handle,
-          email: parsed.account.email,
-          avatarUrl: parsed.account.avatarUrl,
-          lastSyncTimestamp: Date.now(),
-          syncedLikedCount: parsed.likedTracks.length,
-          syncedPlaylistsCount: parsed.playlists.length
-        });
-      }
-
-      this.state.ytModalStatusMsg = '';
-      this.closeModal();
-      this.render();
-      this.showToast(
-        `Импортировано: +${merged.likedAdded} лайков, ${parsed.playlists.length} плейлистов`
-      );
-    } catch (err) {
-      this.showToast(err?.message || 'Ошибка импорта данных YouTube Music');
-    }
-  }
 
   async _mergeYouTubeSyncResult(result) {
     let likedAdded = 0;

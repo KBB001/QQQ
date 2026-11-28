@@ -12,6 +12,7 @@ import {
   sanitizeHttpsUrl
 } from '../src/security.js';
 import {
+  extractChannelQuery,
   extractPlaylistId,
   extractVideoId,
   parseLrcLines,
@@ -20,6 +21,7 @@ import {
   selectBestIosAudioStream,
   SonoraApi
 } from '../src/api.js';
+import { buildAccountAuthModalHtml } from '../src/modals.js';
 import { SonoraOfflineManager, buildSafeAudioFilename, formatBytesRu } from '../src/offline.js';
 import {
   ImplicitSignalType,
@@ -1203,5 +1205,100 @@ test('buildSafeAudioFilename, SonoraOfflineManager partial cache cleanup, revoke
     globalThis.fetch = origFetch;
   }
 });
+
+test('extractChannelQuery & SonoraApi.resolveYouTubeChannelAccount resolve YouTube channel login cleanly', async () => {
+  const qHandle = extractChannelQuery('@LofiGirl');
+  assert.equal(qHandle?.kind, 'handle');
+  assert.equal(qHandle?.pipedPath, '/@LofiGirl');
+
+  const qUrl = extractChannelQuery('https://www.youtube.com/@SonoraMusic/playlists');
+  assert.equal(qUrl?.kind, 'handle');
+  assert.equal(qUrl?.handle, '@SonoraMusic');
+
+  const qCid = extractChannelQuery('https://music.youtube.com/channel/UC1234567890123456789012');
+  assert.equal(qCid?.kind, 'channelId');
+  assert.equal(qCid?.channelId, 'UC1234567890123456789012');
+
+  const qPl = extractChannelQuery('https://music.youtube.com/playlist?list=PLabcdef12345');
+  assert.equal(qPl?.kind, 'playlistId');
+  assert.equal(qPl?.playlistId, 'PLabcdef12345');
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url) => {
+      const s = String(url);
+      if (s.startsWith('https://fast-ch.example.com/@SonoraMusic')) {
+        return new Response(
+          JSON.stringify({
+            id: 'UC1234567890123456789012',
+            name: 'Sonora Official',
+            avatarUrl: 'https://yt3.ggpht.com/avatar.jpg',
+            relatedStreams: [
+              { url: '/watch?v=dQw4w9WgXcQ', title: 'Channel Track', uploaderName: 'Sonora Official', duration: 205 }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('err', { status: 404 });
+    };
+
+    const api = new SonoraApi(() => ({ fastNodes: { piped: 'https://fast-ch.example.com' } }));
+    const res = await api.resolveYouTubeChannelAccount('https://youtube.com/@SonoraMusic');
+    assert.equal(res.account.authType, 'youtube_channel');
+    assert.equal(res.account.name, 'Sonora Official');
+    assert.equal(res.account.handle, '@SonoraMusic');
+    assert.equal(res.account.channelUrl, '/channel/UC1234567890123456789012');
+    assert.equal(res.tracks.length, 1);
+    assert.equal(res.playlists.length, 1);
+    assert.equal(res.playlists[0].tracks[0].id, 'dQw4w9WgXcQ');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('buildAccountAuthModalHtml renders clean login & profile UI without developer clutter, and SonoraStorage persists profiles', async () => {
+  const signedOutHtml = buildAccountAuthModalHtml({ activeAccount: null, accounts: [], tab: 'youtube' });
+  assert.ok(signedOutHtml.includes('Вход в аккаунт'));
+  assert.ok(signedOutHtml.includes('account-youtube-form'));
+  assert.ok(!signedOutHtml.includes('Client ID'));
+  assert.ok(!signedOutHtml.includes('Bookmarklet'));
+  assert.ok(!signedOutHtml.includes('скрипт для консоли'));
+  assert.ok(!signedOutHtml.includes('Takeout'));
+
+  const profileTabHtml = buildAccountAuthModalHtml({ activeAccount: null, accounts: [], tab: 'profile' });
+  assert.ok(profileTabHtml.includes('account-profile-form'));
+  assert.ok(profileTabHtml.includes('Войти в профиль'));
+
+  const storage = new SonoraStorage();
+  await storage.init();
+  await storage.upsertAccount({
+    id: 'yt_UC123',
+    name: 'My YT Channel',
+    handle: '@mychannel',
+    channelUrl: '/channel/UC123',
+    authType: 'youtube_channel'
+  });
+  await storage.upsertAccount({
+    id: 'profile_alex',
+    name: 'Алексей',
+    email: 'alex@example.com',
+    authType: 'local'
+  });
+
+  const signedInHtml = buildAccountAuthModalHtml({
+    activeAccount: storage.activeAccount,
+    accounts: storage.accounts
+  });
+  assert.ok(signedInHtml.includes('account-profile-card'));
+  assert.ok(signedInHtml.includes('Алексей'));
+  assert.ok(signedInHtml.includes('Выйти из аккаунта'));
+
+  await storage.switchAccount('yt_UC123');
+  assert.equal(storage.activeAccount.channelUrl, '/channel/UC123');
+  await storage.removeAccount('yt_UC123');
+  assert.equal(storage.activeAccount.id, 'profile_alex');
+});
+
 
 

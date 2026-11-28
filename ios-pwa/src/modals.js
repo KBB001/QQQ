@@ -1,121 +1,6 @@
 import { VERSION_LABELS_RU } from './recommendations.js';
 import { escapeHtml } from './security.js';
 
-export const YOUTUBE_DIRECT_EXPORT_SNIPPET = `(async () => {
-  if (!location.hostname.includes('youtube.com')) {
-    alert('Откройте music.youtube.com под своим аккаунтом и запустите скрипт там.');
-    return;
-  }
-  const cookieMap = Object.fromEntries(
-    document.cookie.split(';').map((p) => {
-      const i = p.indexOf('=');
-      return i > 0 ? [p.slice(0, i).trim(), p.slice(i + 1).trim()] : ['', ''];
-    })
-  );
-  const sapisid = cookieMap['__Secure-3PAPISID'] || cookieMap['SAPISID'] || '';
-  if (!sapisid) {
-    alert('Войдите в свой аккаунт на music.youtube.com и повторите запуск.');
-    return;
-  }
-  const origin = 'https://music.youtube.com';
-  const ts = Math.floor(Date.now() / 1000);
-  const msg = ts + ' ' + sapisid + ' ' + origin;
-  const buf = await crypto.subtle.digest('SHA-1', new TextEncoder().encode(msg));
-  const hash = Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, '0')).join('');
-  const auth = 'SAPISIDHASH ' + ts + '_' + hash;
-  const ytPost = async (ep, body) => {
-    const r = await fetch(origin + '/youtubei/v1/' + ep + '?prettyPrint=false', {
-      method: 'POST',
-      credentials: 'include',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': auth,
-        'X-Origin': origin,
-        'X-Goog-AuthUser': '0'
-      },
-      body: JSON.stringify({
-        context: { client: { clientName: 'WEB_REMIX', clientVersion: '1.20250201.01.00', hl: 'ru', gl: 'RU' } },
-        ...body
-      })
-    });
-    return r.json();
-  };
-  const txt = (obj) => (obj?.runs || []).map((x) => x.text).join('') || obj?.simpleText || '';
-  const walk = (root, fn) => {
-    if (!root || typeof root !== 'object') return;
-    fn(root);
-    if (Array.isArray(root)) root.forEach((x) => walk(x, fn));
-    else Object.values(root).forEach((v) => walk(v, fn));
-  };
-  const extractTracks = (json) => {
-    const map = new Map();
-    walk(json, (node) => {
-      const m = node.musicResponsiveListItemRenderer || node.playlistVideoRenderer;
-      if (!m) return;
-      const vid = m.playlistItemData?.videoId || m.overlay?.musicItemThumbnailOverlayRenderer?.content?.musicPlayButtonRenderer?.playNavigationEndpoint?.watchEndpoint?.videoId || m.videoId;
-      if (!vid || map.has(vid)) return;
-      const cols = m.flexColumns || [];
-      const title = txt(cols[0]?.musicResponsiveListItemFlexColumnRenderer?.text) || txt(m.title) || ('Track ' + vid);
-      const artist = txt(cols[1]?.musicResponsiveListItemFlexColumnRenderer?.text)?.split('•')[0]?.trim() || 'YouTube Music';
-      const thumbs = m.thumbnail?.musicThumbnailRenderer?.thumbnail?.thumbnails || m.thumbnail?.thumbnails || [];
-      const thumbnailUrl = thumbs[thumbs.length - 1]?.url || ('https://i.ytimg.com/vi/' + vid + '/hqdefault.jpg');
-      map.set(vid, { id: vid, title, artist, durationSeconds: 0, thumbnailUrl });
-    });
-    return Array.from(map.values());
-  };
-  const [accJson, likedJson, histJson, plsJson] = await Promise.all([
-    ytPost('account/account_menu', {}).catch(() => ({})),
-    ytPost('browse', { browseId: 'FEmusic_liked_videos' }).catch(() => ({})),
-    ytPost('browse', { browseId: 'FEmusic_history' }).catch(() => ({})),
-    ytPost('browse', { browseId: 'FEmusic_liked_playlists' }).catch(() => ({}))
-  ]);
-  let account = { id: 'yt_export', name: 'YouTube Music', handle: '', email: '', avatarUrl: '' };
-  walk(accJson, (n) => {
-    if (n.activeAccountHeaderRenderer) {
-      const h = n.activeAccountHeaderRenderer;
-      account = {
-        id: txt(h.channelHandle) || txt(h.accountName) || 'yt_export',
-        name: txt(h.accountName) || 'YouTube Music',
-        handle: txt(h.channelHandle) || '',
-        email: txt(h.email) || '',
-        avatarUrl: h.accountPhoto?.thumbnails?.[0]?.url || ''
-      };
-    }
-  });
-  const plItems = [];
-  walk(plsJson, (n) => {
-    const r = n.musicTwoRowItemRenderer;
-    const bid = r?.navigationEndpoint?.browseEndpoint?.browseId;
-    if (bid && (bid.startsWith('VL') || bid.startsWith('MPRE')) && !plItems.some((p) => p.browseId === bid)) {
-      plItems.push({ browseId: bid, id: bid.replace(/^VL/, ''), name: txt(r.title) || 'Плейлист' });
-    }
-  });
-  const playlists = [];
-  for (const pl of plItems.slice(0, 15)) {
-    const d = await ytPost('browse', { browseId: pl.browseId }).catch(() => ({}));
-    playlists.push({ id: pl.id, name: pl.name, description: 'YouTube Music', tracks: extractTracks(d) });
-  }
-  const payload = JSON.stringify({
-    format: 'sonora-yt-sync:v1',
-    exportedAt: Date.now(),
-    account,
-    likedTracks: extractTracks(likedJson),
-    historyTracks: extractTracks(histJson),
-    playlists
-  }, null, 2);
-  const blob = new Blob([payload], { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = 'sonora-yt-library.json';
-  a.click();
-  try { await navigator.clipboard.writeText(payload); } catch {}
-  alert('Готово! Файл sonora-yt-library.json скачан (и скопирован в буфер). Откройте Sonora и загрузите его.');
-})();`;
-
-export const YOUTUBE_EXPORT_BOOKMARKLET = `javascript:${encodeURIComponent(
-  YOUTUBE_DIRECT_EXPORT_SNIPPET.replace(/\s*\n\s*/g, ' ').trim()
-)}`;
-
 export function buildCreatePlaylistModalHtml() {
   return `
     <h3 class="modal-title">Новый плейлист</h3>
@@ -402,90 +287,103 @@ export function buildMixPreviewModalHtml(mix, getSafeThumb) {
   `;
 }
 
-export function buildYouTubeImportModalHtml({
+export function buildAccountAuthModalHtml({
   activeAccount,
-  accounts,
-  googleClientId = '',
-  redirectUri = '',
-  statusMessage
-}) {
+  accounts = [],
+  tab = 'youtube',
+  showAddForm = false,
+  loading = false,
+  statusMessage = ''
+} = {}) {
+  const hasAccount = Boolean(activeAccount?.id);
   const acc = activeAccount || {};
-  const hasOAuth = acc.authType === 'google_oauth' && Boolean(acc.accessToken);
-  const tokenValid = hasOAuth && (!acc.tokenExpiresAt || acc.tokenExpiresAt > Date.now() + 60_000);
-  return `
-    <h3 class="modal-title">Аккаунт YouTube и импорт</h3>
-    <p class="modal-desc">
-      Прямой вход через Google OAuth в браузере (без своего сервера) и быстрый мобильный импорт через закладку Safari.
-    </p>
-    ${
-      accounts.length > 0
-        ? `<div class="account-pills-row">
-            ${accounts
-              .map(
-                (a) => `
-              <button type="button" class="chip-btn ${a.id === acc.id ? 'active' : ''}" data-action="switch-yt-account" data-account-id="${escapeHtml(a.id)}">
-                ${escapeHtml(a.name)}
+  const activeTab = tab === 'profile' ? 'profile' : 'youtube';
+  const initials = (acc.name || 'S').trim().charAt(0).toUpperCase() || 'S';
+  const canSyncYouTube = acc.authType === 'youtube_channel' || acc.authType === 'google_oauth';
+  const typeBadge =
+    acc.authType === 'youtube_channel'
+      ? 'YouTube канал'
+      : acc.authType === 'google_oauth'
+        ? 'Google аккаунт'
+        : 'Профиль Sonora';
+  const metaSub = acc.handle || acc.email || typeBadge;
+
+  const profileCardHtml = hasAccount
+    ? `<div class="account-profile-card">
+         ${
+           acc.avatarUrl
+             ? `<img src="${escapeHtml(acc.avatarUrl)}" alt="" class="account-avatar-lg" />`
+             : `<div class="account-avatar-lg account-avatar-fallback">${escapeHtml(initials)}</div>`
+         }
+         <div class="account-profile-meta">
+           <div class="account-profile-name">${escapeHtml(acc.name)}</div>
+           <div class="account-profile-sub">${escapeHtml(metaSub)}</div>
+           <span class="status-pill ok">${escapeHtml(typeBadge)}</span>
+         </div>
+       </div>
+       ${
+         accounts.length > 1
+           ? `<div class="account-pills-row">
+                ${accounts
+                  .map(
+                    (a) => `
+                  <button type="button" class="chip-btn ${a.id === acc.id ? 'active' : ''}" data-action="switch-yt-account" data-account-id="${escapeHtml(a.id)}">
+                    ${escapeHtml(a.name)}
+                  </button>`
+                  )
+                  .join('')}
+              </div>`
+           : ''
+       }
+       ${
+         canSyncYouTube
+           ? `<button type="button" class="btn-primary-full" data-action="sync-active-account" ${loading ? 'disabled' : ''}>
+                ${loading ? 'Обновляем…' : 'Обновить плейлисты из YouTube'}
               </button>`
-              )
-              .join('')}
-          </div>`
+           : ''
+       }
+       <button type="button" class="btn-secondary-full" data-action="toggle-add-account">
+         ${showAddForm ? 'Скрыть форму входа' : 'Добавить другой аккаунт'}
+       </button>`
+    : '';
+
+  const formHtml =
+    !hasAccount || showAddForm
+      ? `<div class="segmented-control cols-2 ${hasAccount ? 'mt-12' : ''}">
+           <button type="button" class="seg-btn ${activeTab === 'youtube' ? 'active' : ''}" data-action="set-account-tab" data-account-tab="youtube">YouTube</button>
+           <button type="button" class="seg-btn ${activeTab === 'profile' ? 'active' : ''}" data-action="set-account-tab" data-account-tab="profile">Профиль</button>
+         </div>
+         ${
+           activeTab === 'youtube'
+             ? `<form id="account-youtube-form" class="mt-8">
+                  <label class="field-label" for="account-yt-channel">Канал YouTube или @никнейм</label>
+                  <input id="account-yt-channel" class="ios-field" type="text" placeholder="@username или https://youtube.com/@..." required autocomplete="username" />
+                  <p class="modal-desc">Укажите ваш @handle, название или ссылку на канал — подтянутся профиль и открытые плейлисты.</p>
+                  <button type="submit" class="btn-primary-full" ${loading ? 'disabled' : ''}>
+                    ${loading ? 'Входим…' : 'Войти через YouTube'}
+                  </button>
+                </form>`
+             : `<form id="account-profile-form" class="mt-8">
+                  <label class="field-label" for="account-profile-name">Имя или ник</label>
+                  <input id="account-profile-name" class="ios-field" type="text" placeholder="Например: Алексей" required autocomplete="name" />
+                  <label class="field-label" for="account-profile-email">Email (необязательно)</label>
+                  <input id="account-profile-email" class="ios-field" type="email" placeholder="name@example.com" autocomplete="email" />
+                  <button type="submit" class="btn-primary-full">Войти в профиль</button>
+                </form>`
+         }`
+      : '';
+
+  return `
+    <h3 class="modal-title">${hasAccount ? 'Аккаунт' : 'Вход в аккаунт'}</h3>
+    ${!hasAccount ? '<p class="modal-desc">Войдите через канал YouTube или создайте личный профиль Sonora.</p>' : ''}
+    ${statusMessage ? `<div class="modal-status-msg">${escapeHtml(statusMessage)}</div>` : ''}
+    ${profileCardHtml}
+    ${formHtml}
+    ${
+      hasAccount
+        ? `<button type="button" class="btn-danger-full" data-action="remove-current-account" data-account-id="${escapeHtml(acc.id)}">Выйти из аккаунта</button>`
         : ''
     }
-    ${statusMessage ? `<div class="modal-status-msg">${escapeHtml(statusMessage)}</div>` : ''}
-
-    <div class="helper-box">
-      <div class="helper-title">1. Прямой вход через аккаунт Google / YouTube</div>
-      ${
-        hasOAuth
-          ? `<div class="status-inline ${tokenValid ? 'ok' : 'warn'}">
-               ${tokenValid ? `Подключён: ${escapeHtml(acc.name || acc.email || 'Google')}` : 'Срок сессии истёк — войдите повторно'}
-             </div>
-             ${
-               tokenValid
-                 ? `<button type="button" class="btn-primary-full mt-8" data-action="sync-google-oauth">Синхронизировать плейлисты сейчас</button>`
-                 : ''
-             }`
-          : ''
-      }
-      <form id="google-oauth-form" class="mt-8">
-        <label class="field-label" for="google-client-id-input">Google OAuth Client ID (Web)</label>
-        <input id="google-client-id-input" class="ios-field" type="text" placeholder="1234567890-xxxx.apps.googleusercontent.com" value="${escapeHtml(googleClientId)}" />
-        <button type="submit" class="btn-primary-full">${hasOAuth ? 'Войти / Сменить аккаунт Google' : 'Войти через Google / YouTube'}</button>
-      </form>
-      <details class="oauth-guide-details mt-8">
-        <summary>Как за 1 минуту создать свой Client ID (бесплатно)</summary>
-        <p class="modal-desc mt-8">
-          1. Откройте Google Cloud Console → APIs &amp; Services → Credentials → Create OAuth Client ID (тип <b>Web application</b>).<br/>
-          2. Включите <b>YouTube Data API v3</b> и добавьте ваш Redirect URI ниже в <b>Authorized redirect URIs</b> и origin сайта в <b>Authorized JavaScript origins</b>.<br/>
-          3. Вставьте Client ID выше и нажмите «Войти через Google / YouTube».
-        </p>
-        ${
-          redirectUri
-            ? `<div class="oauth-uri-box">${escapeHtml(redirectUri)}</div>
-               <button type="button" class="btn-secondary-full" data-action="copy-oauth-redirect-uri" data-uri="${escapeHtml(redirectUri)}">Скопировать Redirect URI</button>`
-            : ''
-        }
-      </details>
-    </div>
-
-    <div class="helper-box">
-      <div class="helper-title">2. Закладка Safari (iPhone) и импорт по ссылкам</div>
-      <p class="modal-desc">
-        Не требует Client ID: импортирует даже приватные миксы и историю из <b>music.youtube.com</b> через закладку или по ссылкам на плейлисты.
-      </p>
-      <button type="button" class="btn-primary-full" data-action="open-import-yt-playlist">Импорт по ссылкам (пакетно)</button>
-      <button type="button" class="btn-secondary-full" data-action="copy-yt-bookmarklet">Скопировать закладку (Bookmarklet) для iPhone</button>
-      <button type="button" class="btn-secondary-full" data-action="copy-yt-export-snippet">Скопировать скрипт для консоли (ПК)</button>
-    </div>
-
-    <form id="yt-import-form">
-      <label class="field-label" for="yt-import-json">3. Вставить JSON / CSV Google Takeout или .sonoraenc</label>
-      <textarea id="yt-import-json" class="ios-field ios-textarea" placeholder="Вставьте содержимое sonora-yt-library.json, watch-history.json или CSV из Google Takeout..."></textarea>
-      <button type="submit" class="btn-primary-full">Импортировать вставленный текст</button>
-    </form>
-
-    <button type="button" class="btn-secondary-full" data-action="choose-yt-import-file">Выбрать файл (.json, .csv Takeout, .sonoraenc)</button>
-    ${acc.id ? `<button type="button" class="btn-danger-full" data-action="remove-current-account" data-account-id="${escapeHtml(acc.id)}">Выйти из аккаунта и удалить профиль «${escapeHtml(acc.name)}»</button>` : ''}
     <button type="button" class="btn-secondary-full" data-action="close-modal">Закрыть</button>
   `;
 }
