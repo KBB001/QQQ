@@ -55,15 +55,19 @@ export class SonoraPlayer {
     this.activeSourceKey = null;
     this.failedGateways = new Set();
     this.extractorRetries = 0;
-    this.maxExtractorRetries = 3;
+    this.maxExtractorRetries = 5;
     this._consecutiveTrackErrors = 0;
     this._trackLoadSeq = 0;
+    this._realSrcSeq = 0;
+    this._ignoreErrorsForSeq = -1;
+    this._isRecoveringError = false;
     this._pendingSeekSeconds = 0;
     this._lastSaveAt = 0;
 
     this._activeSession = null;
     this._silentWavUrl = '';
     this._primingSilentAudio = false;
+    this._audioUnlocked = false;
     this._prefetchedOfflineUrls = new Map();
     this._prefetchSeq = 0;
     this._nextShuffleIndex = -1;
@@ -257,20 +261,26 @@ export class SonoraPlayer {
   /** Must be called synchronously inside click/tap handler to unlock iOS Safari background audio */
   unlockGesture({ forcePrime = false } = {}) {
     this._ensurePlaybackAudioSession();
+    const silentUrl = this._getSilentWavUrl();
+    if (this._audioUnlocked) return;
     try {
-      if (this.audio.paused && (!this.audio.src || forcePrime)) {
-        const silentUrl = this._getSilentWavUrl();
+      if (this.audio.paused && !this.audio.src && (forcePrime || !this._audioUnlocked)) {
         if (silentUrl) {
           this._primingSilentAudio = true;
           this.audio.src = silentUrl;
           const p = this.audio.play?.();
-          if (p && typeof p.catch === 'function') {
-            p.catch(() => {
+          if (p && typeof p.then === 'function') {
+            p.then(() => {
+              this._audioUnlocked = true;
+            }).catch(() => {
               this._primingSilentAudio = false;
             });
+          } else {
+            this._audioUnlocked = true;
           }
         } else {
           this.audio.load?.();
+          this._audioUnlocked = true;
         }
       }
     } catch {
@@ -289,6 +299,22 @@ export class SonoraPlayer {
     this.failedGateways = new Set();
     this.extractorRetries = 0;
     this._pendingSeekSeconds = 0;
+    this._isRecoveringError = false;
+  }
+
+  _assignAudioSrc(url) {
+    this._ignoreErrorsForSeq = this._realSrcSeq;
+    try {
+      if (this.audio.src && !this.audio.paused) {
+        this.audio.pause();
+      }
+    } catch {
+      // Ignore
+    }
+    this._realSrcSeq += 1;
+    this._primingSilentAudio = false;
+    this.audio.src = url;
+    this.audio.playbackRate = this.playbackSpeed;
   }
 
   _isSilentPrimerEvent() {
@@ -323,9 +349,9 @@ export class SonoraPlayer {
     const onActivePlay = () => {
       if (this._isSilentPrimerEvent()) return;
       this._ensurePlaybackAudioSession();
+      this._audioUnlocked = true;
       this.isPlaying = true;
       this.isBuffering = false;
-      this._consecutiveTrackErrors = 0;
       if (this._activeSession && this.currentTrack?.id === this._activeSession.track?.id) {
         this._activeSession.lastActiveTickAt = Date.now();
         if (!this._activeSession.playCounted) {
@@ -365,7 +391,6 @@ export class SonoraPlayer {
     this.audio.addEventListener('canplay', () => {
       if (this._isSilentPrimerEvent()) return;
       this.isBuffering = false;
-      this._consecutiveTrackErrors = 0;
       this._emit();
     });
 
@@ -382,14 +407,19 @@ export class SonoraPlayer {
       if (Number.isFinite(this.audio.duration) && this.audio.duration > 0) {
         this.duration = this.audio.duration;
       }
-      if (this._pendingSeekSeconds > 0) {
+      if (
+        this._pendingSeekSeconds > 0 &&
+        (!Number.isFinite(this.audio.duration) ||
+          this.audio.duration <= 0 ||
+          this._pendingSeekSeconds < this.audio.duration - 1)
+      ) {
         try {
           this.audio.currentTime = this._pendingSeekSeconds;
         } catch {
           // Ignore seek before ready
         }
-        this._pendingSeekSeconds = 0;
       }
+      this._pendingSeekSeconds = 0;
       this.audio.playbackRate = this.playbackSpeed;
       this._updatePositionState();
       this._emit();
@@ -408,6 +438,9 @@ export class SonoraPlayer {
           this._activeSession.listenedMs += delta;
         }
         this._activeSession.lastActiveTickAt = now;
+        if (this._activeSession.listenedMs >= 5000 || this.currentTime >= 5) {
+          this._consecutiveTrackErrors = 0;
+        }
       }
       if (now - this._lastSaveAt > 5000) {
         this._lastSaveAt = now;
@@ -422,6 +455,22 @@ export class SonoraPlayer {
         this._primingSilentAudio = false;
         return;
       }
+      if (!this.currentTrack || !this.audio.src) return;
+
+      // Guard against a premature/truncated stub stream (< 2.5s when track is >= 10s)
+      const audioDur = Number(this.audio.duration);
+      const expectedDur = Number(this.currentTrack?.durationSeconds) || 0;
+      if (
+        Number.isFinite(audioDur) &&
+        audioDur > 0 &&
+        audioDur < 2.5 &&
+        expectedDur > 10 &&
+        (this._activeSession?.listenedMs || 0) < 3000
+      ) {
+        await this._handleAudioError();
+        return;
+      }
+
       this.isPlaying = false;
       const finished = this.currentTrack;
       await this._finalizeListeningSession('ended');
@@ -444,11 +493,15 @@ export class SonoraPlayer {
         this._primingSilentAudio = false;
         return;
       }
+      if (!this.audio.src || this._ignoreErrorsForSeq === this._realSrcSeq) {
+        return;
+      }
       await this._handleAudioError();
     });
   }
 
   async _handleAudioError() {
+    if (this._isRecoveringError) return;
     const track = this.currentTrack;
     if (!track || !this.audio.src || this.isOfflineSource) {
       this.isBuffering = false;
@@ -457,87 +510,101 @@ export class SonoraPlayer {
       return;
     }
 
+    this._isRecoveringError = true;
     const seq = this._trackLoadSeq;
 
-    // 1. Try next URL candidate from the same extractor
-    if (this.candidateIndex + 1 < this.activeStreamCandidates.length) {
-      this.candidateIndex += 1;
-      const nextUrl = this.activeStreamCandidates[this.candidateIndex];
-      this.isBuffering = true;
-      this._pendingSeekSeconds = this.currentTime > 0 ? this.currentTime : 0;
-      this._emit();
-      this._primingSilentAudio = false;
-      this.audio.src = nextUrl;
-      this.audio.playbackRate = this.playbackSpeed;
-      try {
-        await this.audio.play();
-      } catch {
-        // Wait for subsequent error or abort cleanly
-      }
-      return;
-    }
-
-    // 2. All candidates from this gateway failed: exclude sourceKey and try next extractor silently
-    if (this.extractorRetries < this.maxExtractorRetries && !track.id.startsWith('aud:')) {
-      if (this.activeSourceKey) {
-        this.failedGateways.add(this.activeSourceKey);
-      }
-      this.extractorRetries += 1;
-      this.streamCache.delete(track.id);
-      this.isBuffering = true;
-      this._emit();
-
-      try {
-        const freshInfo = await this.api.getStreamInfo(track.id, this.storage.settings.audioQuality, {
-          excludeGateways: this.failedGateways
-        });
-        if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
-
-        const candidates =
-          Array.isArray(freshInfo?.streamCandidates) && freshInfo.streamCandidates.length > 0
-            ? freshInfo.streamCandidates
-            : [freshInfo?.streamUrl].filter(Boolean);
-
-        if (candidates.length > 0) {
-          this.streamCache.set(track.id, { fetchedAt: Date.now(), info: freshInfo });
-          this.activeStreamCandidates = candidates;
-          this.candidateIndex = 0;
-          this.activeSourceKey = freshInfo.sourceKey || null;
-          this.sourceType = freshInfo.sourceType || 'audio';
-          this._pendingSeekSeconds = this.currentTime > 0 ? this.currentTime : 0;
-          this._primingSilentAudio = false;
-          this.audio.src = candidates[0];
-          this.audio.playbackRate = this.playbackSpeed;
-          this._emit();
+    try {
+      // 1. Try next URL candidate from the same extractor
+      if (this.candidateIndex + 1 < this.activeStreamCandidates.length) {
+        this.candidateIndex += 1;
+        const nextUrl = this.activeStreamCandidates[this.candidateIndex];
+        this.isBuffering = true;
+        this._pendingSeekSeconds = this.currentTime > 1 ? this.currentTime : 0;
+        this._emit();
+        this._assignAudioSrc(nextUrl);
+        try {
           await this.audio.play();
-          return;
+        } catch (err) {
+          if (err?.name === 'NotAllowedError') {
+            this.isPlaying = false;
+            this.isBuffering = false;
+            this._emit();
+          }
         }
-      } catch {
-        if (this._trackLoadSeq !== seq) return;
+        return;
       }
+
+      // 2. All candidates from this gateway failed: exclude sourceKey and try next extractor silently
+      if (this.extractorRetries < this.maxExtractorRetries && !track.id.startsWith('aud:')) {
+        if (this.activeSourceKey) {
+          this.failedGateways.add(this.activeSourceKey);
+        }
+        this.extractorRetries += 1;
+        this.streamCache.delete(track.id);
+        this.isBuffering = true;
+        this._emit();
+
+        try {
+          const freshInfo = await this.api.getStreamInfo(track.id, this.storage.settings.audioQuality, {
+            excludeGateways: this.failedGateways
+          });
+          if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
+
+          const candidates =
+            Array.isArray(freshInfo?.streamCandidates) && freshInfo.streamCandidates.length > 0
+              ? freshInfo.streamCandidates
+              : [freshInfo?.streamUrl].filter(Boolean);
+
+          if (candidates.length > 0) {
+            this.streamCache.set(track.id, { fetchedAt: Date.now(), info: freshInfo });
+            this.activeStreamCandidates = candidates;
+            this.candidateIndex = 0;
+            this.activeSourceKey = freshInfo.sourceKey || null;
+            this.sourceType = freshInfo.sourceType || 'audio';
+            this._pendingSeekSeconds = this.currentTime > 1 ? this.currentTime : 0;
+            this._assignAudioSrc(candidates[0]);
+            this._emit();
+            try {
+              await this.audio.play();
+            } catch (err) {
+              if (err?.name === 'NotAllowedError') {
+                this.isPlaying = false;
+                this.isBuffering = false;
+                this._emit();
+              }
+            }
+            return;
+          }
+        } catch {
+          if (this._trackLoadSeq !== seq) return;
+        }
+      }
+
+      // 3. Dead track in a multi-track queue -> skip cleanly at most once before pausing with error
+      this._consecutiveTrackErrors += 1;
+      const hasNext =
+        this.queue.length > 1 &&
+        (this.currentIndex + 1 < this.queue.length || this.repeatMode === 'ALL' || this.shuffleEnabled);
+
+      if (hasNext && this._consecutiveTrackErrors < 2) {
+        this._isRecoveringError = false;
+        this.onError?.(`Поток «${track.title}» недоступен — переключаем на следующий трек`);
+        await this.next(true);
+        return;
+      }
+
+      this.isBuffering = false;
+      this.isPlaying = false;
+      this._emit();
+      this.onError?.(
+        formatUserErrorRu(
+          null,
+          'Не удалось загрузить поток без рекламы. Попробуйте другой трек или проверьте источники в Настройках.'
+        )
+      );
+    } finally {
+      this._isRecoveringError = false;
     }
-
-    // 3. Dead track in a multi-track queue -> skip cleanly to next playable track
-    this._consecutiveTrackErrors += 1;
-    const hasNext =
-      this.queue.length > 1 &&
-      (this.currentIndex + 1 < this.queue.length || this.repeatMode === 'ALL' || this.shuffleEnabled);
-
-    if (hasNext && this._consecutiveTrackErrors < 3) {
-      this.onError?.(`Поток «${track.title}» недоступен — переключаем на следующий трек`);
-      await this.next(true);
-      return;
-    }
-
-    this.isBuffering = false;
-    this.isPlaying = false;
-    this._emit();
-    this.onError?.(
-      formatUserErrorRu(
-        null,
-        'Не удалось загрузить поток без рекламы. Попробуйте другой трек или проверьте источники в Настройках.'
-      )
-    );
   }
 
   _bindMediaSession() {
@@ -714,14 +781,25 @@ export class SonoraPlayer {
         this.activeStreamCandidates = [offlineUrl];
         this.candidateIndex = 0;
         this.activeSourceKey = 'offline';
-        this._primingSilentAudio = false;
-        this.audio.src = offlineUrl;
-        this.audio.playbackRate = this.playbackSpeed;
+        this._assignAudioSrc(offlineUrl);
         if (shouldPlay) {
-          await this.audio.play();
-          if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
-          this._consecutiveTrackErrors = 0;
-          await this._commitSessionStart(track, seq);
+          try {
+            await this.audio.play();
+            this._audioUnlocked = true;
+            if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
+            this._consecutiveTrackErrors = 0;
+            await this._commitSessionStart(track, seq);
+          } catch (playErr) {
+            if (playErr?.name === 'AbortError') return;
+            if (playErr?.name === 'NotAllowedError') {
+              this.isPlaying = false;
+              this.isBuffering = false;
+              this._emit();
+              await this._persistPlayback(true);
+              return;
+            }
+            throw playErr;
+          }
         }
         await this._persistPlayback(true);
         this.loadLyricsForCurrentTrack(track);
@@ -775,26 +853,39 @@ export class SonoraPlayer {
       this.activeStreamCandidates = candidates;
       this.candidateIndex = 0;
 
-      this._primingSilentAudio = false;
-      this.audio.src = candidates[0];
-      this.audio.playbackRate = this.playbackSpeed;
+      this._assignAudioSrc(candidates[0]);
       if (shouldPlay) {
-        await this.audio.play();
-        if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
-        this._consecutiveTrackErrors = 0;
-        await this._commitSessionStart(this.currentTrack || track, seq);
+        try {
+          await this.audio.play();
+          this._audioUnlocked = true;
+          if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
+          await this._commitSessionStart(this.currentTrack || track, seq);
+        } catch (playErr) {
+          if (playErr?.name === 'AbortError') return;
+          if (playErr?.name === 'NotAllowedError') {
+            this.isPlaying = false;
+            this.isBuffering = false;
+            this._emit();
+            await this._persistPlayback(true);
+            return;
+          }
+          // Try remaining stream candidates & backup gateways before failing this track
+          await this._handleAudioError();
+          return;
+        }
       }
 
       await this._persistPlayback(true);
       this.loadLyricsForCurrentTrack(track);
       this._prefetchNextTrack();
     } catch (err) {
+      if (err?.name === 'AbortError') return;
       if (this._trackLoadSeq !== seq || this.currentTrack?.id !== track.id) return;
       this._consecutiveTrackErrors += 1;
       const hasNext =
         this.queue.length > 1 &&
         (this.currentIndex + 1 < this.queue.length || this.repeatMode === 'ALL' || this.shuffleEnabled);
-      if (shouldPlay && hasNext && this._consecutiveTrackErrors < 3) {
+      if (shouldPlay && hasNext && this._consecutiveTrackErrors < 2) {
         this.onError?.(`Трек «${track.title}» недоступен — переходим к следующему`);
         await this.next(true);
         return;

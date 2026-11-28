@@ -1,5 +1,5 @@
 const CACHE_VERSION = '__BUILD_VERSION__';
-const CACHE_REV = '2026-11-28-v3';
+const CACHE_REV = '2026-11-28-v4';
 const CACHE_NAME = `sonora-ios-shell-${CACHE_VERSION}-${CACHE_REV}`;
 
 const SHELL_ASSETS = [

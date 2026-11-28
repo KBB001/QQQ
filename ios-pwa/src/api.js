@@ -161,8 +161,28 @@ export function resolveEffectiveQuality(quality = 'HIGH') {
   return 'HIGH';
 }
 
+function getAudioPlaybackSupport() {
+  try {
+    if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+      const a = document.createElement('audio');
+      if (a && typeof a.canPlayType === 'function') {
+        const hls = Boolean(
+          a.canPlayType('application/vnd.apple.mpegurl') || a.canPlayType('application/x-mpegURL')
+        );
+        const webm = Boolean(a.canPlayType('audio/webm; codecs="opus"') || a.canPlayType('audio/webm'));
+        const mp4 = Boolean(a.canPlayType('audio/mp4; codecs="mp4a.40.2"') || a.canPlayType('audio/mp4'));
+        return { hls, webm, mp4 };
+      }
+    }
+  } catch {
+    // Non-DOM / test environment defaults
+  }
+  return { hls: true, webm: false, mp4: true };
+}
+
 export function selectBestIosAudioStream(audioStreams = [], hlsUrl = null, quality = 'HIGH') {
   const effectiveQuality = resolveEffectiveQuality(quality);
+  const support = getAudioPlaybackSupport();
   const safeStreams = (Array.isArray(audioStreams) ? audioStreams : [])
     .map((s) => ({
       url: sanitizeHttpsUrl(s?.url),
@@ -173,9 +193,20 @@ export function selectBestIosAudioStream(audioStreams = [], hlsUrl = null, quali
     }))
     .filter((s) => Boolean(s.url));
 
-  const safeHls = sanitizeHttpsUrl(hlsUrl);
+  const safeHls = support.hls ? sanitizeHttpsUrl(hlsUrl) : null;
   const m4aStreams = safeStreams.filter(isDirectAudioOrM4a);
-  const pool = m4aStreams.length > 0 ? m4aStreams : safeStreams;
+  const webmStreams = support.webm
+    ? safeStreams.filter((s) => {
+        const mime = s.mimeType.toLowerCase();
+        return mime.includes('webm') || s.codec.toLowerCase().includes('opus');
+      })
+    : [];
+  const pool =
+    m4aStreams.length > 0
+      ? m4aStreams
+      : webmStreams.length > 0
+        ? webmStreams
+        : safeStreams;
 
   let chosen = null;
   if (pool.length > 0) {
@@ -192,7 +223,7 @@ export function selectBestIosAudioStream(audioStreams = [], hlsUrl = null, quali
     }
   }
 
-  if (m4aStreams.length === 0 && safeHls) {
+  if (m4aStreams.length === 0 && webmStreams.length === 0 && safeHls) {
     return {
       url: safeHls,
       fallbackUrl: chosen?.url || null,
@@ -1319,15 +1350,20 @@ export class SonoraApi {
             if (!selected) throw new Error('Нет аудиопотоков');
 
             const chosenMatch = audioCandidates.find((c) => c?.url === selected.url);
-            const extraM4aUrls = audioCandidates
-              .filter(isDirectAudioOrM4a)
+            const support = getAudioPlaybackSupport();
+            const extraPlayableUrls = audioCandidates
+              .filter(
+                (c) =>
+                  isDirectAudioOrM4a(c) ||
+                  (support.webm && String(c?.mimeType || '').toLowerCase().includes('webm'))
+              )
               .flatMap((c) => [c.url, c.directUrl]);
 
             const streamCandidates = this._buildStreamCandidates([
               selected.url,
               chosenMatch?.directUrl,
-              selected.fallbackUrl,
-              ...extraM4aUrls
+              ...extraPlayableUrls,
+              selected.fallbackUrl
             ]);
             if (streamCandidates.length === 0) throw new Error('Пустой список аудиопотоков');
 
@@ -1364,7 +1400,7 @@ export class SonoraApi {
       // Fall through to Invidious parallel federation
     }
 
-    // Tier 2: Parallel Invidious Federation (includes CORS/Range local=true AAC M4A fallback)
+    // Tier 2: Parallel Invidious Federation (prioritize local=true CORS/IP-safe M4A proxy)
     try {
       const { data: invResult } = await this._tryInvidiousPool(
         `/api/v1/videos/${encodeURIComponent(cleanId)}`,
@@ -1384,8 +1420,8 @@ export class SonoraApi {
             const invProxiedM4a = `${invBase}/latest_version?id=${encodeURIComponent(cleanId)}&itag=140&local=true`;
             const selected = selectBestIosAudioStream(formats, inv?.hlsUrl, quality);
             const streamCandidates = this._buildStreamCandidates([
-              selected?.url,
               invProxiedM4a,
+              selected?.url,
               selected?.fallbackUrl
             ]);
             if (streamCandidates.length === 0) throw new Error('Нет аудиопотоков Invidious');

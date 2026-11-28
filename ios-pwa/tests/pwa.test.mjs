@@ -1300,5 +1300,114 @@ test('buildAccountAuthModalHtml renders clean login & profile UI without develop
   assert.equal(storage.activeAccount.id, 'profile_alex');
 });
 
+test('SonoraPlayer prevents 2-3s track-skipping loops on NotAllowedError, AbortError, and repeated early stream failures', async () => {
+  const { SonoraPlayer } = await import('../src/player.js');
+  const storage = new SonoraStorage();
+  await storage.init();
+
+  const listeners = new Map();
+  let playBehavior = 'normal';
+  const mockAudio = {
+    src: '',
+    paused: true,
+    currentTime: 0,
+    duration: 180,
+    playbackRate: 1,
+    volume: 1,
+    muted: false,
+    setAttribute() {},
+    removeAttribute() {},
+    addEventListener(type, fn) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    },
+    async emit(type) {
+      for (const fn of listeners.get(type) || []) {
+        await fn();
+      }
+    },
+    async play() {
+      if (playBehavior === 'NotAllowedError') {
+        const err = new Error('Autoplay blocked');
+        err.name = 'NotAllowedError';
+        throw err;
+      }
+      if (playBehavior === 'AbortError') {
+        const err = new Error('Interrupted');
+        err.name = 'AbortError';
+        throw err;
+      }
+      this.paused = false;
+      await this.emit('play');
+      await this.emit('canplay');
+    },
+    pause() {
+      this.paused = true;
+    },
+    load() {}
+  };
+
+  const fakeApi = {
+    async getStreamInfo(id) {
+      return {
+        engine: 'audio',
+        sourceType: 'piped',
+        sourceKey: 'gw1',
+        streamUrl: `https://cdn.example/${id}.m4a`,
+        streamCandidates: [`https://cdn.example/${id}.m4a`],
+        mimeType: 'audio/mp4'
+      };
+    },
+    async fetchLyrics() {
+      return { synced: [], plain: '', source: '' };
+    }
+  };
+
+  const errors = [];
+  const player = new SonoraPlayer({
+    api: fakeApi,
+    storage,
+    offline: null,
+    recommendations: null,
+    audioElement: mockAudio,
+    onError: (msg) => errors.push(msg)
+  });
+
+  const tracks = [
+    { id: 'aa000000001', title: 'One', artist: 'A', durationSeconds: 200 },
+    { id: 'bb000000002', title: 'Two', artist: 'A', durationSeconds: 200 },
+    { id: 'cc000000003', title: 'Three', artist: 'A', durationSeconds: 200 }
+  ];
+
+  // NotAllowedError should pause on current track instead of skipping
+  playBehavior = 'NotAllowedError';
+  await player.playTrack(tracks[0], tracks);
+  assert.equal(player.currentTrack.id, tracks[0].id);
+  assert.equal(player.isPlaying, false);
+
+  // AbortError should stay on current track without error toast
+  playBehavior = 'AbortError';
+  await player.playTrack(tracks[0], tracks);
+  assert.equal(player.currentTrack.id, tracks[0].id);
+
+  // Early stream failures at ~2s (after play/canplay fired!) must NOT reset _consecutiveTrackErrors
+  // and must stop after at most 1 automatic skip rather than cycling through the whole queue
+  playBehavior = 'normal';
+  await player.playTrack(tracks[0], tracks);
+  player.currentTime = 2;
+  player.extractorRetries = player.maxExtractorRetries; // simulate exhausted gateways
+  await mockAudio.emit('error');
+  assert.equal(player.currentTrack.id, tracks[1].id);
+
+  player.currentTime = 2;
+  player.extractorRetries = player.maxExtractorRetries;
+  await mockAudio.emit('error');
+  // Stopped cleanly on tracks[1] instead of jumping to tracks[2]!
+  assert.equal(player.currentTrack.id, tracks[1].id);
+  assert.equal(player.isPlaying, false);
+  assert.ok(errors.length >= 2);
+});
+
+
 
 
