@@ -26,7 +26,8 @@ const DEFAULT_SETTINGS = {
   themeMode: 'SYSTEM',
   autoplayEnabled: true,
   encryptBackupsEnabled: true,
-  customApiBaseUrl: ''
+  customApiBaseUrl: '',
+  googleClientId: ''
 };
 
 const DEFAULT_LIBRARY = {
@@ -129,6 +130,9 @@ export class SonoraStorage {
       handle: '',
       email: '',
       avatarUrl: '',
+      authType: 'import',
+      accessToken: '',
+      tokenExpiresAt: 0,
       lastSyncTimestamp: 0,
       syncedLikedCount: 0,
       syncedPlaylistsCount: 0
@@ -259,13 +263,20 @@ export class SonoraStorage {
         if (item.encryptedCookie && key) {
           decryptedCookie = await decryptLocalSecret(item.encryptedCookie, key).catch(() => '');
         }
-        if (item.name || decryptedCookie) {
+        let decryptedToken = '';
+        if (item.encryptedAccessToken && key) {
+          decryptedToken = await decryptLocalSecret(item.encryptedAccessToken, key).catch(() => '');
+        }
+        if (item.name || decryptedCookie || decryptedToken) {
           hydratedAccounts.push({
             id: String(item.id || `yt_${hydratedAccounts.length + 1}`),
             name: String(item.name || 'YouTube Music'),
             handle: String(item.handle || ''),
             email: String(item.email || ''),
             avatarUrl: sanitizeHttpsUrl(item.avatarUrl) || '',
+            authType: String(item.authType || (decryptedToken ? 'google_oauth' : 'import')),
+            accessToken: decryptedToken || '',
+            tokenExpiresAt: Number(item.tokenExpiresAt) || 0,
             lastSyncTimestamp: Number(item.lastSyncTimestamp) || 0,
             syncedLikedCount: Number(item.syncedLikedCount) || 0,
             syncedPlaylistsCount: Number(item.syncedPlaylistsCount) || 0
@@ -289,16 +300,27 @@ export class SonoraStorage {
       await this._remove(KEY_ACCOUNT);
       return;
     }
-    const serialized = this.accounts.map((acc) => ({
-      id: acc.id,
-      name: acc.name,
-      handle: acc.handle || '',
-      email: acc.email || '',
-      avatarUrl: acc.avatarUrl || '',
-      lastSyncTimestamp: Number(acc.lastSyncTimestamp) || 0,
-      syncedLikedCount: Number(acc.syncedLikedCount) || 0,
-      syncedPlaylistsCount: Number(acc.syncedPlaylistsCount) || 0
-    }));
+    const key = await this._getOrCreateDeviceKey().catch(() => null);
+    const serialized = [];
+    for (const acc of this.accounts) {
+      let encryptedAccessToken = '';
+      if (acc.accessToken && key) {
+        encryptedAccessToken = await encryptLocalSecret(acc.accessToken, key).catch(() => '');
+      }
+      serialized.push({
+        id: acc.id,
+        name: acc.name,
+        handle: acc.handle || '',
+        email: acc.email || '',
+        avatarUrl: acc.avatarUrl || '',
+        authType: acc.authType || 'import',
+        encryptedAccessToken,
+        tokenExpiresAt: Number(acc.tokenExpiresAt) || 0,
+        lastSyncTimestamp: Number(acc.lastSyncTimestamp) || 0,
+        syncedLikedCount: Number(acc.syncedLikedCount) || 0,
+        syncedPlaylistsCount: Number(acc.syncedPlaylistsCount) || 0
+      });
+    }
     await this._write(KEY_ACCOUNT, {
       activeAccountId: this.activeAccountId,
       accounts: serialized
@@ -539,6 +561,55 @@ export class SonoraStorage {
     return true;
   }
 
+  async deduplicatePlaylistTracks(playlistId) {
+    const pl = this.library.playlists.find((p) => p.id === playlistId);
+    if (!pl || !Array.isArray(pl.tracks) || pl.tracks.length < 2) return 0;
+    const seen = new Set();
+    const unique = [];
+    for (const t of pl.tracks) {
+      if (t?.id && !seen.has(t.id)) {
+        seen.add(t.id);
+        unique.push(t);
+      }
+    }
+    const removed = pl.tracks.length - unique.length;
+    if (removed > 0) {
+      pl.tracks = unique;
+      pl.updatedAt = Date.now();
+      await this._saveLibrary();
+    }
+    return removed;
+  }
+
+  getListeningStats() {
+    const artistCounts = new Map();
+    const countArtist = (t, weight = 1) => {
+      const a = String(t?.artist || '').trim();
+      if (!a || a === 'YouTube Music' || a === 'Неизвестный исполнитель') return;
+      artistCounts.set(a, (artistCounts.get(a) || 0) + weight);
+    };
+    for (const t of this.library.history) countArtist(t, 2);
+    for (const t of this.library.favorites) countArtist(t, 3);
+    for (const pl of this.library.playlists) {
+      for (const t of pl.tracks || []) countArtist(t, 1);
+    }
+    const topArtists = Array.from(artistCounts.entries())
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3)
+      .map(([name]) => name);
+    const totalPlaylistTracks = this.library.playlists.reduce(
+      (sum, pl) => sum + (pl.tracks?.length || 0),
+      0
+    );
+    return {
+      favoritesCount: this.library.favorites.length,
+      historyCount: this.library.history.length,
+      playlistsCount: this.library.playlists.length,
+      totalPlaylistTracks,
+      topArtists
+    };
+  }
+
   async renamePlaylist(playlistId, name, description = '') {
     const pl = this.library.playlists.find((p) => p.id === playlistId);
     const cleanName = String(name ?? '').trim().slice(0, 120);
@@ -581,15 +652,19 @@ export class SonoraStorage {
 
   async upsertAccount(config) {
     const id = String(config.id || config.email || config.handle || `yt_${Date.now()}`).trim();
+    const existing = this.accounts.find((a) => a.id === id);
     const record = {
       id,
-      name: String(config.name || 'YouTube Music').trim(),
-      handle: String(config.handle || '').trim(),
-      email: String(config.email || '').trim(),
-      avatarUrl: sanitizeHttpsUrl(config.avatarUrl) || '',
+      name: String(config.name || existing?.name || 'YouTube Music').trim(),
+      handle: String(config.handle ?? existing?.handle ?? '').trim(),
+      email: String(config.email ?? existing?.email ?? '').trim(),
+      avatarUrl: sanitizeHttpsUrl(config.avatarUrl) || existing?.avatarUrl || '',
+      authType: String(config.authType || existing?.authType || 'import'),
+      accessToken: config.accessToken !== undefined ? String(config.accessToken || '') : (existing?.accessToken || ''),
+      tokenExpiresAt: config.tokenExpiresAt !== undefined ? (Number(config.tokenExpiresAt) || 0) : (existing?.tokenExpiresAt || 0),
       lastSyncTimestamp: Number(config.lastSyncTimestamp) || Date.now(),
-      syncedLikedCount: Number(config.syncedLikedCount) || 0,
-      syncedPlaylistsCount: Number(config.syncedPlaylistsCount) || 0
+      syncedLikedCount: Number(config.syncedLikedCount) ?? existing?.syncedLikedCount ?? 0,
+      syncedPlaylistsCount: Number(config.syncedPlaylistsCount) ?? existing?.syncedPlaylistsCount ?? 0
     };
 
     const idx = this.accounts.findIndex((a) => a.id === id);

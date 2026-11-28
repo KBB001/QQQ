@@ -414,6 +414,8 @@ button {
   width: 100%;
   text-align: left;
   position: relative;
+  content-visibility: auto;
+  contain-intrinsic-size: 64px;
 }
 
 .track-row + .track-row::before {
@@ -624,7 +626,7 @@ button {
 .mini-player {
   position: fixed;
   left: 50%;
-  transform: translateX(-50%);
+  transform: translate3d(-50%, 0, 0);
   width: calc(100% - 20px);
   max-width: 700px;
   bottom: calc(var(--tabbar-h) + env(safe-area-inset-bottom) + 8px);
@@ -636,6 +638,8 @@ button {
   border: 0.5px solid var(--separator);
   box-shadow: var(--shadow-float);
   overflow: hidden;
+  will-change: transform, opacity;
+  touch-action: pan-y;
 }
 
 .mini-progress-track {
@@ -750,6 +754,7 @@ button {
   max-width: 720px;
   margin: 0 auto;
   overflow-y: auto;
+  will-change: transform, opacity;
   animation: sheet-up 0.28s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
@@ -1651,3 +1656,83 @@ button.track-meta {
   gap: 10px;
   padding: 12px 0;
 }
+
+.player-artist-link {
+  display: inline-block;
+  text-align: left;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: rgba(255, 255, 255, 0.8);
+  padding: 2px 0;
+}
+
+.player-artist-link:active {
+  opacity: 0.65;
+}
+
+.list-load-more-wrap {
+  padding: 10px 14px 12px;
+  border-top: 0.5px solid var(--separator);
+}
+
+.scroll-sentinel {
+  width: 100%;
+  height: 1px;
+}
+
+.queue-act-btn {
+  width: 34px;
+  height: 38px;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.stats-grid-pad {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding: 12px 14px 8px;
+}
+
+.stat-tile {
+  background: var(--bg-subtle);
+  border-radius: 12px;
+  padding: 10px 8px;
+  text-align: center;
+}
+
+.stat-val {
+  font-size: 20px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.stat-lbl {
+  font-size: 11px;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.oauth-guide-details summary {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  cursor: pointer;
+  padding: 4px 0;
+}
+
+.oauth-uri-box {
+  background: var(--bg-elevated);
+  border: 0.5px solid var(--separator);
+  border-radius: 10px;
+  padding: 8px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-all;
+  color: var(--text);
+  margin-bottom: 6px;
+}
+

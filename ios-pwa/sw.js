@@ -13,6 +13,7 @@ const SHELL_ASSETS = [
   './src/offline.js',
   './src/modals.js',
   './src/player.js',
+  './src/youtube-oauth.js',
   './src/app.js',
   './icons/apple-touch-icon.png',
   './icons/icon-192.png',

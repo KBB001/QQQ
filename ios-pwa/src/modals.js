@@ -179,6 +179,7 @@ export function buildTrackMenuHtml(track, { isFav, isOffline, isDownloading, pro
     <button type="button" class="btn-secondary-full" data-action="menu-play-next" data-track-id="${safeId}">Играть следующим</button>
     <button type="button" class="btn-secondary-full" data-action="menu-add-queue" data-track-id="${safeId}">Добавить в очередь</button>
     <button type="button" class="btn-secondary-full" data-action="menu-start-radio" data-track-id="${safeId}">Запустить радио по треку</button>
+    <button type="button" class="btn-secondary-full" data-action="menu-open-artist" data-track-id="${safeId}">Перейти к артисту</button>
     <button type="button" class="btn-secondary-full" data-action="menu-add-playlist" data-track-id="${safeId}">Добавить в плейлист</button>
     <button type="button" class="btn-secondary-full" data-action="share-track" data-track-id="${safeId}">Поделиться треком</button>
     ${
@@ -310,11 +311,16 @@ export function buildQueueModalHtml({ queue, currentIndex, getSafeThumb }) {
                   <div class="track-sub">${escapeHtml(t.artist)}</div>
                 </button>
                 ${
-                  i !== currentIndex && i !== currentIndex + 1
-                    ? `<button type="button" class="track-more-btn" data-action="queue-move-next" data-qindex="${i}" title="Играть следующим" aria-label="Играть следующим">↑</button>`
+                  i > 0
+                    ? `<button type="button" class="track-more-btn queue-act-btn" data-action="queue-move-up" data-qindex="${i}" title="Выше" aria-label="Выше">↑</button>`
                     : ''
                 }
-                <button type="button" class="track-more-btn" data-action="queue-remove" data-qindex="${i}" title="Удалить из очереди" aria-label="Удалить из очереди">✕</button>
+                ${
+                  i + 1 < queue.length
+                    ? `<button type="button" class="track-more-btn queue-act-btn" data-action="queue-move-down" data-qindex="${i}" title="Ниже" aria-label="Ниже">↓</button>`
+                    : ''
+                }
+                <button type="button" class="track-more-btn queue-act-btn" data-action="queue-remove" data-qindex="${i}" title="Удалить из очереди" aria-label="Удалить из очереди">✕</button>
               </div>`
               )
               .join('')}
@@ -392,13 +398,17 @@ export function buildMixPreviewModalHtml(mix, getSafeThumb) {
 export function buildYouTubeImportModalHtml({
   activeAccount,
   accounts,
+  googleClientId = '',
+  redirectUri = '',
   statusMessage
 }) {
   const acc = activeAccount || {};
+  const hasOAuth = acc.authType === 'google_oauth' && Boolean(acc.accessToken);
+  const tokenValid = hasOAuth && (!acc.tokenExpiresAt || acc.tokenExpiresAt > Date.now() + 60_000);
   return `
-    <h3 class="modal-title">Синхронизация YouTube Music</h3>
+    <h3 class="modal-title">Аккаунт YouTube и импорт</h3>
     <p class="modal-desc">
-      Полностью без серверов и передачи паролей: загрузите свои плейлисты по ссылкам, через закладку для Safari/Chrome на телефоне, Google Takeout или копию Android Sonora.
+      Прямой вход через Google OAuth в браузере (без своего сервера) и быстрый мобильный импорт через закладку Safari.
     </p>
     ${
       accounts.length > 0
@@ -417,9 +427,44 @@ export function buildYouTubeImportModalHtml({
     ${statusMessage ? `<div class="modal-status-msg">${escapeHtml(statusMessage)}</div>` : ''}
 
     <div class="helper-box">
-      <div class="helper-title">1. Быстрый мобильный импорт (без консоли браузера)</div>
+      <div class="helper-title">1. Прямой вход через аккаунт Google / YouTube</div>
+      ${
+        hasOAuth
+          ? `<div class="status-inline ${tokenValid ? 'ok' : 'warn'}">
+               ${tokenValid ? `Подключён: ${escapeHtml(acc.name || acc.email || 'Google')}` : 'Срок сессии истёк — войдите повторно'}
+             </div>
+             ${
+               tokenValid
+                 ? `<button type="button" class="btn-primary-full mt-8" data-action="sync-google-oauth">Синхронизировать плейлисты сейчас</button>`
+                 : ''
+             }`
+          : ''
+      }
+      <form id="google-oauth-form" class="mt-8">
+        <label class="field-label" for="google-client-id-input">Google OAuth Client ID (Web)</label>
+        <input id="google-client-id-input" class="ios-field" type="text" placeholder="1234567890-xxxx.apps.googleusercontent.com" value="${escapeHtml(googleClientId)}" />
+        <button type="submit" class="btn-primary-full">${hasOAuth ? 'Войти / Сменить аккаунт Google' : 'Войти через Google / YouTube'}</button>
+      </form>
+      <details class="oauth-guide-details mt-8">
+        <summary>Как за 1 минуту создать свой Client ID (бесплатно)</summary>
+        <p class="modal-desc mt-8">
+          1. Откройте Google Cloud Console → APIs &amp; Services → Credentials → Create OAuth Client ID (тип <b>Web application</b>).<br/>
+          2. Включите <b>YouTube Data API v3</b> и добавьте ваш Redirect URI ниже в <b>Authorized redirect URIs</b> и origin сайта в <b>Authorized JavaScript origins</b>.<br/>
+          3. Вставьте Client ID выше и нажмите «Войти через Google / YouTube».
+        </p>
+        ${
+          redirectUri
+            ? `<div class="oauth-uri-box">${escapeHtml(redirectUri)}</div>
+               <button type="button" class="btn-secondary-full" data-action="copy-oauth-redirect-uri" data-uri="${escapeHtml(redirectUri)}">Скопировать Redirect URI</button>`
+            : ''
+        }
+      </details>
+    </div>
+
+    <div class="helper-box">
+      <div class="helper-title">2. Закладка Safari (iPhone) и импорт по ссылкам</div>
       <p class="modal-desc">
-        Вставьте одну или сразу несколько ссылок на плейлисты/треки YouTube Music либо сохраните <b>Закладку-экспорт</b> для Safari на iPhone.
+        Не требует Client ID: импортирует даже приватные миксы и историю из <b>music.youtube.com</b> через закладку или по ссылкам на плейлисты.
       </p>
       <button type="button" class="btn-primary-full" data-action="open-import-yt-playlist">Импорт по ссылкам (пакетно)</button>
       <button type="button" class="btn-secondary-full" data-action="copy-yt-bookmarklet">Скопировать закладку (Bookmarklet) для iPhone</button>
@@ -427,13 +472,13 @@ export function buildYouTubeImportModalHtml({
     </div>
 
     <form id="yt-import-form">
-      <label class="field-label" for="yt-import-json">2. Вставьте JSON или выберите файл (JSON / CSV Takeout / .sonoraenc)</label>
+      <label class="field-label" for="yt-import-json">3. Вставить JSON / CSV Google Takeout или .sonoraenc</label>
       <textarea id="yt-import-json" class="ios-field ios-textarea" placeholder="Вставьте содержимое sonora-yt-library.json, watch-history.json или CSV из Google Takeout..."></textarea>
       <button type="submit" class="btn-primary-full">Импортировать вставленный текст</button>
     </form>
 
     <button type="button" class="btn-secondary-full" data-action="choose-yt-import-file">Выбрать файл (.json, .csv Takeout, .sonoraenc)</button>
-    ${acc.id ? `<button type="button" class="btn-danger-full" data-action="remove-current-account" data-account-id="${escapeHtml(acc.id)}">Удалить профиль «${escapeHtml(acc.name)}»</button>` : ''}
+    ${acc.id ? `<button type="button" class="btn-danger-full" data-action="remove-current-account" data-account-id="${escapeHtml(acc.id)}">Выйти и удалить профиль «${escapeHtml(acc.name)}»</button>` : ''}
     <button type="button" class="btn-secondary-full" data-action="close-modal">Закрыть</button>
   `;
 }

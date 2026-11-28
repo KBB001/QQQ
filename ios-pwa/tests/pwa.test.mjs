@@ -14,6 +14,7 @@ import {
   extractVideoId,
   parseLrcLines,
   parseLyricsTrackQuery,
+  resolveEffectiveQuality,
   selectBestIosAudioStream,
   SonoraApi
 } from '../src/api.js';
@@ -25,6 +26,13 @@ import {
   TrackMoodProfiler
 } from '../src/recommendations.js';
 import { SonoraStorage } from '../src/storage.js';
+import {
+  buildGoogleOAuthUrl,
+  isValidGoogleClientId,
+  parseIsoDurationSeconds,
+  parseOAuthHashResponse,
+  syncYouTubeLibraryWithOAuth
+} from '../src/youtube-oauth.js';
 
 test('BackupCipher encrypts and decrypts with Android-compatible sonora-enc:v1 envelope', async () => {
   const sample = JSON.stringify({
@@ -736,3 +744,174 @@ test('SonoraOfflineManager reuses cached ObjectURLs across repeated playback loo
     URL.createObjectURL = origCreateObjectURL;
   }
 });
+
+test('youtube-oauth helpers validate Client IDs, build/parse OAuth URLs, and sync library via mocked Google APIs', async () => {
+  assert.equal(isValidGoogleClientId('1234567890-abcdef.apps.googleusercontent.com'), true);
+  assert.equal(isValidGoogleClientId('not-a-client-id'), false);
+  assert.equal(parseIsoDurationSeconds('PT3M45S'), 225);
+  assert.equal(parseIsoDurationSeconds('PT1H02M05S'), 3725);
+
+  const authUrl = buildGoogleOAuthUrl({
+    clientId: '1234567890-abcdef.apps.googleusercontent.com',
+    redirectUri: 'https://kbb001.github.io/QQQ/',
+    state: 'state_xyz'
+  });
+  assert.ok(authUrl.startsWith('https://accounts.google.com/o/oauth2/v2/auth?'));
+  assert.ok(authUrl.includes('youtube.readonly'));
+  assert.ok(authUrl.includes('response_type=token'));
+
+  const parsedHash = parseOAuthHashResponse('#access_token=ya29.testtoken&expires_in=3600&state=state_xyz');
+  assert.equal(parsedHash?.accessToken, 'ya29.testtoken');
+  assert.equal(parsedHash?.state, 'state_xyz');
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url) => {
+      const s = String(url);
+      if (s.includes('oauth2/v3/userinfo')) {
+        return new Response(
+          JSON.stringify({ sub: 'u1', name: 'Test User', email: 'u@example.com', picture: 'https://lh3.googleusercontent.com/pic.jpg' }),
+          { status: 200 }
+        );
+      }
+      if (s.includes('youtube/v3/channels')) {
+        return new Response(
+          JSON.stringify({ items: [{ id: 'UC1', snippet: { title: 'YT Music Channel', customUrl: '@ytm' } }] }),
+          { status: 200 }
+        );
+      }
+      if (s.includes('youtube/v3/playlists')) {
+        return new Response(
+          JSON.stringify({ items: [{ id: 'PLoauth1', snippet: { title: 'My Google Mix', description: 'Synced' } }] }),
+          { status: 200 }
+        );
+      }
+      if (s.includes('youtube/v3/playlistItems')) {
+        return new Response(
+          JSON.stringify({
+            items: [
+              {
+                snippet: {
+                  title: 'Track OAuth',
+                  videoOwnerChannelTitle: 'Artist OAuth - Topic',
+                  resourceId: { videoId: 'dQw4w9WgXcQ' },
+                  thumbnails: { high: { url: 'https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg' } }
+                },
+                contentDetails: { videoId: 'dQw4w9WgXcQ' }
+              }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      if (s.includes('youtube/v3/videos')) {
+        return new Response(
+          JSON.stringify({
+            items: [
+              {
+                id: '1N8hOpMqvYs',
+                snippet: {
+                  title: 'Liked Track',
+                  channelTitle: 'Cool Band - Topic',
+                  thumbnails: { high: { url: 'https://i.ytimg.com/vi/1N8hOpMqvYs/hqdefault.jpg' } }
+                },
+                contentDetails: { duration: 'PT3M10S' }
+              }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('{}', { status: 404 });
+    };
+
+    const synced = await syncYouTubeLibraryWithOAuth('ya29.testtoken');
+    assert.equal(synced.account.name, 'YT Music Channel');
+    assert.equal(synced.playlists.length, 1);
+    assert.equal(synced.playlists[0].tracks[0].artist, 'Artist OAuth');
+    assert.equal(synced.likedTracks.length, 1);
+    assert.equal(synced.likedTracks[0].durationSeconds, 190);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('SonoraStorage deduplicates playlists, computes listening stats, and persists encrypted OAuth tokens', async () => {
+  const storage = new SonoraStorage();
+  await storage.init();
+
+  const pl = await storage.createPlaylist('Dupes', '', [
+    { id: 'dQw4w9WgXcQ', title: 'Track 1', artist: 'Artist A', durationSeconds: 200 },
+    { id: '1N8hOpMqvYs', title: 'Track 2', artist: 'Artist B', durationSeconds: 180 },
+    { id: 'dQw4w9WgXcQ', title: 'Track 1 Duplicate', artist: 'Artist A', durationSeconds: 200 }
+  ]);
+  const removed = await storage.deduplicatePlaylistTracks(pl.id);
+  assert.equal(removed, 1);
+  assert.equal(storage.library.playlists[0].tracks.length, 2);
+
+  await storage.toggleFavorite({ id: 'dQw4w9WgXcQ', title: 'Track 1', artist: 'Artist A', durationSeconds: 200 });
+  await storage.recordPlayback({ id: '1N8hOpMqvYs', title: 'Track 2', artist: 'Artist A', durationSeconds: 180 });
+  const stats = storage.getListeningStats();
+  assert.equal(stats.favoritesCount, 1);
+  assert.equal(stats.historyCount, 1);
+  assert.equal(stats.playlistsCount, 1);
+  assert.equal(stats.topArtists[0], 'Artist A');
+
+  await storage.upsertAccount({
+    id: 'google_1',
+    name: 'Google User',
+    authType: 'google_oauth',
+    accessToken: 'secret-token-value',
+    tokenExpiresAt: Date.now() + 3600_000
+  });
+  assert.equal(storage.activeAccount.accessToken, 'secret-token-value');
+  assert.equal(storage.activeAccount.authType, 'google_oauth');
+});
+
+test('SonoraApi resolves AUTO quality and paginates Piped playlists across nextpage tokens', async () => {
+  assert.equal(resolveEffectiveQuality('HIGH'), 'HIGH');
+  assert.ok(['LOW', 'MEDIUM', 'HIGH'].includes(resolveEffectiveQuality('AUTO')));
+
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url) => {
+      const s = String(url);
+      if (s.startsWith('https://fast-pl.example.com/playlists/PLmulti123')) {
+        return new Response(
+          JSON.stringify({
+            name: 'Big Mix',
+            uploader: 'Curator',
+            nextpage: 'page_2_token',
+            relatedStreams: [
+              { url: '/watch?v=dQw4w9WgXcQ', title: 'Track 1', uploaderName: 'Artist 1', duration: 180 }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      if (s.startsWith('https://fast-pl.example.com/nextpage/playlists/PLmulti123')) {
+        return new Response(
+          JSON.stringify({
+            nextpage: null,
+            relatedStreams: [
+              { url: '/watch?v=1N8hOpMqvYs', title: 'Track 2', uploaderName: 'Artist 2', duration: 210 }
+            ]
+          }),
+          { status: 200 }
+        );
+      }
+      return new Response('err', { status: 502 });
+    };
+
+    const api = new SonoraApi(() => ({
+      fastNodes: { piped: 'https://fast-pl.example.com' }
+    }));
+    const pl = await api.getPlaylist('PLmulti123');
+    assert.equal(pl.tracks.length, 2);
+    assert.equal(pl.tracks[0].id, 'dQw4w9WgXcQ');
+    assert.equal(pl.tracks[1].id, '1N8hOpMqvYs');
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+

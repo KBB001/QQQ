@@ -107,7 +107,22 @@ export function isDirectAudioOrM4a(stream) {
   );
 }
 
+export function resolveEffectiveQuality(quality = 'HIGH') {
+  if (quality !== 'AUTO') return quality || 'HIGH';
+  try {
+    const conn = globalThis.navigator?.connection;
+    if (conn?.saveData) return 'LOW';
+    const eff = String(conn?.effectiveType || '').toLowerCase();
+    if (eff === 'slow-2g' || eff === '2g') return 'LOW';
+    if (eff === '3g') return 'MEDIUM';
+  } catch {
+    // Ignore
+  }
+  return 'HIGH';
+}
+
 export function selectBestIosAudioStream(audioStreams = [], hlsUrl = null, quality = 'HIGH') {
+  const effectiveQuality = resolveEffectiveQuality(quality);
   const safeStreams = (Array.isArray(audioStreams) ? audioStreams : [])
     .map((s) => ({
       url: sanitizeHttpsUrl(s?.url),
@@ -125,9 +140,9 @@ export function selectBestIosAudioStream(audioStreams = [], hlsUrl = null, quali
   let chosen = null;
   if (pool.length > 0) {
     const sorted = [...pool].sort((a, b) => a.bitrate - b.bitrate);
-    if (quality === 'LOW') {
+    if (effectiveQuality === 'LOW') {
       chosen = sorted[0];
-    } else if (quality === 'MEDIUM') {
+    } else if (effectiveQuality === 'MEDIUM') {
       const target = 128000;
       chosen = sorted.reduce((best, cur) =>
         Math.abs(cur.bitrate - target) < Math.abs(best.bitrate - target) ? cur : best
@@ -1175,7 +1190,7 @@ export class SonoraApi {
     return items.filter((it) => it.type === 'track' && it.id !== id);
   }
 
-  async getPlaylist(rawPlaylistInput) {
+  async getPlaylist(rawPlaylistInput, { maxPages = 5 } = {}) {
     const playlistId = extractPlaylistId(rawPlaylistInput);
     if (!playlistId) throw new Error('Некорректная ссылка или ID плейлиста YouTube');
 
@@ -1184,32 +1199,87 @@ export class SonoraApi {
       return cached.playlist;
     }
 
+    const dedupeTracks = (list) => {
+      const seen = new Set();
+      const out = [];
+      for (const t of list) {
+        if (t?.id && !seen.has(t.id)) {
+          seen.add(t.id);
+          out.push(t);
+        }
+      }
+      return out;
+    };
+
     let playlist = null;
     try {
-      const { data } = await this._tryPipedPool(`/playlists/${encodeURIComponent(playlistId)}`);
+      const { base, data } = await this._tryPipedPool(`/playlists/${encodeURIComponent(playlistId)}`);
+      const collected = (Array.isArray(data.relatedStreams) ? data.relatedStreams : [])
+        .map(normalizePipedTrack)
+        .filter(Boolean);
+
+      let nextpage = data.nextpage || null;
+      for (let page = 1; page < maxPages && nextpage; page++) {
+        try {
+          const nextData = await this._fetchJson(
+            `${base}/nextpage/playlists/${encodeURIComponent(playlistId)}?nextpage=${encodeURIComponent(nextpage)}`,
+            {},
+            3600
+          );
+          const more = (Array.isArray(nextData.relatedStreams) ? nextData.relatedStreams : [])
+            .map(normalizePipedTrack)
+            .filter(Boolean);
+          if (more.length === 0) break;
+          collected.push(...more);
+          nextpage = nextData.nextpage || null;
+        } catch {
+          break;
+        }
+      }
+
       playlist = {
         id: playlistId,
         title: data.name || 'Плейлист YouTube',
         author: data.uploader || 'YouTube Music',
         description: data.description || '',
         thumbnailUrl: sanitizeHttpsUrl(data.thumbnailUrl) || '',
-        tracks: (Array.isArray(data.relatedStreams) ? data.relatedStreams : [])
-          .map(normalizePipedTrack)
-          .filter(Boolean)
+        tracks: dedupeTracks(collected)
       };
     } catch {
-      const { data: inv } = await this._tryInvidiousPool(
+      const { base, data: inv } = await this._tryInvidiousPool(
         `/api/v1/playlists/${encodeURIComponent(playlistId)}`
       );
+      const collected = (Array.isArray(inv.videos) ? inv.videos : [])
+        .map(normalizeInvidiousTrack)
+        .filter(Boolean);
+
+      if (collected.length >= 90) {
+        for (let page = 2; page <= maxPages; page++) {
+          try {
+            const pageData = await this._fetchJson(
+              `${base}/api/v1/playlists/${encodeURIComponent(playlistId)}?page=${page}`,
+              {},
+              3600
+            );
+            const more = (Array.isArray(pageData.videos) ? pageData.videos : [])
+              .map(normalizeInvidiousTrack)
+              .filter(Boolean);
+            if (more.length === 0) break;
+            collected.push(...more);
+            if (more.length < 90) break;
+          } catch {
+            break;
+          }
+        }
+      }
+
       playlist = {
         id: playlistId,
         title: inv.title || 'Плейлист YouTube Music',
         author: inv.author || 'YouTube Music',
         description: inv.description || '',
         thumbnailUrl: sanitizeHttpsUrl(inv.playlistThumbnail) || '',
-        tracks: (Array.isArray(inv.videos) ? inv.videos : [])
-          .map(normalizeInvidiousTrack)
-          .filter(Boolean)
+        tracks: dedupeTracks(collected)
       };
     }
 
